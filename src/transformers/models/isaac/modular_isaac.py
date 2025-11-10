@@ -1360,6 +1360,29 @@ class IsaacConfig(PretrainedConfig):
     model_type = "isaac"
     sub_configs = {"vision_config": IsaacVisionConfig, "text_config": Qwen3Config}
     image_processor_type = "IsaacImageProcessor"
+    _TEXT_CONFIG_FIELDS = {
+        "attention_bias",
+        "attention_dropout",
+        "head_dim",
+        "hidden_act",
+        "hidden_size",
+        "initializer_range",
+        "intermediate_size",
+        "layer_types",
+        "max_position_embeddings",
+        "max_window_layers",
+        "num_attention_heads",
+        "num_hidden_layers",
+        "num_key_value_heads",
+        "rope_parameters",
+        "rope_theta",
+        "rms_norm_eps",
+        "sliding_window",
+        "tie_word_embeddings",
+        "use_cache",
+        "use_sliding_window",
+        "vocab_size",
+    }
 
     def __init__(
         self,
@@ -1370,7 +1393,6 @@ class IsaacConfig(PretrainedConfig):
         vision_token: str = "<image>",
         **kwargs,
     ):
-        self._rope_scaling: Optional[dict[str, Any]] = None
         resolved_text_config = kwargs.pop("text_config", text_config)
         if isinstance(resolved_text_config, Qwen3Config):
             text_config_kwargs = copy.deepcopy(resolved_text_config.to_dict())
@@ -1381,60 +1403,50 @@ class IsaacConfig(PretrainedConfig):
         else:
             raise TypeError("`text_config` must be a mapping or `Qwen3Config` instance when provided.")
 
-        text_config_kwargs.update(kwargs)
+        forwarded_text_keys = {key: kwargs.pop(key) for key in list(kwargs.keys()) if key in self._TEXT_CONFIG_FIELDS}
+        text_config_kwargs.update(forwarded_text_keys)
+
+        self._text_config_user_dict = copy.deepcopy(text_config_kwargs) if text_config_kwargs else {}
 
         self.text_config = self.sub_configs["text_config"](**text_config_kwargs)
 
         super().__init__(**kwargs)
 
-        if self._rope_scaling is None:
-            self._rope_scaling = getattr(self.text_config, "rope_scaling", None)
-        else:
-            self.text_config.rope_scaling = self._rope_scaling
-
-        # Mirror frequently accessed Qwen3 attributes at the composite config level for BC.
-        self.tie_word_embeddings = getattr(self.text_config, "tie_word_embeddings", False)
-        self.vocab_size = self.text_config.vocab_size
-        self.max_position_embeddings = self.text_config.max_position_embeddings
-        self.hidden_size = self.text_config.hidden_size
-        self.intermediate_size = self.text_config.intermediate_size
-        self.num_hidden_layers = self.text_config.num_hidden_layers
-        self.num_attention_heads = self.text_config.num_attention_heads
-        self.use_sliding_window = getattr(self.text_config, "use_sliding_window", False)
-        sliding_window = getattr(self.text_config, "sliding_window", None)
-        self.sliding_window = sliding_window if self.use_sliding_window else None
-        self.max_window_layers = getattr(self.text_config, "max_window_layers", None)
-        self.num_key_value_heads = getattr(self.text_config, "num_key_value_heads", None)
-        if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
-        self.head_dim = self.text_config.head_dim
-        self.hidden_act = self.text_config.hidden_act
-        self.initializer_range = self.text_config.initializer_range
-        self.rms_norm_eps = self.text_config.rms_norm_eps
-        self.use_cache = self.text_config.use_cache
-        self.rope_theta = self.text_config.rope_theta
-        self.attention_bias = getattr(self.text_config, "attention_bias", False)
-        self.attention_dropout = getattr(self.text_config, "attention_dropout", 0.0)
-
-        # Validate rotary parameters now that they have been mirrored locally.
-        rope_config_validation(self)
-
-        self.layer_types = getattr(self.text_config, "layer_types", None)
+        text_config = self.text_config
+        self.layer_types = getattr(text_config, "layer_types", None)
         if self.layer_types is None:
             self.layer_types = [
                 "sliding_attention"
-                if self.sliding_window is not None and i >= self.max_window_layers
+                if getattr(text_config, "use_sliding_window", False)
+                and getattr(text_config, "sliding_window", None) is not None
+                and getattr(text_config, "max_window_layers", None) is not None
+                and i >= text_config.max_window_layers
                 else "full_attention"
-                for i in range(self.num_hidden_layers)
+                for i in range(text_config.num_hidden_layers)
             ]
-        layer_type_validation(self.layer_types, self.num_hidden_layers)
+        layer_type_validation(self.layer_types, text_config.num_hidden_layers)
+
+        use_sliding_window = getattr(text_config, "use_sliding_window", False)
+        sliding_window = getattr(text_config, "sliding_window", None)
+        self.sliding_window = sliding_window if use_sliding_window else None
+        self.max_window_layers = getattr(text_config, "max_window_layers", None)
+
+        rope_params = copy.deepcopy(getattr(text_config, "rope_parameters", None))
+        self.rope_parameters = rope_params
+        if rope_params is not None:
+            text_config.rope_parameters = copy.deepcopy(rope_params)
+
+        rope_config_validation(self)
 
         # Handle vision config - either dict or IsaacVisionConfig instance
         if isinstance(vision_config, dict):
+            self._vision_config_user_dict = copy.deepcopy(vision_config)
             self.vision_config = self.sub_configs["vision_config"](**vision_config)
         elif isinstance(vision_config, IsaacVisionConfig):
+            self._vision_config_user_dict = vision_config.to_dict()
             self.vision_config = vision_config
         elif vision_config is None:
+            self._vision_config_user_dict = {}
             self.vision_config = self.sub_configs["vision_config"]()
 
         # Vision normalization parameters
@@ -1450,17 +1462,168 @@ class IsaacConfig(PretrainedConfig):
         kwargs.pop("encoder", None)
         return self.text_config
 
+    def _get_text_attr(self, name: str, default: Any = None):
+        return getattr(self.text_config, name, default)
+
+    def _set_text_attr(self, name: str, value: Any):
+        setattr(self.text_config, name, value)
+        if name in {"rope_parameters", "rope_theta"}:
+            rope_params = copy.deepcopy(getattr(self.text_config, "rope_parameters", None))
+            self.rope_parameters = rope_params
+        if hasattr(self, "_text_config_user_dict"):
+            if isinstance(value, dict):
+                self._text_config_user_dict[name] = copy.deepcopy(value)
+            else:
+                self._text_config_user_dict[name] = value
+
+    def to_diff_dict(self) -> dict[str, Any]:
+        diff = super().to_diff_dict()
+        if getattr(self, "_text_config_user_dict", None):
+            diff["text_config"] = copy.deepcopy(self._text_config_user_dict)
+        if getattr(self, "_vision_config_user_dict", None):
+            diff["vision_config"] = copy.deepcopy(self._vision_config_user_dict)
+        return diff
+
+    @property
+    def hidden_size(self) -> int:
+        return int(self._get_text_attr("hidden_size"))
+
+    @hidden_size.setter
+    def hidden_size(self, value: int) -> None:
+        self._set_text_attr("hidden_size", value)
+
+    @property
+    def vocab_size(self) -> int:
+        return int(self._get_text_attr("vocab_size"))
+
+    @vocab_size.setter
+    def vocab_size(self, value: int) -> None:
+        self._set_text_attr("vocab_size", value)
+
+    @property
+    def max_position_embeddings(self) -> int:
+        return int(self._get_text_attr("max_position_embeddings"))
+
+    @max_position_embeddings.setter
+    def max_position_embeddings(self, value: int) -> None:
+        self._set_text_attr("max_position_embeddings", value)
+
+    @property
+    def tie_word_embeddings(self) -> bool:
+        return bool(self._get_text_attr("tie_word_embeddings", False))
+
+    @tie_word_embeddings.setter
+    def tie_word_embeddings(self, value: bool) -> None:
+        self._set_text_attr("tie_word_embeddings", value)
+
+    @property
+    def num_hidden_layers(self) -> int:
+        return int(self._get_text_attr("num_hidden_layers"))
+
+    @num_hidden_layers.setter
+    def num_hidden_layers(self, value: int) -> None:
+        self._set_text_attr("num_hidden_layers", value)
+
+    @property
+    def num_attention_heads(self) -> int:
+        return int(self._get_text_attr("num_attention_heads"))
+
+    @num_attention_heads.setter
+    def num_attention_heads(self, value: int) -> None:
+        self._set_text_attr("num_attention_heads", value)
+
+    @property
+    def num_key_value_heads(self) -> int:
+        return int(self._get_text_attr("num_key_value_heads", self.num_attention_heads))
+
+    @num_key_value_heads.setter
+    def num_key_value_heads(self, value: int) -> None:
+        self._set_text_attr("num_key_value_heads", value)
+
+    @property
+    def head_dim(self) -> int:
+        return int(self._get_text_attr("head_dim"))
+
+    @head_dim.setter
+    def head_dim(self, value: int) -> None:
+        self._set_text_attr("head_dim", value)
+
+    @property
+    def intermediate_size(self) -> int:
+        return int(self._get_text_attr("intermediate_size"))
+
+    @intermediate_size.setter
+    def intermediate_size(self, value: int) -> None:
+        self._set_text_attr("intermediate_size", value)
+
+    @property
+    def hidden_act(self) -> str:
+        return self._get_text_attr("hidden_act")
+
+    @hidden_act.setter
+    def hidden_act(self, value: str) -> None:
+        self._set_text_attr("hidden_act", value)
+
+    @property
+    def initializer_range(self) -> float:
+        return float(self._get_text_attr("initializer_range"))
+
+    @initializer_range.setter
+    def initializer_range(self, value: float) -> None:
+        self._set_text_attr("initializer_range", value)
+
+    @property
+    def rms_norm_eps(self) -> float:
+        return float(self._get_text_attr("rms_norm_eps"))
+
+    @rms_norm_eps.setter
+    def rms_norm_eps(self, value: float) -> None:
+        self._set_text_attr("rms_norm_eps", value)
+
+    @property
+    def use_cache(self) -> bool:
+        return bool(self._get_text_attr("use_cache", True))
+
+    @use_cache.setter
+    def use_cache(self, value: bool) -> None:
+        self._set_text_attr("use_cache", value)
+
+    @property
+    def attention_bias(self) -> bool:
+        return bool(self._get_text_attr("attention_bias", False))
+
+    @attention_bias.setter
+    def attention_bias(self, value: bool) -> None:
+        self._set_text_attr("attention_bias", value)
+
+    @property
+    def attention_dropout(self) -> float:
+        return float(self._get_text_attr("attention_dropout", 0.0))
+
+    @attention_dropout.setter
+    def attention_dropout(self, value: float) -> None:
+        self._set_text_attr("attention_dropout", value)
+
+    @property
+    def rope_theta(self) -> float:
+        rope_params = self.rope_parameters or {}
+        if isinstance(rope_params, dict) and "rope_theta" in rope_params:
+            return rope_params["rope_theta"]
+        return getattr(self.text_config, "rope_theta", 10000.0)
+
+    @rope_theta.setter
+    def rope_theta(self, value: float) -> None:
+        self._set_text_attr("rope_theta", value)
+
     @property
     def rope_scaling(self):
-        if hasattr(self, "text_config") and self.text_config is not None:
-            return getattr(self.text_config, "rope_scaling", None)
-        return self._rope_scaling
+        return self.rope_parameters
 
     @rope_scaling.setter
     def rope_scaling(self, value):
-        self._rope_scaling = value
+        self.rope_parameters = value
         if hasattr(self, "text_config") and self.text_config is not None:
-            self.text_config.rope_scaling = value
+            self.text_config.rope_parameters = copy.deepcopy(value)
 
     @property
     def vision_attn_implementation(self) -> Optional[str]:
