@@ -137,7 +137,7 @@ from ...models.qwen3.configuration_qwen3 import Qwen3Config
 from ...models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3PreTrainedModel
 from ...processing_utils import ProcessorMixin, Unpack
 from ...tokenization_utils_base import BatchEncoding
-from ...utils import auto_docstring, TensorType
+from ...utils import TensorType, auto_docstring
 
 # Vision preprocessing constants
 from ...utils.constants import IMAGENET_STANDARD_MEAN as VISION_MEAN
@@ -1370,7 +1370,6 @@ class IsaacConfig(PretrainedConfig):
         # Keep rope parameters alias in sync with upstream expectations
         self._rope_scaling = self._rope_parameters
 
-
         # Mirror frequently accessed Qwen3 attributes at the composite config level for BC.
         self.tie_word_embeddings = getattr(self.text_config, "tie_word_embeddings", False)
         self.vocab_size = self.text_config.vocab_size
@@ -1431,7 +1430,9 @@ class IsaacConfig(PretrainedConfig):
     @property
     def rope_scaling(self):
         if hasattr(self, "text_config") and self.text_config is not None:
-            return getattr(self.text_config, "rope_parameters", None) or getattr(self.text_config, "rope_scaling", None)
+            return getattr(self.text_config, "rope_parameters", None) or getattr(
+                self.text_config, "rope_scaling", None
+            )
         return self._rope_parameters
 
     @rope_scaling.setter
@@ -1453,7 +1454,9 @@ class IsaacConfig(PretrainedConfig):
         """Alias introduced upstream for rope scaling dictionaries."""
         value = self._rope_parameters
         if value is None and hasattr(self, "text_config") and self.text_config is not None:
-            value = getattr(self.text_config, "rope_parameters", None) or getattr(self.text_config, "rope_scaling", None)
+            value = getattr(self.text_config, "rope_parameters", None) or getattr(
+                self.text_config, "rope_scaling", None
+            )
         if value is None:
             return {"rope_type": "default"}
         return value
@@ -1754,9 +1757,7 @@ class IsaacRotaryEmbedding(nn.Module):
 
         rope_source_cfg = config.get_text_config() if hasattr(config, "get_text_config") else config
         rope_params = (
-            getattr(rope_source_cfg, "rope_parameters", None)
-            or getattr(rope_source_cfg, "rope_scaling", None)
-            or {}
+            getattr(rope_source_cfg, "rope_parameters", None) or getattr(rope_source_cfg, "rope_scaling", None) or {}
         )
         legacy_rope_theta = getattr(rope_source_cfg, "rope_theta", None)
         if legacy_rope_theta is not None and isinstance(rope_params, dict) and "rope_theta" not in rope_params:
@@ -2285,8 +2286,6 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
         **kwargs,
     ) -> tuple | CausalLMOutputWithPast:
         r"""
-        Forward pass for conditional generation supporting both standard inputs and TensorStream.
-
         tensor_stream (`TensorStream`, *optional*):
             Packed multimodal stream (text, vision, audio tokens) that already encodes spatial metadata. When provided,
             the model derives embeddings, modality masks, and 3D rotary coordinates directly from the stream instead of
