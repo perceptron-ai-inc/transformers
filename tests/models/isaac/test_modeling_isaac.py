@@ -166,7 +166,6 @@ def tokenizer(isaac_reference_checkpoint):
         AutoTokenizer,
         isaac_reference_checkpoint,
         trust_remote_code=True,
-        use_fast=False,
     )
 
 
