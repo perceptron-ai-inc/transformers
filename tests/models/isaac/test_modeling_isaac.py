@@ -15,7 +15,7 @@ from transformers import (
     IsaacConfig,
     IsaacForConditionalGeneration,
     IsaacModel,
-    PreTrainedTokenizer,
+    PythonBackend,
     is_torch_available,
 )
 from transformers.models.isaac.configuration_isaac import IsaacVisionConfig
@@ -253,7 +253,7 @@ def _reference_checkpoint_or_skip():
     return MODEL_ID
 
 
-class SimpleIsaacTokenizer(PreTrainedTokenizer):
+class SimpleIsaacTokenizer(PythonBackend):
     vocab_files_names = {}
     model_input_names = ["input_ids"]
 
@@ -271,7 +271,7 @@ class SimpleIsaacTokenizer(PreTrainedTokenizer):
             eos_token="<eos>",
             pad_token="<pad>",
             unk_token="<unk>",
-            additional_special_tokens=["<image>"],
+            extra_special_tokens=["<image>"],
             model_max_length=512,
         )
         self.chat_template = (
