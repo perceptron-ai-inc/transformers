@@ -589,6 +589,20 @@ def test_isaac_processor_text_only_round_trip(isaac_processor):
 
 
 @require_torch
+@tensorstream_required
+def test_isaac_processor_accepts_batchencoding_chat_template(isaac_processor):
+    messages = [{"role": "user", "content": "Hello, how are you?"}]
+    batch_encoding = isaac_processor.apply_chat_template(messages, add_generation_prompt=True)
+
+    outputs = isaac_processor(text=batch_encoding, images=None, return_tensors="pt")
+
+    assert "input_ids" in outputs
+    assert "tensor_stream" in outputs
+    assert isinstance(outputs["tensor_stream"], TensorStream)
+    assert outputs["input_ids"].shape[0] == 1
+
+
+@require_torch
 @require_vision
 @tensorstream_required
 def test_isaac_processor_with_single_image(isaac_processor):
