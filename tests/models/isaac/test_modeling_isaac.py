@@ -422,9 +422,6 @@ class IsaacModelTester:
             # Keep the same multi-RoPE setup as the reference checkpoints but shrink the
             # sections so they sum to the rotary half-dimension (4) of this tiny test model.
             "rope_parameters": {"rope_type": "default", "mrope_section": [2, 1, 1], "mrope_interleaved": True},
-            # Qwen3 config expects `rope_theta` to be present on the text sub-config, so we
-            # set it explicitly to mimic real checkpoints and keep attribute mirroring working.
-            "rope_theta": 10000,
             "tie_word_embeddings": True,
         }
 
@@ -530,6 +527,16 @@ def test_isaac_config_extends_qwen3_defaults(isaac_tiny_config):
     assert isaac_tiny_config.max_sequence_length == 16384
     assert isaac_tiny_config.vision_rescale_factor == pytest.approx(1 / 255)
     assert isaac_tiny_config.vision_token == "<image>"
+
+
+def test_isaac_config_migrates_legacy_rope_theta():
+    cfg = IsaacConfig(text_config={"rope_theta": 12345})
+    assert cfg.rope_parameters.get("rope_theta") == 12345
+    assert cfg.rope_parameters.get("rope_type") == "default"
+    serialized = cfg.to_dict()
+    assert "rope_theta" not in serialized
+    assert "rope_theta" not in serialized.get("text_config", {})
+    assert serialized["rope_parameters"].get("rope_theta") == 12345
 
 
 @require_torch
