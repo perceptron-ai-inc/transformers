@@ -203,6 +203,13 @@ class IsaacVisionConfig(Siglip2VisionConfig):
         if self._attn_implementation is None:
             self._attn_implementation = "flash_attention_2"
 
+        # Keep legacy and new attention implementation fields in sync
+        existing_attn_impl = getattr(self, "attn_implementation", None)
+        if existing_attn_impl is None:
+            self.attn_implementation = self._attn_implementation
+        else:
+            self._attn_implementation = existing_attn_impl
+
 
 class IsaacImageProcessorKwargs(ImagesKwargs, total=False):
     patch_size: Optional[int]
@@ -1320,11 +1327,15 @@ class IsaacConfig(PretrainedConfig):
         text_config_kwargs.update(kwargs)
 
         self.text_config = self.sub_configs["text_config"](**text_config_kwargs)
-        if not hasattr(self.text_config, "rope_theta"):
-            rope_theta_override = text_config_kwargs.get("rope_theta", kwargs.get("rope_theta"))
-            if rope_theta_override is None:
-                rope_theta_override = getattr(Qwen3Config(), "rope_theta", 10000.0)
-            self.text_config.rope_theta = rope_theta_override
+
+        # Ensure rope_theta always exists and is non-None for rotary math
+        default_theta = text_config_kwargs.get("rope_theta", getattr(Qwen3Config(), "rope_theta", 10000.0))
+        current_theta = getattr(self.text_config, "rope_theta", None)
+        if current_theta is None:
+            try:
+                self.text_config.rope_theta = default_theta
+            except AttributeError:
+                setattr(self.text_config, "rope_theta", default_theta)
 
         super().__init__(**kwargs)
 
@@ -1335,6 +1346,7 @@ class IsaacConfig(PretrainedConfig):
 
         # Keep rope parameters alias in sync with upstream expectations
         self._rope_parameters = self._rope_scaling
+
 
         # Mirror frequently accessed Qwen3 attributes at the composite config level for BC.
         self.tie_word_embeddings = getattr(self.text_config, "tie_word_embeddings", False)
@@ -1397,7 +1409,7 @@ class IsaacConfig(PretrainedConfig):
     @property
     def rope_scaling(self):
         if hasattr(self, "text_config") and self.text_config is not None:
-            return getattr(self.text_config, "rope_scaling", None)
+            return getattr(self.text_config, "rope_parameters", None) or getattr(self.text_config, "rope_scaling", None)
         return self._rope_scaling
 
     @rope_scaling.setter
@@ -1405,6 +1417,9 @@ class IsaacConfig(PretrainedConfig):
         self._rope_scaling = value
         if hasattr(self, "text_config") and self.text_config is not None:
             self.text_config.rope_scaling = value
+            if hasattr(self.text_config, "rope_parameters"):
+                self.text_config.rope_parameters = value
+        self._rope_parameters = value
 
     @property
     def rope_parameters(self) -> dict[str, Any] | None:
