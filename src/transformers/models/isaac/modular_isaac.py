@@ -460,13 +460,6 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
         )
 
 
-def _max_from_cu(cu: Optional[torch.Tensor], fallback: int) -> int:
-    """Helper to compute max sequence length from cumulative sequence lengths."""
-    if cu is None or len(cu) < 2:
-        return fallback
-    return int((cu[1:] - cu[:-1]).max().item())
-
-
 def build_document_attention_mask(
     cu_seqlens: Optional[torch.Tensor],
     total_tokens: int,
