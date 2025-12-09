@@ -8,6 +8,7 @@ from functools import lru_cache
 from pathlib import Path
 
 import pytest
+from huggingface_hub import is_offline_mode
 
 from transformers import (
     AutoProcessor,
@@ -23,7 +24,7 @@ from transformers.models.isaac.image_processing_isaac_fast import IsaacImageProc
 from transformers.models.isaac.modeling_isaac import IsaacVisionAttention
 from transformers.models.isaac.processing_isaac import IsaacProcessor
 from transformers.testing_utils import require_torch, require_vision, slow, torch_device
-from transformers.utils import is_offline_mode, is_vision_available
+from transformers.utils import is_vision_available
 from transformers.utils.import_utils import is_perceptron_available
 
 
