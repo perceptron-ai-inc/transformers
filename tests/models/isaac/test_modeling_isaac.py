@@ -24,6 +24,7 @@ from transformers.models.isaac.modeling_isaac import IsaacVisionAttention
 from transformers.models.isaac.processing_isaac import IsaacProcessor
 from transformers.testing_utils import require_torch, require_vision, slow, torch_device
 from transformers.utils import is_offline_mode, is_vision_available
+from transformers.utils.import_utils import is_perceptron_available
 
 
 if is_vision_available():
@@ -38,10 +39,10 @@ from ...test_modeling_common import ids_tensor
 if is_torch_available():
     import torch
 
-try:
+if is_perceptron_available():
     from perceptron.tensorstream.ops import modality_mask, role_mask, tensor_stream_token_view
     from perceptron.tensorstream.tensorstream import TensorStream
-except Exception:
+else:
     TensorStream = None
 
 
