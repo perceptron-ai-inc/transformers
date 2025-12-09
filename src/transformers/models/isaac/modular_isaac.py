@@ -89,11 +89,18 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import Any, Optional, Union
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from ...utils.import_utils import (
+    is_perceptron_available,
+    is_torch_available,
+    is_torchdynamo_compiling,
+    is_vision_available,
+)
 
-from ...utils.import_utils import is_perceptron_available, is_torchdynamo_compiling, is_vision_available
+
+if is_torch_available():
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
 
 
 if is_vision_available():
