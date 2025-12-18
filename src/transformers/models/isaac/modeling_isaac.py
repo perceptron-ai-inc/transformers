@@ -398,6 +398,8 @@ class IsaacVisionEncoderLayer(GradientCheckpointingLayer):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
+        if output_attentions:
+            return hidden_states, attn_weights
         return hidden_states
 
 
@@ -420,6 +422,15 @@ class IsaacVisionEncoder(nn.Module):
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutput:
         hidden_states = inputs_embeds
+        kwargs.update(
+            {
+                "max_seqlen": max_seqlen,
+                "cu_seqlens": cu_seqlens,
+                "output_attentions": output_attentions,
+                "output_hidden_states": output_hidden_states,
+                "return_dict": return_dict,
+            }
+        )
         for encoder_layer in self.layers:
             hidden_states = encoder_layer(
                 hidden_states,
@@ -1320,6 +1331,29 @@ class IsaacPreTrainedModel(PreTrainedModel):
         "hidden_states": IsaacDecoderLayer,
         "attentions": IsaacAttention,
     }
+
+
+# ============================================================================
+# Model
+# ============================================================================
+
+
+def compute_position_ids_input_ids(input_ids: torch.Tensor) -> torch.Tensor:
+    r"""Create 3D positional indices for token input.
+
+    Args:
+        input_ids (`torch.Tensor`):
+            Tensor of shape `(batch_size, seq_len)` containing token ids.
+
+    Returns:
+        `torch.Tensor`: Positional indices with shape `(batch_size, seq_len, 3)` where each channel duplicates the
+        1D position so it can be consumed by the 3-axis MRoPE rotary embedding.
+    """
+    batch_size, seq_length = input_ids.shape
+    position_ids = torch.arange(seq_length, device=input_ids.device)
+    position_ids = position_ids.view(1, -1).expand(batch_size, -1)
+    position_ids = position_ids.unsqueeze(2).expand(-1, -1, 3)  # Add 3D for MRoPE
+    return position_ids
 
 
 @auto_docstring
