@@ -585,33 +585,6 @@ def merge_streams(streams: Iterable["Stream"]) -> "Stream":
 EventDescriptor = NewType("EventDescriptor", Any)
 
 
-# NOTE: actually not used now but thought it *might* be useful
-def get_stream_descriptor(
-    stream: Stream, measure_fn: Callable[[Event], EventDescriptor] = lambda ev: ev.type
-) -> set[Any]:
-    """
-    Create a set of descriptors for each Event in a Stream based on measure_fn.
-
-    measure_fn maps an Event to a descriptive key.
-    For example, if events have different data shapes, one might use:
-        measure_fn = lambda ev: ev.data.shape
-    i.e.
-        stream of VisionTypes with tensors of shapes [(1, 3, 3), (1, 3, 3), (1, 4, 4)]
-        get_stream_descriptor(stream, measure_fn=lambda t: t.shape) = {(1, 3, 3), (1, 4, 4)}
-        now we can pass this into group_streams which will split out vision sub-streams which can be bundled
-    Returns:
-        A set of descriptors representing the Events in the stream.
-
-    Example usage:
-        descriptor = get_stream_descriptor(my_stream, lambda ev: ev.type)
-    """
-    stream_descriptor = set()
-    for ev in stream.events:
-        ev_measurement = measure_fn(ev)
-        stream_descriptor.add(ev_measurement)
-    return stream_descriptor
-
-
 def group_streams(
     stream: Stream, group_fn: Callable[[Event], EventDescriptor], schedule=True
 ) -> dict[EventDescriptor, Stream]:
