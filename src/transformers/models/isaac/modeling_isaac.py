@@ -1185,10 +1185,6 @@ def event_mask(
     return stream_apply(ts, to_label, compact=True).squeeze(-1)
 
 
-def modality_mask(ts: TensorStream) -> torch.Tensor:
-    return event_mask(ts, lambda ev: ev.type.value)
-
-
 def tensor_stream_token_view(
     text_token_ids: torch.Tensor,
     modality_tensor: torch.Tensor,
@@ -1318,12 +1314,14 @@ def tensor_stream_to_packed_inputs(tensor_stream: TensorStream) -> dict[str, Opt
         token_offsets = None
         token_lengths = None
 
+    modality_tensor = event_mask(tensor_stream, lambda ev: ev.type.value)
+
     return {
         "vision_patches": seq_patches,
         "vision_token_grids": token_grids,
         "vision_token_offsets": token_offsets,
         "vision_token_lengths": token_lengths,
-        "modality_tensor": modality_mask(tensor_stream),
+        "modality_tensor": modality_tensor,
         "position_ids": compute_mrope_pos_tensor(tensor_stream),
         "text_token_ids": text_token_ids,
     }
