@@ -433,20 +433,6 @@ def modality_mask(ts: TensorStream) -> torch.Tensor:
     return event_mask(ts, lambda ev: ev.type.value)
 
 
-ROLE_TO_IDX = {
-    None: -1,
-    "": -1,
-    "agent": 0,
-    "user": 1,
-    "system": 2,
-    # … add more if you like
-}
-
-
-def role_mask(ts: TensorStream) -> torch.Tensor:
-    return event_mask(ts, lambda ev: ROLE_TO_IDX.get(ev.role, -1))
-
-
 def tensor_stream_token_view(ts: TensorStream) -> torch.Tensor:
     """
     Return a (B, T) token view by summing across the last dim of every
