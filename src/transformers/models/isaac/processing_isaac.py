@@ -44,7 +44,7 @@ else:
     Image = None
 
 
-def _schedule_stream(stream: Stream) -> Stream:
+def _schedule_stream(stream: "Stream") -> "Stream":
     """
     Internal function that reorders (schedules) the events in a Stream
     based on the stream's priority.
@@ -60,7 +60,7 @@ def _schedule_stream(stream: Stream) -> Stream:
     return stream
 
 
-def create_stream(events: list[Event], priority: list[ModalityType], schedule: bool = True) -> Stream:
+def create_stream(events: list["Event"], priority: list[ModalityType], schedule: bool = True) -> "Stream":
     """
     Creates a new Stream with the given events and priority.
     If 'schedule' is True, the events are reordered by calling _schedule_stream.
@@ -83,7 +83,7 @@ def create_stream(events: list[Event], priority: list[ModalityType], schedule: b
 Category = NewType("Category", Any)
 
 
-def schedule_events(stream: Stream, priority: list[Category]) -> list[int]:
+def schedule_events(stream: "Stream", priority: list[Category]) -> list[int]:
     """
     Schedule events based on their start time and priority using a topological sort algorithm.
 
@@ -197,7 +197,7 @@ def tensor_stream_token_view(ts: TensorStream) -> torch.Tensor:
 # ============================================================================
 
 
-def create_text_event(tokenizer: AutoTokenizer, text: str, time: float = 0.0) -> Event:
+def create_text_event(tokenizer: AutoTokenizer, text: str, time: float = 0.0) -> "Event":
     r"""Wrap a text into an `Event` compatible with the multimodal TensorStream.
 
     Args:
@@ -287,7 +287,7 @@ class IsaacProcessor(ProcessorMixin):
         self,
         text: str,
         images: Optional[list[Image]] = None,
-    ) -> Stream:
+    ) -> "Stream":
         events = []
         # Process text and images
         # Find all occurrences of vision token

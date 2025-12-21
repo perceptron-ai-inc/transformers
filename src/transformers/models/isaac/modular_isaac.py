@@ -21,7 +21,7 @@ import math
 import re
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
-from typing import Any, NewType, Optional, Union
+from typing import Any, Optional, Union, NewType
 
 from ...utils.import_utils import (
     is_torch_available,
@@ -149,17 +149,6 @@ class TextType(ModalityType):
     padding = 2
 
 
-# maps idx -> type
-ALL_TYPES = [
-    tp
-    for types in [
-        list(VisionType),
-        list(TextType),
-    ]
-    for tp in types
-]
-
-
 # @dataclass
 @dataclass(slots=True)
 class Event:
@@ -229,7 +218,7 @@ class Event:
             return math.prod(self.dims(virtual=False))
         return self.idx_range[1] - self.idx_range[0] if partial else math.prod(self.dims())
 
-    def shallow_copy(self) -> Event:
+    def shallow_copy(self) -> "Event":
         return replace(self)
 
     def __hash__(self) -> int:
@@ -324,7 +313,7 @@ class Stream:
         """Returns the number of Event objects in this Stream."""
         return len(self.events)
 
-    def __getitem__(self, key: int) -> Stream | Event:
+    def __getitem__(self, key: int) -> "Stream | Event":
         return self.events[key]
 
     def __iter__(self):
@@ -341,7 +330,7 @@ class Stream:
         func: Callable[[Event], dict[str, Any]],
         *,
         copy_unchanged: bool = False,  # opt-in if you really need isolation
-    ) -> Stream:
+    ) -> "Stream":
         """
         Apply *func* to every event and return a new Stream.
 
@@ -384,10 +373,10 @@ class Stream:
         ).contiguous()
         return tensor
 
-    def flatten(self) -> Stream:
+    def flatten(self) -> "Stream":
         return self.map(lambda ev: {"data": ev.data.reshape(-1, ev.data.shape[-1])})
 
-    def shallow_copy(self) -> Stream:
+    def shallow_copy(self) -> "Stream":
         events_copy = [ev.shallow_copy() for ev in self.events]
         return create_stream(events=events_copy, priority=self.priority, schedule=False)
 
@@ -430,7 +419,7 @@ class TensorStream:
         compact_tensor_stream = torch.stack([stream.compact() for stream in self.streams]).contiguous()
         return compact_tensor_stream
 
-    def map(self, event_tf: Callable[[Event], dict[str, Any]]) -> TensorStream:
+    def map(self, event_tf: Callable[[Event], dict[str, Any]]) -> "TensorStream":
         mapped_streams = [stream.map(event_tf) for stream in self.streams]
         return TensorStream(mapped_streams)
 
@@ -443,7 +432,7 @@ class TensorStream:
         tensor = torch.tensor(mapped_list, dtype=torch.long, device=self.device).reshape(B, T)
         return tensor
 
-    def flat_stream(self) -> Stream:
+    def flat_stream(self) -> "Stream":
         if not self.streams:
             return create_stream([], priority=[], schedule=False)
         return create_stream(
@@ -467,7 +456,7 @@ class TensorStream:
         device: torch.device | str,
         dtype: torch.dtype | None = None,
         non_blocking: bool = True,
-    ) -> TensorStream:
+    ) -> "TensorStream":
         """
         Move **all** `Event.data` tensors to *device*.
 
@@ -515,42 +504,6 @@ class TensorStream:
         self._device = target_device
         return self
 
-    def pin_memory(self, non_blocking: bool = True) -> TensorStream:
-        """
-        Page-lock (aka *pin*) all **CPU** tensors contained in this
-        `TensorStream`.  Pinned tensors make subsequent asynchronous
-        H2D copies (e.g. inside `TensorStream.to("cuda")`) faster and,
-        when used together with a `DataLoader(pin_memory=True)`,
-        enable overlap of host-to-device transfers with GPU execution.
-
-        The call is a no-op for tensors that are already on a CUDA /
-        MPS / other non-CPU device.
-
-        Parameters
-        ----------
-        non_blocking : bool, default = True
-            Forwarded to `Tensor.pin_memory()`; should almost always
-            stay *True* so later `to(device, non_blocking=True)` calls
-            can overlap.
-
-        Returns
-        -------
-        self : TensorStream
-            The same object (mutated in-place) to allow call chaining.
-        """
-        for stream in self.streams:
-            for ev in stream:
-                if ev.data.device.type == "cpu":
-                    # `pin_memory()` clones only when needed
-                    pinned = ev.data.pin_memory()  # noqa: F841
-                    # NB: pin_memory() preserves dtype/shape/grad/etc.
-                    if not non_blocking:
-                        # ensure the pinning work is done now
-                        torch.cuda.current_stream().synchronize()  # safe on CPU too
-                    ev.data = pinned
-        # `_device` **stays** the same (still CPU) – no change needed
-        return self
-
     def __hash__(self) -> int:
         """Hash TensorStream based on structure."""
         return hash(
@@ -574,13 +527,7 @@ class TensorStream:
         )
 
 
-def collate_tensor_stream(
-    tensor_streams: list[TensorStream],
-) -> TensorStream:
-    return TensorStream([stream for ts in tensor_streams for stream in ts.streams])
-
-
-def _schedule_stream(stream: Stream) -> Stream:
+def _schedule_stream(stream: "Stream") -> "Stream":
     """
     Internal function that reorders (schedules) the events in a Stream
     based on the stream's priority.
@@ -596,7 +543,7 @@ def _schedule_stream(stream: Stream) -> Stream:
     return stream
 
 
-def create_stream(events: list[Event], priority: list[ModalityType], schedule: bool = True) -> Stream:
+def create_stream(events: list["Event"], priority: list[ModalityType], schedule: bool = True) -> "Stream":
     """
     Creates a new Stream with the given events and priority.
     If 'schedule' is True, the events are reordered by calling _schedule_stream.
@@ -615,7 +562,7 @@ def create_stream(events: list[Event], priority: list[ModalityType], schedule: b
     return stream
 
 
-def merge_streams(streams: Iterable[Stream]) -> Stream:
+def merge_streams(streams: Iterable["Stream"]) -> "Stream":
     """
     Merges multiple Stream objects into one.
     The priority of the merged stream is chosen from the longest priority list among the inputs.
@@ -696,7 +643,7 @@ def group_streams(
 Category = NewType("Category", Any)
 
 
-def schedule_events(stream: Stream, priority: list[Category]) -> list[int]:
+def schedule_events(stream: "Stream", priority: list[Category]) -> list[int]:
     """
     Schedule events based on their start time and priority using a topological sort algorithm.
 
@@ -855,23 +802,6 @@ def event_mask(
     return ts.map_compact(to_label).squeeze(-1)
 
 
-def event_mask_by_key(
-    ts: TensorStream,
-    key: str,
-    tag_index: dict[str, int],
-    default: int = -1,
-) -> torch.Tensor:
-    """
-    Faster call-site syntax when you just want to look up
-    `event.tags[key]` and map it through `tag_index`.
-    """
-    return event_mask(
-        ts,
-        lambda ev: tag_index.get(ev.tags.get(key)) if key in ev.tags else None,
-        default=default,
-    )
-
-
 def modality_mask(ts: TensorStream) -> torch.Tensor:
     return event_mask(ts, lambda ev: ev.type.value)
 
@@ -909,8 +839,8 @@ def tensor_stream_token_view(ts: TensorStream) -> torch.Tensor:
 
 
 def reconstruct_tensor_stream_from_compact_dict(
-    ts: TensorStream, compact_dict: dict[ModalityType, torch.Tensor]
-) -> TensorStream:
+    ts: "TensorStream", compact_dict: dict[ModalityType, torch.Tensor]
+) -> "TensorStream":
     streams = []
     for stream in ts.streams:
         event_list = []
@@ -984,7 +914,7 @@ def set_data(
     return data, set_data_mask
 
 
-def slice(tensor_stream: TensorStream, start: int, end: int) -> TensorStream:
+def slice(tensor_stream: "TensorStream", start: int, end: int) -> "TensorStream":
     """
     Return a new TensorStream that contains *only* the tokens in the
     half-open interval ``[start, end)`` (0-based, inclusive-exclusive).
@@ -2099,7 +2029,7 @@ class IsaacConfig(PretrainedConfig):
 # ============================================================================
 
 
-def create_text_event(tokenizer: AutoTokenizer, text: str, time: float = 0.0) -> Event:
+def create_text_event(tokenizer: AutoTokenizer, text: str, time: float = 0.0) -> "Event":
     r"""Wrap a text into an `Event` compatible with the multimodal TensorStream.
 
     Args:
@@ -2189,7 +2119,7 @@ class IsaacProcessor(ProcessorMixin):
         self,
         text: str,
         images: Optional[list[Image]] = None,
-    ) -> Stream:
+    ) -> "Stream":
         events = []
         # Process text and images
         # Find all occurrences of vision token
