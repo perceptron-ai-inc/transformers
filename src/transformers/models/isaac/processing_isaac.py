@@ -19,20 +19,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import heapq
 import math
 import re
-from typing import Optional, Union
+from collections import defaultdict
+from typing import Any, NewType, Optional, Union
 
 from ...feature_extraction_utils import BatchFeature
 from ...models.auto.tokenization_auto import AutoTokenizer
 from ...processing_utils import ProcessorMixin
 from ...utils import TensorType
-from ...utils.import_utils import (
-    is_perceptron_available,
-    is_torch_available,
-    is_vision_available,
-)
+from ...utils.import_utils import is_torch_available, is_vision_available
 from .configuration_isaac import IsaacConfig
+from .modeling_isaac import Event, ModalityType, Stream, TensorStream, TextType, VisionType
 
 
 if is_torch_available():
@@ -44,19 +43,153 @@ if is_vision_available():
 else:
     Image = None
 
-if is_perceptron_available():
-    from perceptron.tensorstream.ops import slice as ts_slice
-    from perceptron.tensorstream.ops import tensor_stream_token_view
-    from perceptron.tensorstream.tensorstream import Event, Stream, TensorStream, TextType, VisionType, create_stream
-else:
-    ts_slice = None
-    Event = None
-    Stream = None
-    TensorStream = None
-    TextType = None
-    VisionType = None
-    create_stream = None
-    group_streams = None
+
+def _schedule_stream(stream: Stream) -> Stream:
+    """
+    Internal function that reorders (schedules) the events in a Stream
+    based on the stream's priority.
+
+    By default, this calls schedule_events(...) and reorders the events accordingly.
+    The new ordering is assigned in-place to stream.events.
+
+    Example usage (indirect):
+        new_stream = _schedule_stream(old_stream)
+    """
+    scheduled_inds = schedule_events(stream, priority=stream.priority)
+    stream.events = [stream.events[i] for i in scheduled_inds]
+    return stream
+
+
+def create_stream(events: list[Event], priority: list[ModalityType], schedule: bool = True) -> Stream:
+    """
+    Creates a new Stream with the given events and priority.
+    If 'schedule' is True, the events are reordered by calling _schedule_stream.
+
+    Example usage:
+        evt1 = Event(torch.zeros(10), TextType.text, (0.0, 1.0))
+        evt2 = Event(torch.ones(10), TextType.text, (1.0, 2.0))
+        my_stream = create_stream(events=[evt1, evt2],
+                                  priority=[TextType.text],
+                                  schedule=False)
+        print(my_stream)
+    """
+    stream = Stream(events, priority)
+    if schedule:
+        stream = _schedule_stream(stream)
+    return stream
+
+
+# Define Category for clarity
+Category = NewType("Category", Any)
+
+
+def schedule_events(stream: Stream, priority: list[Category]) -> list[int]:
+    """
+    Schedule events based on their start time and priority using a topological sort algorithm.
+
+    The priority list defines the ordering of categories.
+
+    This function:
+      1. Pairs each event with its original index.
+      2. Sorts events by start time.
+      3. Builds a dependency graph based on overlapping events.
+      4. Uses a heap to perform a deterministic topological sort with tie-breakers.
+
+    Raises:
+        ValueError: If a cycle is detected in the events (i.e., no valid ordering exists).
+
+    Returns:
+        List[int]: A list of original indices representing the scheduled order of events.
+    """
+    priority_index: dict[Category, int] = {category: idx for idx, category in enumerate(priority)}
+
+    # Pair each event metadata with its original index
+    events = []
+    for i, event in enumerate(stream.events):
+        events.append(
+            (
+                i,
+                event.time[0],
+                event.time[1],
+                event.type,
+            )
+        )
+
+    sorted_events = sorted(events, key=lambda e: e[1])  # sort by start time
+    num_events = len(sorted_events)
+
+    # Build dependency graph
+    graph = defaultdict(set)
+    indegree = dict.fromkeys(range(num_events), 0)
+
+    for i in range(num_events):
+        idx_i, start_i, end_i, category_i = sorted_events[i]
+        prio_i = priority_index[category_i]
+        for j in range(i + 1, num_events):
+            idx_j, start_j, end_j, category_j = sorted_events[j]
+            if start_j >= end_i:
+                break
+            if end_i > start_j and end_j > start_i:
+                prio_j = priority_index[category_j]
+                if prio_i < prio_j:
+                    graph[i].add(j)
+                    indegree[j] += 1
+                elif prio_i > prio_j:
+                    graph[j].add(i)
+                    indegree[i] += 1
+
+    # Use heap for deterministic tie-breakers: (start_time, priority, original_index)
+    heap = [
+        (
+            sorted_events[i][1],
+            priority_index[sorted_events[i][3]],
+            sorted_events[i][0],
+            i,
+        )
+        for i in range(num_events)
+        if indegree[i] == 0
+    ]
+    heapq.heapify(heap)
+    resolved_order = []
+
+    while heap:
+        _, _, _, u = heapq.heappop(heap)
+        resolved_order.append(u)
+        for v in graph[u]:
+            indegree[v] -= 1
+            if indegree[v] == 0:
+                heapq.heappush(
+                    heap,
+                    (
+                        sorted_events[v][1],
+                        priority_index[sorted_events[v][3]],
+                        sorted_events[v][0],
+                        v,
+                    ),
+                )
+
+    if len(resolved_order) != num_events:
+        raise ValueError("Cycle detected in events, cannot resolve order")
+
+    return [sorted_events[i][0] for i in resolved_order]
+
+
+def tensor_stream_token_view(ts: TensorStream) -> torch.Tensor:
+    """
+    Return a (B, T) token view by summing across the last dim of every
+    event and flattening over the selected token range.
+    """
+
+    def to_token_view(ev: Event) -> list[int]:
+        # collapse all but the last dim, cast to long
+        flat = ev.data.sum(dim=-1).long().reshape(-1)
+        if ev.idx_range is not None:
+            s, e = ev.idx_range
+            return flat[s:e].tolist()
+        else:
+            return flat.tolist()
+
+    return ts.map_compact(to_token_view)  # shape (B, T)
 
 
 # ============================================================================
