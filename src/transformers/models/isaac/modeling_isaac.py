@@ -24,7 +24,7 @@ import copy
 import itertools
 import math
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
 from typing import Any, Optional, Union
@@ -183,55 +183,6 @@ class Stream:
         """
         yield from self.events
 
-    # --- after ------------------------------------------------------------
-    def map(
-        self,
-        func: Callable[[Event], dict[str, Any]],
-        *,
-        copy_unchanged: bool = False,  # opt-in if you really need isolation
-    ) -> "Stream":
-        """
-        Apply *func* to every event and return a new Stream.
-
-        *func* must return a **dict of fields that actually change**.
-        We create **one shallow copy** only when something changes;
-        unchanged events are reused directly, which is inexpensive and
-        keeps autograd graphs intact.
-        """
-        mapped: list[Event] = []
-        for ev in self.events:
-            delta = func(ev)
-            if not delta:  # fast-path: nothing changes
-                mapped.append(ev if not copy_unchanged else ev.shallow_copy())
-                continue
-
-            new_ev = ev.shallow_copy()  # ⚡ no tensor clone
-            for k, v in delta.items():
-                setattr(new_ev, k, v)
-            mapped.append(new_ev)
-
-        return Stream(mapped, priority=self.priority)
-
-    def compact(self) -> torch.Tensor:
-        assert all([(isinstance(ev.data, torch.Tensor) and ev.is_measured) for ev in self.events]), (
-            "Stream.compact only works for streams with events that have measured tensor data"
-        )
-        return torch.cat([ev.data for ev in self.events]).contiguous()
-
-    def map_compact(self, event_tf: Callable[[Event], list[Any]]) -> torch.Tensor:
-        mapped_list = []
-        for event in self:
-            mapped_list.extend(event_tf(event))
-        tensor = torch.tensor(
-            mapped_list,
-            dtype=torch.long,
-            device=next(
-                (ev.data.device for ev in self.events if isinstance(ev.data, torch.Tensor)),
-                "cpu",
-            ),
-        ).contiguous()
-        return tensor
-
     def shallow_copy(self) -> "Stream":
         events_copy = [ev.shallow_copy() for ev in self.events]
         return Stream(events=events_copy, priority=self.priority)
@@ -249,24 +200,6 @@ class TensorStream:
                 assert isinstance(event.data, torch.Tensor)
                 if self._device is None:
                     self._device = torch.device(event.data.device)
-
-    # TODO: implement non-strict compaction modes
-    def compact(self, mode="strict") -> torch.Tensor:
-        compact_tensor_stream = torch.stack([stream.compact() for stream in self.streams]).contiguous()
-        return compact_tensor_stream
-
-    def map(self, event_tf: Callable[[Event], dict[str, Any]]) -> "TensorStream":
-        mapped_streams = [stream.map(event_tf) for stream in self.streams]
-        return TensorStream(mapped_streams)
-
-    def map_compact(self, event_tf: Callable[[Event], list[Any]]) -> torch.Tensor:
-        mapped_list = []
-        for stream in self.streams:
-            for event in stream:
-                mapped_list.extend(event_tf(event))
-        B, T = self.shape
-        tensor = torch.tensor(mapped_list, dtype=torch.long, device=self.device).reshape(B, T)
-        return tensor
 
     @property
     def device(self):
@@ -1054,6 +987,137 @@ class IsaacRotaryEmbedding(qwen2_5_vl_modeling.Qwen2_5_VLRotaryEmbedding):
         return cos_combined, sin_combined
 
 
+def _infer_device_from_streams(streams: list[Stream]) -> torch.device | str:
+    return next(
+        (ev.data.device for stream in streams for ev in stream.events if isinstance(ev.data, torch.Tensor)),
+        "cpu",
+    )
+
+
+def _compact_stream_events(stream: Stream) -> torch.Tensor:
+    assert all([(isinstance(ev.data, torch.Tensor) and ev.is_measured) for ev in stream.events]), (
+        "stream_apply(compact=True) only works for streams with events that have measured tensor data"
+    )
+    return torch.cat([ev.data for ev in stream.events]).contiguous()
+
+
+def _map_stream(
+    stream: Stream,
+    map_fn: Callable[[Event], Any] | None,
+    *,
+    copy_unchanged: bool,
+) -> tuple[str, Stream | list[Any]]:
+    if map_fn is None:
+        return "events", stream if not copy_unchanged else stream.shallow_copy()
+
+    mapped_events: list[Event] = []
+    flat_values: list[Any] = []
+    mode: str | None = None
+
+    for ev in stream:
+        out = map_fn(ev)
+        if out is None:
+            out = {}
+
+        if isinstance(out, dict):
+            if mode is None:
+                mode = "events"
+            elif mode != "events":
+                raise ValueError("map_fn must consistently return a dict or an iterable for every event")
+
+            if not out:
+                mapped_events.append(ev if not copy_unchanged else ev.shallow_copy())
+                continue
+
+            new_ev = ev.shallow_copy()
+            for k, v in out.items():
+                setattr(new_ev, k, v)
+            mapped_events.append(new_ev)
+            continue
+
+        if isinstance(out, Iterable) and not isinstance(out, (str, bytes)):
+            if mode is None:
+                mode = "flat"
+            elif mode != "flat":
+                raise ValueError("map_fn must consistently return a dict or an iterable for every event")
+
+            flat_values.extend(out)
+            continue
+
+        raise TypeError(f"map_fn must return a dict or iterable, got {type(out)}")
+
+    if mode is None:
+        mode = "events"
+        mapped_events = stream.events if not copy_unchanged else [ev.shallow_copy() for ev in stream.events]
+        return mode, Stream(mapped_events, priority=stream.priority)
+
+    if mode == "events":
+        return mode, Stream(mapped_events, priority=stream.priority)
+
+    return mode, flat_values
+
+
+def stream_apply(
+    stream_like: Stream | TensorStream,
+    map_fn: Callable[[Event], Any] | None = None,
+    *,
+    compact: bool = False,
+    copy_unchanged: bool = False,
+) -> Stream | TensorStream | torch.Tensor | list[Any] | list[list[Any]]:
+    """
+    Unified helper to (optionally) map over events and (optionally) compact to tensors.
+
+    Args:
+        stream_like: A ``Stream`` or ``TensorStream`` instance.
+        map_fn: Optional callable applied to every ``Event``. It may return a dict of field deltas
+            (structural map) or an iterable of values (token map). Returning ``None`` is treated as ``{}``.
+        compact: When True, returns a tensor (``(B, T)`` for ``TensorStream``, ``(T,)`` for ``Stream``).
+        copy_unchanged: When True, shallow-copy events even if unchanged.
+
+    Returns:
+        Stream/TensorStream, torch.Tensor, or list(s) depending on ``compact`` and ``map_fn`` mode.
+    """
+    is_batch = isinstance(stream_like, TensorStream)
+
+    streams = stream_like.streams if is_batch else [stream_like]
+    mapped_streams: list[Stream] = []
+    flat_batches: list[list[Any]] = []
+    mode: str | None = None
+
+    for stream in streams:
+        stream_mode, payload = _map_stream(stream, map_fn, copy_unchanged=copy_unchanged)
+        if mode is None:
+            mode = stream_mode
+        elif mode != stream_mode:
+            raise ValueError("map_fn must return the same type (dict vs iterable) for every stream")
+
+        if stream_mode == "events":
+            mapped_streams.append(payload)  # type: ignore[arg-type]
+        else:
+            flat_batches.append(payload)  # type: ignore[arg-type]
+
+    if mode is None:
+        mode = "events"
+        mapped_streams = streams if not copy_unchanged else [s.shallow_copy() for s in streams]
+
+    if not compact:
+        if mode == "events":
+            return TensorStream(mapped_streams) if is_batch else mapped_streams[0]
+        return flat_batches if is_batch else flat_batches[0]
+
+    if mode == "events":
+        compacted = [_compact_stream_events(s) for s in mapped_streams]
+        return torch.stack(compacted).contiguous() if is_batch else compacted[0]
+
+    device = _infer_device_from_streams(streams)
+    flat_values: list[Any] = list(itertools.chain.from_iterable(flat_batches)) if is_batch else flat_batches[0]
+    tensor = torch.tensor(flat_values, dtype=torch.long, device=device)
+    if is_batch:
+        B, T = stream_like.shape  # type: ignore[union-attr]
+        tensor = tensor.reshape(B, T)
+    return tensor.contiguous()
+
+
 def compute_mrope_pos_tensor(ts: TensorStream, n_pos_dims: int = 3) -> torch.Tensor:
     """
     Create a (batch, T, n_pos_dims) position tensor in one sweep.
@@ -1119,7 +1183,7 @@ def event_mask(
             label = default
         return [label] * ev.num_tokens()
 
-    return ts.map_compact(to_label).squeeze(-1)
+    return stream_apply(ts, to_label, compact=True).squeeze(-1)
 
 
 def modality_mask(ts: TensorStream) -> torch.Tensor:
@@ -1271,7 +1335,7 @@ class IsaacModel(PreTrainedModel):
                 flat_stream.priority,
             )
         per_modality_stream = dict(split_streams)
-        per_modality_compact_stream = {k: v.compact() for k, v in per_modality_stream.items()}
+        per_modality_compact_stream = {k: stream_apply(v, compact=True) for k, v in per_modality_stream.items()}
 
         # Collect per-event grids for vision tokens (H, W like dims sans time)
         token_grids = defaultdict(list)
@@ -1295,7 +1359,7 @@ class IsaacModel(PreTrainedModel):
 
         # Reconstruct a TensorStream with embedded payloads and compact
         embedded_ts = reconstruct_tensor_stream_from_compact_dict(tensor_stream, embedded_compact)
-        h = embedded_ts.compact()  # (B, T, D)
+        h = stream_apply(embedded_ts, compact=True)  # (B, T, D)
         return h
 
     def embed_packed_inputs(
