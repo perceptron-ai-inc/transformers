@@ -361,11 +361,6 @@ class TensorStream:
         tensor = torch.tensor(mapped_list, dtype=torch.long, device=self.device).reshape(B, T)
         return tensor
 
-    def flat_stream(self) -> "Stream":
-        if not self.streams:
-            return Stream([], priority=[])
-        return Stream([event for stream in self.streams for event in stream], priority=self.streams[0].priority)
-
     @property
     def device(self):
         return self._device
@@ -1174,34 +1169,6 @@ class IsaacRotaryEmbedding(qwen2_5_vl_modeling.Qwen2_5_VLRotaryEmbedding):
         return cos_combined, sin_combined
 
 
-def group_streams(stream: Stream, group_fn: Callable[[Event], Any]) -> dict[Any, Stream]:
-    """
-    Splits a single Stream into multiple sub-Streams, grouped by the output of group_fn(event).
-
-    For example, group_fn could be:
-        - lambda ev: ev.type
-        - lambda ev: (ev.type, ev.data.shape)
-        - lambda ev: (ev.type, ev.dims())
-
-    Returns:
-        A dictionary mapping each group key to a Stream of events belonging to that group.
-        If 'schedule' is True, each sub-Stream is scheduled via create_stream(..., schedule=True).
-
-    Example usage:
-        substreams = group_streams(my_stream, lambda ev: ev.type)
-    """
-    split_streams: defaultdict[Any, list[Event]] = defaultdict(list)
-    for ev in stream:
-        group = group_fn(ev)
-        split_streams[group].append(ev)
-    for g, events in split_streams.items():
-        split_streams[g] = Stream(
-            events,
-            stream.priority,
-        )
-    return dict(split_streams)
-
-
 def compute_mrope_pos_tensor(ts: TensorStream, n_pos_dims: int = 3) -> torch.Tensor:
     """
     Create a (batch, T, n_pos_dims) position tensor in one sweep.
@@ -1406,8 +1373,19 @@ class IsaacModel(PreTrainedModel):
         Embed each modality stream independently, preserving the original TensorStream
         structure.
         """
-        flat_stream = tensor_stream.flat_stream()
-        per_modality_stream = group_streams(flat_stream, group_fn=lambda ev: ev.type)
+        flat_stream = Stream(
+            [event for stream in tensor_stream.streams for event in stream], priority=tensor_stream.streams[0].priority
+        )
+        split_streams: defaultdict[Any, list[Event]] = defaultdict(list)
+        for ev in flat_stream:
+            group = ev.type
+            split_streams[group].append(ev)
+        for g, events in split_streams.items():
+            split_streams[g] = Stream(
+                events,
+                flat_stream.priority,
+            )
+        per_modality_stream = dict(split_streams)
         per_modality_compact_stream = {k: v.compact() for k, v in per_modality_stream.items()}
 
         # Collect per-event grids for vision tokens (H, W like dims sans time)
