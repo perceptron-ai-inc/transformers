@@ -853,67 +853,6 @@ def reconstruct_tensor_stream_from_compact_dict(
     return TensorStream(streams)
 
 
-def set_data(
-    tensor_stream: TensorStream,
-    stream_types: Iterable[ModalityType],
-    roles: Iterable[str] = ROLE_TO_IDX.keys(),
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Gathers data from a TensorStream according to the given stream types
-    and returns (data, mask) where 'data' has valid entries for
-    each requested stream type and 'mask' indicates which elements
-    in 'data' are valid.
-
-    NOTE: Currently assumes stream_types are text-based types, but can be extended.
-
-    Args:
-        tensor_stream (TensorStream):
-            The input TensorStream which contains data for multiple modalities.
-        stream_types (Iterable[ModalityType]):
-            A list or iterable of modality types (e.g., TextType, VisionType, etc.)
-            to retrieve from the TensorStream.
-        exclude_non_agent_roles (bool, optional):
-            If True, only include tokens with role="agent" or role=None in the loss calculation.
-            Defaults to False.
-
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]:
-            - data: A tensor of the same shape as the internal metadata shape,
-              containing valid entries from the given stream types.
-            - mask: A boolean tensor of the same shape, where True indicates
-              the corresponding element in 'data' is valid/used.
-    """
-    # Retrieve indexing and shape metadata
-    st_tensor = modality_mask(tensor_stream)  # (B, T) modality-ids
-    roles_tensor = role_mask(tensor_stream)  # (B, T) role-ids
-
-    # Create output data placeholders on the same device
-    data = torch.zeros_like(st_tensor).to(tensor_stream.device)
-    set_data_mask = torch.zeros_like(st_tensor).bool().to(tensor_stream.device).bool()
-    per_modality_stream = group_streams(tensor_stream.flat_stream(), group_fn=lambda ev: ev.type, schedule=False)
-    per_modality_compact_stream = {k: v.compact() for k, v in per_modality_stream.items()}
-
-    # Fill 'data' and 'set_data_mask' for each requested stream type
-    for st in stream_types:
-        data_mask = st_tensor == st.value
-        partial_mask = (
-            per_modality_stream[st]
-            .map_compact(
-                lambda ev: [int(ev.idx_range[0] <= i < ev.idx_range[1]) for i in range(ev.num_tokens(partial=False))]
-            )
-            .bool()
-        )
-        data[data_mask] = per_modality_compact_stream[st].reshape(-1)[partial_mask]
-
-        roles_mask = torch.zeros_like(st_tensor).bool().to(tensor_stream.device).bool()
-        for role in roles:
-            roles_mask |= roles_tensor == ROLE_TO_IDX[role]
-        data_mask = data_mask & roles_mask
-        set_data_mask[data_mask] = True
-
-    return data, set_data_mask
-
-
 def slice(tensor_stream: "TensorStream", start: int, end: int) -> "TensorStream":
     """
     Return a new TensorStream that contains *only* the tokens in the
