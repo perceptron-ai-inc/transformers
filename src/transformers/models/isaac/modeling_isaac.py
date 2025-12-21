@@ -1564,8 +1564,6 @@ class IsaacModel(PreTrainedModel):
                     f"but got {tuple(modality_tensor.shape)}"
                 )
 
-        # Prefer tensor-based positions; fall back to tensor_stream only when nothing else is provided.
-        stream_for_positions = None
         if position_ids is None:
             position_ids = cache_position.view(1, -1).expand(modality_tensor.shape[0], -1)
 
@@ -1636,8 +1634,6 @@ class IsaacModel(PreTrainedModel):
             if input_ids is None:
                 input_ids = tensor_stream_token_view(tensor_stream).to(dtype=torch.long)
                 modality_for_ids = packed_inputs.get("modality_tensor")
-                if modality_for_ids is None:
-                    modality_for_ids = modality_mask(tensor_stream)
                 modality_for_ids = modality_for_ids.to(device=input_ids.device, dtype=torch.long)
                 image_mask = modality_for_ids == ModalityType.image.value
                 if image_mask.any():

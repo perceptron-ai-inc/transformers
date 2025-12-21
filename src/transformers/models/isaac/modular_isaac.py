@@ -2282,8 +2282,6 @@ class IsaacModel(Qwen3PreTrainedModel):
             if input_ids is None:
                 input_ids = tensor_stream_token_view(tensor_stream).to(dtype=torch.long)
                 modality_for_ids = packed_inputs.get("modality_tensor")
-                if modality_for_ids is None:
-                    modality_for_ids = modality_mask(tensor_stream)
                 modality_for_ids = modality_for_ids.to(device=input_ids.device, dtype=torch.long)
                 image_mask = modality_for_ids == ModalityType.image.value
                 if image_mask.any():
