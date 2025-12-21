@@ -301,130 +301,6 @@ def _infer_device_from_streams(streams: list[Stream]) -> torch.device | str:
     )
 
 
-def _compact_stream_events(stream: Stream) -> torch.Tensor:
-    assert all([(isinstance(ev.data, torch.Tensor) and ev.is_measured) for ev in stream.events]), (
-        "stream_apply(compact=True) only works for streams with events that have measured tensor data"
-    )
-    return torch.cat([ev.data for ev in stream.events]).contiguous()
-
-
-def _map_stream(
-    stream: Stream,
-    map_fn: Callable[[Event], Any] | None,
-    *,
-    copy_unchanged: bool,
-) -> tuple[str, Stream | list[Any]]:
-    if map_fn is None:
-        return "events", stream if not copy_unchanged else stream.shallow_copy()
-
-    mapped_events: list[Event] = []
-    flat_values: list[Any] = []
-    mode: str | None = None
-
-    for ev in stream:
-        out = map_fn(ev)
-        if out is None:
-            out = {}
-
-        if isinstance(out, dict):
-            if mode is None:
-                mode = "events"
-            elif mode != "events":
-                raise ValueError("map_fn must consistently return a dict or an iterable for every event")
-
-            if not out:
-                mapped_events.append(ev if not copy_unchanged else ev.shallow_copy())
-                continue
-
-            new_ev = ev.shallow_copy()
-            for k, v in out.items():
-                setattr(new_ev, k, v)
-            mapped_events.append(new_ev)
-            continue
-
-        if isinstance(out, Iterable) and not isinstance(out, (str, bytes)):
-            if mode is None:
-                mode = "flat"
-            elif mode != "flat":
-                raise ValueError("map_fn must consistently return a dict or an iterable for every event")
-
-            flat_values.extend(out)
-            continue
-
-        raise TypeError(f"map_fn must return a dict or iterable, got {type(out)}")
-
-    if mode is None:
-        mode = "events"
-        mapped_events = stream.events if not copy_unchanged else [ev.shallow_copy() for ev in stream.events]
-        return mode, Stream(mapped_events, priority=stream.priority)
-
-    if mode == "events":
-        return mode, Stream(mapped_events, priority=stream.priority)
-
-    return mode, flat_values
-
-
-def stream_apply(
-    stream_like: Stream | TensorStream,
-    map_fn: Callable[[Event], Any] | None = None,
-    *,
-    compact: bool = False,
-    copy_unchanged: bool = False,
-) -> Stream | TensorStream | torch.Tensor | list[Any] | list[list[Any]]:
-    """
-    Unified helper to (optionally) map over events and (optionally) compact to tensors.
-
-    Args:
-        stream_like: A ``Stream`` or ``TensorStream`` instance.
-        map_fn: Optional callable applied to every ``Event``. It may return a dict of field deltas
-            (structural map) or an iterable of values (token map). Returning ``None`` is treated as ``{}``.
-        compact: When True, returns a tensor (``(B, T)`` for ``TensorStream``, ``(T,)`` for ``Stream``).
-        copy_unchanged: When True, shallow-copy events even if unchanged.
-
-    Returns:
-        Stream/TensorStream, torch.Tensor, or list(s) depending on ``compact`` and ``map_fn`` mode.
-    """
-    is_batch = isinstance(stream_like, TensorStream)
-
-    streams = stream_like.streams if is_batch else [stream_like]
-    mapped_streams: list[Stream] = []
-    flat_batches: list[list[Any]] = []
-    mode: str | None = None
-
-    for stream in streams:
-        stream_mode, payload = _map_stream(stream, map_fn, copy_unchanged=copy_unchanged)
-        if mode is None:
-            mode = stream_mode
-        elif mode != stream_mode:
-            raise ValueError("map_fn must return the same type (dict vs iterable) for every stream")
-
-        if stream_mode == "events":
-            mapped_streams.append(payload)  # type: ignore[arg-type]
-        else:
-            flat_batches.append(payload)  # type: ignore[arg-type]
-
-    if mode is None:
-        mode = "events"
-        mapped_streams = streams if not copy_unchanged else [s.shallow_copy() for s in streams]
-
-    if not compact:
-        if mode == "events":
-            return TensorStream(mapped_streams) if is_batch else mapped_streams[0]
-        return flat_batches if is_batch else flat_batches[0]
-
-    if mode == "events":
-        compacted = [_compact_stream_events(s) for s in mapped_streams]
-        return torch.stack(compacted).contiguous() if is_batch else compacted[0]
-
-    device = _infer_device_from_streams(streams)
-    flat_values: list[Any] = list(itertools.chain.from_iterable(flat_batches)) if is_batch else flat_batches[0]
-    tensor = torch.tensor(flat_values, dtype=torch.long, device=device)
-    if is_batch:
-        B, T = stream_like.shape  # type: ignore[union-attr]
-        tensor = tensor.reshape(B, T)
-    return tensor.contiguous()
-
-
 def compute_mrope_pos_tensor(ts: TensorStream, n_pos_dims: int = 3) -> torch.Tensor:
     """
     Create a (batch, T, n_pos_dims) position tensor in one sweep.
@@ -466,31 +342,6 @@ def compute_mrope_pos_tensor(ts: TensorStream, n_pos_dims: int = 3) -> torch.Ten
     # Convert to tensor and reshape to (B, T, n_pos_dims)
     B, T = ts.shape
     return torch.tensor(all_coords, dtype=torch.long, device=ts.device).reshape(B, T, n_pos_dims)
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# Generic event-labelling helper
-# ──────────────────────────────────────────────────────────────────────────
-def event_mask(
-    ts: TensorStream,
-    tag_fn: Callable[[Event], int | None],
-    default: int = -1,
-) -> torch.Tensor:
-    """
-    Build a (batch, seq_len) LongTensor whose value for every *token*
-    is given by `tag_fn(event)`, falling back to `default` when the
-    function returns None.
-
-    The work is done in a single pass via `map  →  compact`.
-    """
-
-    def to_label(ev: Event) -> Any:
-        label = tag_fn(ev)
-        if label is None:
-            label = default
-        return [label] * ev.num_tokens()
-
-    return stream_apply(ts, to_label, compact=True).squeeze(-1)
 
 
 def tensor_stream_token_view(
@@ -580,6 +431,24 @@ def tensor_stream_to_packed_inputs(tensor_stream: TensorStream) -> dict[str, Opt
         if tokens.numel():
             text_token_ids[idx, : tokens.numel()] = tokens
 
+    modality_batches: list[torch.Tensor] = []
+    pad_value = ModalityType.padding.value
+    for stream in tensor_stream.streams:
+        token_labels: list[torch.Tensor] = []
+        for ev in stream:
+            num = ev.idx_range[1] - ev.idx_range[0] if ev.idx_range is not None else ev.num_tokens()
+            token_labels.append(torch.full((num,), ev.type.value, device=device, dtype=torch.long))
+        if token_labels:
+            modality_batches.append(torch.cat(token_labels, dim=0))
+        else:
+            modality_batches.append(torch.zeros((0,), device=device, dtype=torch.long))
+
+    max_modality_len = max(m.numel() for m in modality_batches) if modality_batches else 0
+    modality_tensor = torch.full((len(modality_batches), max_modality_len), pad_value, device=device, dtype=torch.long)
+    for idx, labels in enumerate(modality_batches):
+        if labels.numel():
+            modality_tensor[idx, : labels.numel()] = labels
+
     vision_events = [ev for stream in tensor_stream.streams for ev in stream if ev.type == ModalityType.image]
 
     seq_patches: Optional[torch.Tensor]
@@ -622,7 +491,9 @@ def tensor_stream_to_packed_inputs(tensor_stream: TensorStream) -> dict[str, Opt
         token_offsets = None
         token_lengths = None
 
-    modality_tensor = event_mask(tensor_stream, lambda ev: ev.type.value)
+    if modality_tensor.dim() != 2:
+        raise ValueError("`modality_tensor` must be 2D (batch, seq_len).")
+    modality_tensor.to(dtype=torch.long)
 
     return {
         "vision_patches": seq_patches,
