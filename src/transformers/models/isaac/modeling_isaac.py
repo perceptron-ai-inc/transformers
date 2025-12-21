@@ -1545,22 +1545,16 @@ class IsaacModel(PreTrainedModel):
         self,
         position_ids: Optional[torch.LongTensor],
         modality_tensor: Optional[torch.LongTensor],
-        tensor_stream: Optional[TensorStream],
         inputs_embeds: torch.Tensor,
         cache_position: torch.LongTensor,
     ) -> tuple[torch.LongTensor, torch.LongTensor, torch.LongTensor, torch.Tensor, torch.Tensor]:
         text_value = ModalityType.text.value
         batch_size, seq_len = inputs_embeds.shape[:2]
 
-        # Only rely on the tensor_stream for modality when none was provided.
-        stream_for_modality = tensor_stream if modality_tensor is None else None
         if modality_tensor is None:
-            if stream_for_modality is not None:
-                modality_tensor = modality_mask(stream_for_modality)
-            else:
-                modality_tensor = torch.full(
-                    (batch_size, seq_len), text_value, device=inputs_embeds.device, dtype=torch.long
-                )
+            modality_tensor = torch.full(
+                (batch_size, seq_len), text_value, device=inputs_embeds.device, dtype=torch.long
+            )
         else:
             modality_tensor = modality_tensor.to(device=inputs_embeds.device, dtype=torch.long)
             expected_shape = (batch_size, seq_len)
@@ -1571,12 +1565,9 @@ class IsaacModel(PreTrainedModel):
                 )
 
         # Prefer tensor-based positions; fall back to tensor_stream only when nothing else is provided.
-        stream_for_positions = tensor_stream if position_ids is None else None
+        stream_for_positions = None
         if position_ids is None:
-            if stream_for_positions is not None:
-                position_ids = compute_mrope_pos_tensor(stream_for_positions)  # (B,L,3)
-            else:
-                position_ids = cache_position.view(1, -1).expand(modality_tensor.shape[0], -1)
+            position_ids = cache_position.view(1, -1).expand(modality_tensor.shape[0], -1)
 
         if position_ids.ndim == 2:
             position_ids = position_ids.to(device=inputs_embeds.device)
@@ -1702,7 +1693,6 @@ class IsaacModel(PreTrainedModel):
         position_ids, modality_tensor, decoder_position_ids, cos, sin = self._prepare_position_and_modality(
             position_ids=position_arg,
             modality_tensor=modality_tensor,
-            tensor_stream=tensor_stream,
             inputs_embeds=inputs_embeds,
             cache_position=cache_position,
         )
