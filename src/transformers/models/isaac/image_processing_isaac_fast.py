@@ -154,19 +154,6 @@ def get_image_size_for_max_num_patches(
         return target_height, target_width
 
 
-def _compute_residual_p_frames(frames: torch.Tensor, is_p_frame: list[bool]) -> torch.Tensor:
-    """Compute residuals for P-frames to stay in sync with the training pipeline."""
-    if not any(is_p_frame):
-        return frames
-
-    frame_indices = torch.arange(len(is_p_frame), device=frames.device)
-    i_frame_mask = torch.tensor([not flag for flag in is_p_frame], device=frames.device)
-    last_i_indices = torch.cummax((i_frame_mask * (1 + frame_indices)), dim=0).values.long() - 1
-    p_indices = frame_indices[torch.tensor(is_p_frame, device=frames.device)]
-    frames[p_indices] = frames[p_indices] - frames[last_i_indices[p_indices]]
-    return frames
-
-
 @auto_docstring
 class IsaacImageProcessorFast(BaseImageProcessorFast):
     MAX_PIXELS = 60_000_000  # 60‑megapixel ceiling ≈ 8200 × 7300 px
@@ -328,7 +315,6 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
                 )
 
             nhwc_images = image_batch.permute(0, 2, 3, 1)
-            nhwc_images = _compute_residual_p_frames(nhwc_images, is_p_frame=[False] * batch_size)
 
             patches = torch_extract_patches(nhwc_images.permute(0, 3, 1, 2), patch_size, patch_size)
             _, height_tokens, width_tokens, _ = patches.shape
