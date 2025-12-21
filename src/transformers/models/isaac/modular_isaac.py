@@ -307,7 +307,7 @@ class Stream:
                 setattr(new_ev, k, v)
             mapped.append(new_ev)
 
-        return create_stream(mapped, priority=self.priority, schedule=False)
+        return create_stream(mapped, priority=self.priority)
 
     def compact(self) -> torch.Tensor:
         assert all([(isinstance(ev.data, torch.Tensor) and ev.is_measured) for ev in self.events]), (
@@ -334,7 +334,7 @@ class Stream:
 
     def shallow_copy(self) -> "Stream":
         events_copy = [ev.shallow_copy() for ev in self.events]
-        return create_stream(events=events_copy, priority=self.priority, schedule=False)
+        return create_stream(events=events_copy, priority=self.priority)
 
     def __hash__(self) -> int:
         """Hash Stream based on structure."""
@@ -390,10 +390,8 @@ class TensorStream:
 
     def flat_stream(self) -> "Stream":
         if not self.streams:
-            return create_stream([], priority=[], schedule=False)
-        return create_stream(
-            [event for stream in self.streams for event in stream], priority=self.streams[0].priority, schedule=False
-        )
+            return create_stream([], priority=[])
+        return create_stream([event for stream in self.streams for event in stream], priority=self.streams[0].priority)
 
     @property
     def device(self):
@@ -483,7 +481,7 @@ class TensorStream:
         )
 
 
-def create_stream(events: list["Event"], priority: list[ModalityType], schedule: bool = True) -> "Stream":
+def create_stream(events: list["Event"], priority: list[ModalityType]) -> "Stream":
     """
     Creates a new Stream with the given events and priority.
     If 'schedule' is True, events are ordered inline using a deterministic
@@ -498,76 +496,13 @@ def create_stream(events: list["Event"], priority: list[ModalityType], schedule:
                                   schedule=False)
         print(my_stream)
     """
-    if schedule and events:
-        priority_index: dict[ModalityType, int] = {category: idx for idx, category in enumerate(priority)}
-        sortable_events = []
-        for i, event in enumerate(events):
-            sortable_events.append((i, event.time[0], event.time[1], event.type))
-        sorted_events = sorted(sortable_events, key=lambda e: e[1])
-        num_events = len(sorted_events)
-
-        graph = defaultdict(set)
-        indegree = {i: 0 for i in range(num_events)}
-
-        for i in range(num_events):
-            idx_i, start_i, end_i, category_i = sorted_events[i]
-            prio_i = priority_index[category_i]
-            for j in range(i + 1, num_events):
-                idx_j, start_j, end_j, category_j = sorted_events[j]
-                if start_j >= end_i:
-                    break
-                if end_i > start_j and end_j > start_i:
-                    prio_j = priority_index[category_j]
-                    if prio_i < prio_j:
-                        graph[i].add(j)
-                        indegree[j] += 1
-                    elif prio_i > prio_j:
-                        graph[j].add(i)
-                        indegree[i] += 1
-
-        heap = [
-            (
-                sorted_events[i][1],
-                priority_index[sorted_events[i][3]],
-                sorted_events[i][0],
-                i,
-            )
-            for i in range(num_events)
-            if indegree[i] == 0
-        ]
-        heapq.heapify(heap)
-        resolved_order = []
-
-        while heap:
-            _, _, _, u = heapq.heappop(heap)
-            resolved_order.append(u)
-            for v in graph[u]:
-                indegree[v] -= 1
-                if indegree[v] == 0:
-                    heapq.heappush(
-                        heap,
-                        (
-                            sorted_events[v][1],
-                            priority_index[sorted_events[v][3]],
-                            sorted_events[v][0],
-                            v,
-                        ),
-                    )
-
-        if len(resolved_order) != num_events:
-            raise ValueError("Cycle detected in events, cannot resolve order")
-
-        events = [events[sorted_events[i][0]] for i in resolved_order]
-
     return Stream(events, priority)
 
 
 EventDescriptor = NewType("EventDescriptor", Any)
 
 
-def group_streams(
-    stream: Stream, group_fn: Callable[[Event], EventDescriptor], schedule=True
-) -> dict[EventDescriptor, Stream]:
+def group_streams(stream: Stream, group_fn: Callable[[Event], EventDescriptor]) -> dict[EventDescriptor, Stream]:
     """
     Splits a single Stream into multiple sub-Streams, grouped by the output of group_fn(event).
 
@@ -588,7 +523,10 @@ def group_streams(
         group = group_fn(ev)
         split_streams[group].append(ev)
     for g, events in split_streams.items():
-        split_streams[g] = create_stream(events, stream.priority, schedule=schedule)
+        split_streams[g] = create_stream(
+            events,
+            stream.priority,
+        )
     return dict(split_streams)
 
 
@@ -800,7 +738,7 @@ def slice(tensor_stream: "TensorStream", start: int, end: int) -> "TensorStream"
 
             curr_global_index = global_ev_end
 
-        sliced_streams.append(create_stream(new_events, stream.priority, schedule=False))
+        sliced_streams.append(create_stream(new_events, stream.priority))
 
     return TensorStream(sliced_streams)
 
@@ -1992,7 +1930,7 @@ class IsaacProcessor(ProcessorMixin):
                 events.append(text_event)
 
         # Create stream without scheduling (events already in order)
-        return create_stream(events, priority=[ModalityType.text, ModalityType.image], schedule=False)
+        return create_stream(events, priority=[ModalityType.text, ModalityType.image])
 
     def __call__(
         self,
@@ -2262,7 +2200,7 @@ class IsaacModel(Qwen3PreTrainedModel):
         structure.
         """
         flat_stream = tensor_stream.flat_stream()
-        per_modality_stream = group_streams(flat_stream, group_fn=lambda ev: ev.type, schedule=False)
+        per_modality_stream = group_streams(flat_stream, group_fn=lambda ev: ev.type)
         per_modality_compact_stream = {k: v.compact() for k, v in per_modality_stream.items()}
 
         # Collect per-event grids for vision tokens (H, W like dims sans time)

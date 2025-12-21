@@ -19,10 +19,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import heapq
 import math
 import re
-from collections import defaultdict
 from collections.abc import Callable
 from typing import Any, Optional, Union
 
@@ -45,7 +43,7 @@ else:
     Image = None
 
 
-def create_stream(events: list["Event"], priority: list[ModalityType], schedule: bool = True) -> "Stream":
+def create_stream(events: list["Event"], priority: list[ModalityType]) -> "Stream":
     """
     Creates a new Stream with the given events and priority.
     If 'schedule' is True, events are ordered inline using a deterministic
@@ -60,67 +58,6 @@ def create_stream(events: list["Event"], priority: list[ModalityType], schedule:
                                   schedule=False)
         print(my_stream)
     """
-    if schedule and events:
-        priority_index: dict[ModalityType, int] = {category: idx for idx, category in enumerate(priority)}
-        sortable_events = []
-        for i, event in enumerate(events):
-            sortable_events.append((i, event.time[0], event.time[1], event.type))
-        sorted_events = sorted(sortable_events, key=lambda e: e[1])
-        num_events = len(sorted_events)
-
-        graph = defaultdict(set)
-        indegree = dict.fromkeys(range(num_events), 0)
-
-        for i in range(num_events):
-            idx_i, start_i, end_i, category_i = sorted_events[i]
-            prio_i = priority_index[category_i]
-            for j in range(i + 1, num_events):
-                idx_j, start_j, end_j, category_j = sorted_events[j]
-                if start_j >= end_i:
-                    break
-                if end_i > start_j and end_j > start_i:
-                    prio_j = priority_index[category_j]
-                    if prio_i < prio_j:
-                        graph[i].add(j)
-                        indegree[j] += 1
-                    elif prio_i > prio_j:
-                        graph[j].add(i)
-                        indegree[i] += 1
-
-        heap = [
-            (
-                sorted_events[i][1],
-                priority_index[sorted_events[i][3]],
-                sorted_events[i][0],
-                i,
-            )
-            for i in range(num_events)
-            if indegree[i] == 0
-        ]
-        heapq.heapify(heap)
-        resolved_order = []
-
-        while heap:
-            _, _, _, u = heapq.heappop(heap)
-            resolved_order.append(u)
-            for v in graph[u]:
-                indegree[v] -= 1
-                if indegree[v] == 0:
-                    heapq.heappush(
-                        heap,
-                        (
-                            sorted_events[v][1],
-                            priority_index[sorted_events[v][3]],
-                            sorted_events[v][0],
-                            v,
-                        ),
-                    )
-
-        if len(resolved_order) != num_events:
-            raise ValueError("Cycle detected in events, cannot resolve order")
-
-        events = [events[sorted_events[i][0]] for i in resolved_order]
-
     return Stream(events, priority)
 
 
@@ -342,7 +279,7 @@ class IsaacProcessor(ProcessorMixin):
                 events.append(text_event)
 
         # Create stream without scheduling (events already in order)
-        return create_stream(events, priority=[ModalityType.text, ModalityType.image], schedule=False)
+        return create_stream(events, priority=[ModalityType.text, ModalityType.image])
 
     def __call__(
         self,
