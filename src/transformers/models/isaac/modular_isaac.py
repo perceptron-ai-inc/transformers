@@ -497,22 +497,90 @@ def modality_mask(ts: TensorStream) -> torch.Tensor:
     return event_mask(ts, lambda ev: ev.type.value)
 
 
-def tensor_stream_token_view(ts: TensorStream) -> torch.Tensor:
-    """
-    Return a (B, T) token view by summing across the last dim of every
-    event and flattening over the selected token range.
-    """
+def _extract_text_token_ids_from_stream(tensor_stream: TensorStream) -> torch.Tensor:
+    device = tensor_stream.device or torch.device(_infer_device_from_streams(tensor_stream.streams))
+    token_batches: list[torch.Tensor] = []
 
-    def to_token_view(ev: Event) -> list[int]:
-        # collapse all but the last dim, cast to long
-        flat = ev.data.sum(dim=-1).long().reshape(-1)
-        if ev.idx_range is not None:
-            s, e = ev.idx_range
-            return flat[s:e].tolist()
+    for stream in tensor_stream.streams:
+        stream_tokens: list[torch.Tensor] = []
+        for ev in stream:
+            if ev.type != ModalityType.text:
+                continue
+            tokens = ev.data
+            if tokens.dim() > 1:
+                tokens = tokens.reshape(-1)
+            if ev.idx_range is not None:
+                start, end = ev.idx_range
+                tokens = tokens[start:end]
+            stream_tokens.append(tokens.to(device=device, dtype=torch.long))
+        if stream_tokens:
+            token_batches.append(torch.cat(stream_tokens, dim=0))
         else:
-            return flat.tolist()
+            token_batches.append(torch.zeros((0,), device=device, dtype=torch.long))
 
-    return stream_apply(ts, to_token_view, compact=True)  # shape (B, T)
+    if not token_batches:
+        return torch.zeros((0, 0), device=device, dtype=torch.long)
+
+    max_len = max(tokens.numel() for tokens in token_batches)
+    padded = torch.zeros((len(token_batches), max_len), device=device, dtype=torch.long)
+    for idx, tokens in enumerate(token_batches):
+        if tokens.numel():
+            padded[idx, : tokens.numel()] = tokens
+    return padded
+
+
+def tensor_stream_token_view(
+    text_token_ids: torch.Tensor,
+    modality_tensor: torch.Tensor,
+    *,
+    fill_value: int | None = None,
+) -> torch.Tensor:
+    """
+    Compose a (batch, seq_len) token tensor using only text token ids and
+    a modality map.
+
+    Args:
+        text_token_ids: Concatenated text token ids shaped (batch, num_text_tokens)
+            or (num_text_tokens,) for single-batch inputs.
+        modality_tensor: Modality labels shaped (batch, seq_len) with values
+            from ModalityType.
+        fill_value: Value used for non-text positions (defaults to 0).
+    """
+    if modality_tensor.dim() != 2:
+        raise ValueError("`modality_tensor` must be 2D (batch, seq_len).")
+
+    if text_token_ids.dim() == 1:
+        text_token_ids = text_token_ids.unsqueeze(0)
+    if text_token_ids.dim() != 2:
+        raise ValueError("`text_token_ids` must be 1D or 2D.")
+
+    batch_size, seq_len = modality_tensor.shape
+    token_batch = text_token_ids.shape[0]
+    if token_batch not in {1, batch_size}:
+        raise ValueError("`text_token_ids` batch dimension must match `modality_tensor` or be 1.")
+
+    if token_batch == 1 and batch_size > 1:
+        text_token_ids = text_token_ids.expand(batch_size, -1)
+
+    text_mask = modality_tensor == ModalityType.text.value
+    text_counts = text_mask.sum(dim=1)
+    max_text_needed = int(text_counts.max().item()) if text_counts.numel() else 0
+
+    if text_token_ids.size(1) < max_text_needed:
+        raise ValueError("`text_token_ids` does not have enough tokens for the provided modalities.")
+
+    fill = 0 if fill_value is None else fill_value
+    tokens = modality_tensor.new_full(modality_tensor.shape, fill, dtype=torch.long, device=modality_tensor.device)
+
+    for batch_idx in range(batch_size):
+        num_text = int(text_counts[batch_idx].item())
+        if num_text == 0:
+            continue
+        tokens[batch_idx, text_mask[batch_idx]] = text_token_ids[batch_idx, :num_text].to(
+            device=tokens.device, dtype=torch.long
+        )
+
+    return tokens
 
 
 def tensor_stream_to_packed_inputs(tensor_stream: TensorStream) -> dict[str, Optional[torch.Tensor]]:
@@ -1660,8 +1728,7 @@ def create_text_event(tokenizer: AutoTokenizer, text: str, time: float = 0.0) ->
     dims_virtual = [num_tokens, 1]  # [sequence_length, 1]
     dims_real = dims_virtual.copy()
 
-    # Ensure tokens has the right shape for tensor_stream_token_view
-    # It expects a 2D tensor where sum(dim=-1) gives the token IDs
+    # Keep a trailing dimension so downstream flattening preserves token order
     if tokens.dim() == 1:
         tokens = tokens.unsqueeze(-1)
 
@@ -1829,14 +1896,19 @@ class IsaacProcessor(ProcessorMixin):
         if T > self.max_sequence_length:
             tensor_stream = ts_slice(tensor_stream, start=T - self.max_sequence_length, end=T)
 
-        # Get token view
-        tokens = tensor_stream_token_view(tensor_stream)
+        packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
+
+        modality_tensor = packed_inputs.get("modality_tensor")
+        if modality_tensor is None:
+            raise ValueError("`modality_tensor` is required to build input ids from packed inputs.")
+
+        text_token_ids = _extract_text_token_ids_from_stream(tensor_stream)
+        tokens = tensor_stream_token_view(text_token_ids, modality_tensor)
         if return_tensors in (TensorType.PYTORCH, "pt"):
             input_ids = torch.as_tensor(tokens, dtype=torch.long)
         else:
             input_ids = tokens
 
-        packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
         data = {
             "input_ids": input_ids,
             "packed_inputs": packed_inputs,
@@ -2220,8 +2292,11 @@ class IsaacModel(Qwen3PreTrainedModel):
                 position_ids = packed_inputs.get("position_ids")
 
             if input_ids is None:
-                input_ids = tensor_stream_token_view(tensor_stream).to(dtype=torch.long)
                 modality_for_ids = packed_inputs.get("modality_tensor")
+                if modality_for_ids is None:
+                    raise ValueError("`modality_tensor` is required when converting from `tensor_stream`.")
+                text_token_ids = _extract_text_token_ids_from_stream(tensor_stream)
+                input_ids = tensor_stream_token_view(text_token_ids, modality_for_ids).to(dtype=torch.long)
                 modality_for_ids = modality_for_ids.to(device=input_ids.device, dtype=torch.long)
                 image_mask = modality_for_ids == ModalityType.image.value
                 if image_mask.any():
