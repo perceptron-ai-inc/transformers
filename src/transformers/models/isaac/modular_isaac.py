@@ -1996,7 +1996,7 @@ class IsaacProcessor(ProcessorMixin):
                 events.append(text_event)
 
         # Create stream without scheduling (events already in order)
-        return create_stream(events, priority=[ModalityType.text, ModalityType.image], schedule=True)
+        return create_stream(events, priority=[ModalityType.text, ModalityType.image], schedule=False)
 
     def __call__(
         self,
