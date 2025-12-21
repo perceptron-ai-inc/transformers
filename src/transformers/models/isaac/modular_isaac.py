@@ -518,36 +518,65 @@ def tensor_stream_token_view(ts: TensorStream) -> torch.Tensor:
 def tensor_stream_to_packed_inputs(tensor_stream: TensorStream) -> dict[str, Optional[torch.Tensor]]:
     """
     Extract plain tensor payloads from a TensorStream so downstream code can start
-    bypassing the Event/Stream abstraction. Returns a dict containing:
+    bypassing the Event/Stream abstraction. The returned tensors cover the Event
+    fields we previously relied on:
 
-    - vision_patches: concatenated vision tokens shaped (total_tokens, embed_dim) or None
-    - vision_token_grids: (num_images, 2) token grid sizes or None
-    - modality_tensor: (batch, seq_len) modality ids aligned to the stream
+    - modality_tensor mirrors `Event.type` for every token.
+    - position_ids materialize MRoPE-ready coordinates from `Event.idx_range` and `Event.dims`.
+    - vision_token_grids store the real spatial grid from `Event.dims(real)`.
+    - vision_token_offsets/vision_token_lengths mirror `Event.idx_range` for vision events after truncation.
+    - vision_patches keeps `Event.data` (real patch vectors) concatenated.
     """
 
     vision_events = [ev for stream in tensor_stream.streams for ev in stream if ev.type == ModalityType.image]
 
     seq_patches: Optional[torch.Tensor]
     token_grids: Optional[torch.Tensor]
+    token_offsets: Optional[torch.Tensor]
+    token_lengths: Optional[torch.Tensor]
 
     if vision_events:
-        seq_patches = torch.cat([ev.data for ev in vision_events], dim=0)
-        token_grids = torch.tensor(
-            [
-                (ev.dims(False) or ev.dims())[1:]  # drop the time dimension
-                for ev in vision_events
-            ],
-            dtype=torch.long,
-            device=seq_patches.device,
-        )
+        patch_chunks: list[torch.Tensor] = []
+        grid_rows: list[tuple[int, int]] = []
+        offset_rows: list[int] = []
+        length_rows: list[int] = []
+
+        for ev in vision_events:
+            event_data = ev.data
+            if event_data.dim() > 2:
+                event_data = event_data.view(event_data.size(0), -1)
+
+            # idx_range describes how much of this event survives truncation
+            token_span = ev.idx_range
+            if token_span is None:
+                token_span = (0, math.prod(ev.dims() or [event_data.shape[0]]))
+            start, end = token_span
+
+            patch_chunks.append(event_data)
+            dims_real = ev.dims(False) or ev.dims() or [event_data.shape[0], 1, 1]
+            if len(dims_real) < 3:
+                dims_real = list(dims_real) + [1] * (3 - len(dims_real))
+            grid_rows.append((int(dims_real[1]), int(dims_real[2])))
+            offset_rows.append(int(max(0, start)))
+            length_rows.append(int(max(0, end - start)))
+
+        seq_patches = torch.cat(patch_chunks, dim=0)
+        token_grids = torch.tensor(grid_rows, dtype=torch.long, device=seq_patches.device)
+        token_offsets = torch.tensor(offset_rows, dtype=torch.long, device=seq_patches.device)
+        token_lengths = torch.tensor(length_rows, dtype=torch.long, device=seq_patches.device)
     else:
         seq_patches = None
         token_grids = None
+        token_offsets = None
+        token_lengths = None
 
     return {
         "vision_patches": seq_patches,
         "vision_token_grids": token_grids,
+        "vision_token_offsets": token_offsets,
+        "vision_token_lengths": token_lengths,
         "modality_tensor": modality_mask(tensor_stream),
+        "position_ids": compute_mrope_pos_tensor(tensor_stream),
     }
 
 
@@ -1772,7 +1801,9 @@ class IsaacProcessor(ProcessorMixin):
             return_tensor_stream: When True, include the legacy TensorStream in the output.
 
         Returns:
-            BatchFeature with input_ids, packed_inputs, and optionally tensor_stream
+            BatchFeature with input_ids, packed_inputs, and optionally tensor_stream. packed_inputs bundles the
+            plain tensors (vision_patches, vision_token_grids, modality_tensor, position_ids, vision_token_offsets,
+            vision_token_lengths) needed to describe the multimodal sequence without TensorStream.
         """
         # Normalize inputs to lists
         if isinstance(text, str):
@@ -2068,9 +2099,12 @@ class IsaacModel(Qwen3PreTrainedModel):
         """Embed packed_inputs (plain tensors) instead of TensorStream.
 
         Expects input_ids for text tokens and packed_inputs containing:
+        - modality_tensor: (batch, seq_len) modality ids aligned to the sequence
+        - position_ids: (batch, seq_len, 3) MRoPE coordinates (optional)
         - vision_patches: concatenated vision tokens shaped (total_tokens, embed_dim) or None
         - vision_token_grids: (num_images, 2) token grid sizes or None
-        - modality_tensor: (batch, seq_len) modality ids aligned to the sequence
+        - vision_token_offsets: (num_images,) offsets into each image's virtual token span (optional)
+        - vision_token_lengths: (num_images,) surviving virtual token lengths per image (optional)
         """
 
         if input_ids is None:
@@ -2091,9 +2125,59 @@ class IsaacModel(Qwen3PreTrainedModel):
             if token_grids is None:
                 raise ValueError("`vision_token_grids` must accompany `vision_patches` in packed_inputs.`")
 
+            vision_token_offsets = packed_inputs.get("vision_token_offsets")
+            vision_token_lengths = packed_inputs.get("vision_token_lengths")
+
             vision_embeds = self.embed_vision((vision_patches, token_grids))
+
+            vision_seq_sizes = torch.prod(token_grids.to(device=vision_embeds.device), dim=-1)
+            scale_factor = getattr(self.config.vision_config, "pixel_shuffle_scale_factor", 1)
+            if scale_factor > 1:
+                vision_seq_sizes = vision_seq_sizes // int(scale_factor * scale_factor)
+
+            if vision_token_offsets is not None and vision_token_offsets.numel() != vision_seq_sizes.numel():
+                raise ValueError(
+                    "`vision_token_offsets` must match number of images inferred from vision_token_grids.`"
+                )
+            if vision_token_lengths is not None and vision_token_lengths.numel() != vision_seq_sizes.numel():
+                raise ValueError(
+                    "`vision_token_lengths` must match number of images inferred from vision_token_grids.`"
+                )
+
+            if vision_token_offsets is not None or vision_token_lengths is not None:
+                offsets = vision_token_offsets
+                lengths = vision_token_lengths
+                if offsets is None:
+                    offsets = torch.zeros_like(vision_seq_sizes, dtype=torch.long, device=vision_seq_sizes.device)
+                else:
+                    offsets = offsets.to(device=vision_embeds.device, dtype=torch.long)
+                if lengths is None:
+                    lengths = vision_seq_sizes.to(device=vision_embeds.device)
+                else:
+                    lengths = lengths.to(device=vision_embeds.device, dtype=torch.long)
+
+                selected_chunks: list[torch.Tensor] = []
+                cursor = 0
+                for seq_len, offset, length in zip(vision_seq_sizes.tolist(), offsets.tolist(), lengths.tolist()):
+                    end = cursor + seq_len
+                    if seq_len == 0:
+                        cursor = end
+                        continue
+                    chunk = vision_embeds[cursor:end]
+                    chunk_offset = max(0, min(offset, seq_len))
+                    chunk_length = max(0, min(length, seq_len - chunk_offset))
+                    selected_chunks.append(chunk[chunk_offset : chunk_offset + chunk_length])
+                    cursor = end
+
+                vision_embeds = (
+                    torch.cat(selected_chunks, dim=0)
+                    if selected_chunks
+                    else vision_embeds.new_zeros((0, vision_embeds.size(-1)))
+                )
+
             vision_mask = modality_tensor == ModalityType.image.value
-            if vision_mask.sum().item() != vision_embeds.shape[0]:
+            expected_image_tokens = int(vision_mask.sum().item())
+            if expected_image_tokens != vision_embeds.shape[0]:
                 raise ValueError("Packed vision payload size does not match modality tensor.")
 
             embeds = embeds.clone()
@@ -2203,10 +2287,14 @@ class IsaacModel(Qwen3PreTrainedModel):
 
         # Resolve the input source (prefer packed_inputs > tensor_stream > ids > embeds).
         precomputed_modality: Optional[torch.Tensor] = None
+        precomputed_position_ids: Optional[torch.Tensor] = None
         if packed_inputs is not None:
             if input_ids is None:
                 raise ValueError("`input_ids` must be provided when using `packed_inputs`.")
             inputs_embeds, precomputed_modality = self.embed_packed_inputs(input_ids, packed_inputs)
+            precomputed_position_ids = packed_inputs.get("position_ids")
+            if precomputed_position_ids is not None:
+                precomputed_position_ids = precomputed_position_ids.to(inputs_embeds.device)
             tensor_stream = None  # prefer packed_inputs path once provided
         elif tensor_stream is not None:
             inputs_embeds = self.embed_stream(tensor_stream)
@@ -2232,8 +2320,10 @@ class IsaacModel(Qwen3PreTrainedModel):
         if modality_tensor is None and precomputed_modality is not None:
             modality_tensor = precomputed_modality
 
+        position_arg = position_ids if position_ids is not None else precomputed_position_ids
+
         position_ids, modality_tensor, decoder_position_ids, cos, sin = self._prepare_position_and_modality(
-            position_ids=position_ids,
+            position_ids=position_arg,
             modality_tensor=modality_tensor,
             tensor_stream=tensor_stream,
             inputs_embeds=inputs_embeds,

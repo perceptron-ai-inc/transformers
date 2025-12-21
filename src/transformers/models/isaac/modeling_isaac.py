@@ -1368,9 +1368,12 @@ class IsaacModel(PreTrainedModel):
         """Embed packed_inputs (plain tensors) instead of TensorStream.
 
         Expects input_ids for text tokens and packed_inputs containing:
+        - modality_tensor: (batch, seq_len) modality ids aligned to the sequence
+        - position_ids: (batch, seq_len, 3) MRoPE coordinates (optional)
         - vision_patches: concatenated vision tokens shaped (total_tokens, embed_dim) or None
         - vision_token_grids: (num_images, 2) token grid sizes or None
-        - modality_tensor: (batch, seq_len) modality ids aligned to the sequence
+        - vision_token_offsets: (num_images,) offsets into each image's virtual token span (optional)
+        - vision_token_lengths: (num_images,) surviving virtual token lengths per image (optional)
         """
 
         if input_ids is None:
@@ -1391,9 +1394,59 @@ class IsaacModel(PreTrainedModel):
             if token_grids is None:
                 raise ValueError("`vision_token_grids` must accompany `vision_patches` in packed_inputs.`")
 
+            vision_token_offsets = packed_inputs.get("vision_token_offsets")
+            vision_token_lengths = packed_inputs.get("vision_token_lengths")
+
             vision_embeds = self.embed_vision((vision_patches, token_grids))
+
+            vision_seq_sizes = torch.prod(token_grids.to(device=vision_embeds.device), dim=-1)
+            scale_factor = getattr(self.config.vision_config, "pixel_shuffle_scale_factor", 1)
+            if scale_factor > 1:
+                vision_seq_sizes = vision_seq_sizes // int(scale_factor * scale_factor)
+
+            if vision_token_offsets is not None and vision_token_offsets.numel() != vision_seq_sizes.numel():
+                raise ValueError(
+                    "`vision_token_offsets` must match number of images inferred from vision_token_grids.`"
+                )
+            if vision_token_lengths is not None and vision_token_lengths.numel() != vision_seq_sizes.numel():
+                raise ValueError(
+                    "`vision_token_lengths` must match number of images inferred from vision_token_grids.`"
+                )
+
+            if vision_token_offsets is not None or vision_token_lengths is not None:
+                offsets = vision_token_offsets
+                lengths = vision_token_lengths
+                if offsets is None:
+                    offsets = torch.zeros_like(vision_seq_sizes, dtype=torch.long, device=vision_seq_sizes.device)
+                else:
+                    offsets = offsets.to(device=vision_embeds.device, dtype=torch.long)
+                if lengths is None:
+                    lengths = vision_seq_sizes.to(device=vision_embeds.device)
+                else:
+                    lengths = lengths.to(device=vision_embeds.device, dtype=torch.long)
+
+                selected_chunks: list[torch.Tensor] = []
+                cursor = 0
+                for seq_len, offset, length in zip(vision_seq_sizes.tolist(), offsets.tolist(), lengths.tolist()):
+                    end = cursor + seq_len
+                    if seq_len == 0:
+                        cursor = end
+                        continue
+                    chunk = vision_embeds[cursor:end]
+                    chunk_offset = max(0, min(offset, seq_len))
+                    chunk_length = max(0, min(length, seq_len - chunk_offset))
+                    selected_chunks.append(chunk[chunk_offset : chunk_offset + chunk_length])
+                    cursor = end
+
+                vision_embeds = (
+                    torch.cat(selected_chunks, dim=0)
+                    if selected_chunks
+                    else vision_embeds.new_zeros((0, vision_embeds.size(-1)))
+                )
+
             vision_mask = modality_tensor == ModalityType.image.value
-            if vision_mask.sum().item() != vision_embeds.shape[0]:
+            expected_image_tokens = int(vision_mask.sum().item())
+            if expected_image_tokens != vision_embeds.shape[0]:
                 raise ValueError("Packed vision payload size does not match modality tensor.")
 
             embeds = embeds.clone()
@@ -1503,10 +1556,14 @@ class IsaacModel(PreTrainedModel):
 
         # Resolve the input source (prefer packed_inputs > tensor_stream > ids > embeds).
         precomputed_modality: Optional[torch.Tensor] = None
+        precomputed_position_ids: Optional[torch.Tensor] = None
         if packed_inputs is not None:
             if input_ids is None:
                 raise ValueError("`input_ids` must be provided when using `packed_inputs`.")
             inputs_embeds, precomputed_modality = self.embed_packed_inputs(input_ids, packed_inputs)
+            precomputed_position_ids = packed_inputs.get("position_ids")
+            if precomputed_position_ids is not None:
+                precomputed_position_ids = precomputed_position_ids.to(inputs_embeds.device)
             tensor_stream = None  # prefer packed_inputs path once provided
         elif tensor_stream is not None:
             inputs_embeds = self.embed_stream(tensor_stream)
@@ -1532,8 +1589,10 @@ class IsaacModel(PreTrainedModel):
         if modality_tensor is None and precomputed_modality is not None:
             modality_tensor = precomputed_modality
 
+        position_arg = position_ids if position_ids is not None else precomputed_position_ids
+
         position_ids, modality_tensor, decoder_position_ids, cos, sin = self._prepare_position_and_modality(
-            position_ids=position_ids,
+            position_ids=position_arg,
             modality_tensor=modality_tensor,
             tensor_stream=tensor_stream,
             inputs_embeds=inputs_embeds,
