@@ -580,21 +580,6 @@ def tensor_stream_to_packed_inputs(tensor_stream: TensorStream) -> dict[str, Opt
     }
 
 
-def reconstruct_tensor_stream_from_compact_dict(
-    ts: "TensorStream", compact_dict: dict[ModalityType, torch.Tensor]
-) -> "TensorStream":
-    streams = []
-    for stream in ts.streams:
-        event_list = []
-        for event in stream:
-            new_event = event.shallow_copy()
-            new_event.data = compact_dict[event.type][event.idx_range[0] : event.idx_range[1]]
-            compact_dict[event.type] = compact_dict[event.type][event.num_tokens(partial=False) :]
-            event_list.append(new_event)
-        streams.append(Stream(event_list, priority=stream.priority))
-    return TensorStream(streams)
-
-
 # TENSORSTREAM END -------------------------------------------------------------------------------
 
 
@@ -2047,51 +2032,6 @@ class IsaacModel(Qwen3PreTrainedModel):
         """Embed vision tokens using the vision encoder."""
         # vision tokens is (seq_patches, token_grids)
         return self.vision_embedding(vision_tokens)
-
-    def embed_stream(self, tensor_stream: TensorStream) -> torch.Tensor:
-        """
-        Embed each modality stream independently, preserving the original TensorStream
-        structure.
-        """
-        flat_stream = Stream(
-            [event for stream in tensor_stream.streams for event in stream], priority=tensor_stream.streams[0].priority
-        )
-        split_streams: defaultdict[Any, list[Event]] = defaultdict(list)
-        for ev in flat_stream:
-            group = ev.type
-            split_streams[group].append(ev)
-        for g, events in split_streams.items():
-            split_streams[g] = Stream(
-                events,
-                flat_stream.priority,
-            )
-        per_modality_stream = dict(split_streams)
-        per_modality_compact_stream = {k: stream_apply(v, compact=True) for k, v in per_modality_stream.items()}
-
-        # Collect per-event grids for vision tokens (H, W like dims sans time)
-        token_grids = defaultdict(list)
-        for stream in tensor_stream.streams:
-            for event in stream:
-                token_grids[event.type].append(event.dims(virtual=False))
-
-        embedded_compact = {}
-        for stream_type, modality_payload_tensor in per_modality_compact_stream.items():
-            if stream_type == ModalityType.image:
-                # Build a (N_events, 2) grid tensor with spatial dims only
-                grids = token_grids.get(stream_type, [])
-                if len(grids) == 0:
-                    input_tensor = modality_payload_tensor
-                else:
-                    token_grids_tensor = torch.tensor(grids, dtype=torch.long, device=tensor_stream.device)[:, 1:]
-                    input_tensor = (modality_payload_tensor, token_grids_tensor)
-                embedded_compact[stream_type] = self.embed_fns[stream_type](input_tensor)
-            else:
-                embedded_compact[stream_type] = self.embed_fns[stream_type](modality_payload_tensor)
-
-        # Reconstruct a TensorStream with embedded payloads and compact
-        embedded_ts = reconstruct_tensor_stream_from_compact_dict(tensor_stream, embedded_compact)
-        h = stream_apply(embedded_ts, compact=True)  # (B, T, D)
-        return h
 
     def embed_packed_inputs(
         self, input_ids: torch.Tensor, packed_inputs: dict[str, Optional[torch.Tensor]]
