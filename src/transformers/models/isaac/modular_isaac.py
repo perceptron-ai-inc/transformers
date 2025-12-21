@@ -2147,7 +2147,6 @@ class IsaacModel(Qwen3PreTrainedModel):
         """
 
         output_attentions = kwargs.pop("output_attentions", None)
-        packed_inputs = None
 
         converted_from_stream = False
         if tensor_stream is not None and packed_inputs is None:
