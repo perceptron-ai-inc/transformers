@@ -132,15 +132,6 @@ class Event:
     def is_measured(self):
         return self.dims_virtual is not None
 
-    def slice_tokens(self, start: int | None = None, end: int | None = None):
-        """
-        Converts into a partial event where the only valid data is between start and end indices of the flattened data
-        """
-        assert self.is_measured
-        assert start is not None and end is not None
-        assert self.idx_range[0] <= start <= end <= self.idx_range[1]
-        self.idx_range = (start or 0, end or math.prod(self.dims()))
-
     def num_tokens(self, partial=True, virtual=True) -> int:
         if not virtual:
             assert partial is False and isinstance(self.data, torch.Tensor)
