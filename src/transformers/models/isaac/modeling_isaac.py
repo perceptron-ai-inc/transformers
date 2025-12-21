@@ -27,7 +27,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields, replace
 from enum import IntEnum
-from typing import Any, NewType, Optional, Union
+from typing import Any, Optional, Union
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
@@ -212,24 +212,6 @@ class Event:
         return True
 
 
-def create_stream(events: list["Event"], priority: list[ModalityType]) -> "Stream":
-    """
-    Creates a new Stream with the given events and priority.
-    If 'schedule' is True, events are ordered inline using a deterministic
-    schedule based on start time and priority index so the function stays
-    self-contained.
-
-    Example usage:
-        evt1 = Event(torch.zeros(10), ModalityType.text, (0.0, 1.0))
-        evt2 = Event(torch.ones(10), ModalityType.text, (1.0, 2.0))
-        my_stream = create_stream(events=[evt1, evt2],
-                                  priority=[ModalityType.text],
-                                  schedule=False)
-        print(my_stream)
-    """
-    return Stream(events, priority)
-
-
 @dataclass
 class Stream:
     """
@@ -298,7 +280,7 @@ class Stream:
                 setattr(new_ev, k, v)
             mapped.append(new_ev)
 
-        return create_stream(mapped, priority=self.priority)
+        return Stream(mapped, priority=self.priority)
 
     def compact(self) -> torch.Tensor:
         assert all([(isinstance(ev.data, torch.Tensor) and ev.is_measured) for ev in self.events]), (
@@ -325,7 +307,7 @@ class Stream:
 
     def shallow_copy(self) -> "Stream":
         events_copy = [ev.shallow_copy() for ev in self.events]
-        return create_stream(events=events_copy, priority=self.priority)
+        return Stream(events=events_copy, priority=self.priority)
 
     def __hash__(self) -> int:
         """Hash Stream based on structure."""
@@ -381,8 +363,8 @@ class TensorStream:
 
     def flat_stream(self) -> "Stream":
         if not self.streams:
-            return create_stream([], priority=[])
-        return create_stream([event for stream in self.streams for event in stream], priority=self.streams[0].priority)
+            return Stream([], priority=[])
+        return Stream([event for stream in self.streams for event in stream], priority=self.streams[0].priority)
 
     @property
     def device(self):
@@ -1192,10 +1174,7 @@ class IsaacRotaryEmbedding(qwen2_5_vl_modeling.Qwen2_5_VLRotaryEmbedding):
         return cos_combined, sin_combined
 
 
-EventDescriptor = NewType("EventDescriptor", Any)
-
-
-def group_streams(stream: Stream, group_fn: Callable[[Event], EventDescriptor]) -> dict[EventDescriptor, Stream]:
+def group_streams(stream: Stream, group_fn: Callable[[Event], Any]) -> dict[Any, Stream]:
     """
     Splits a single Stream into multiple sub-Streams, grouped by the output of group_fn(event).
 
@@ -1211,12 +1190,12 @@ def group_streams(stream: Stream, group_fn: Callable[[Event], EventDescriptor]) 
     Example usage:
         substreams = group_streams(my_stream, lambda ev: ev.type)
     """
-    split_streams: defaultdict[EventDescriptor, list[Event]] = defaultdict(list)
+    split_streams: defaultdict[Any, list[Event]] = defaultdict(list)
     for ev in stream:
         group = group_fn(ev)
         split_streams[group].append(ev)
     for g, events in split_streams.items():
-        split_streams[g] = create_stream(
+        split_streams[g] = Stream(
             events,
             stream.priority,
         )

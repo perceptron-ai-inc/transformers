@@ -43,24 +43,6 @@ else:
     Image = None
 
 
-def create_stream(events: list["Event"], priority: list[ModalityType]) -> "Stream":
-    """
-    Creates a new Stream with the given events and priority.
-    If 'schedule' is True, events are ordered inline using a deterministic
-    schedule based on start time and priority index so the function stays
-    self-contained.
-
-    Example usage:
-        evt1 = Event(torch.zeros(10), ModalityType.text, (0.0, 1.0))
-        evt2 = Event(torch.ones(10), ModalityType.text, (1.0, 2.0))
-        my_stream = create_stream(events=[evt1, evt2],
-                                  priority=[ModalityType.text],
-                                  schedule=False)
-        print(my_stream)
-    """
-    return Stream(events, priority)
-
-
 # ──────────────────────────────────────────────────────────────────────────
 # Generic event-labelling helper
 # ──────────────────────────────────────────────────────────────────────────
@@ -279,7 +261,7 @@ class IsaacProcessor(ProcessorMixin):
                 events.append(text_event)
 
         # Create stream without scheduling (events already in order)
-        return create_stream(events, priority=[ModalityType.text, ModalityType.image])
+        return Stream(events, priority=[ModalityType.text, ModalityType.image])
 
     def __call__(
         self,
