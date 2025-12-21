@@ -1983,14 +1983,8 @@ class IsaacModel(Qwen3PreTrainedModel):
         - vision_token_lengths: (num_images,) surviving virtual token lengths per image (optional)
         """
 
-        if input_ids is None:
-            raise ValueError("`input_ids` must be provided when using `packed_inputs`.")
-
         modality_tensor = packed_inputs.get("modality_tensor")
-        if modality_tensor is None:
-            modality_tensor = torch.full_like(input_ids, ModalityType.text.value, dtype=torch.long)
-        else:
-            modality_tensor = modality_tensor.to(device=input_ids.device, dtype=torch.long)
+        modality_tensor = modality_tensor.to(device=input_ids.device, dtype=torch.long)
 
         text_embeds = self.embed_text_tokens(input_ids)
         embeds = text_embeds
@@ -2007,18 +2001,8 @@ class IsaacModel(Qwen3PreTrainedModel):
             vision_embeds = self.embed_vision((vision_patches, token_grids))
 
             vision_seq_sizes = torch.prod(token_grids.to(device=vision_embeds.device), dim=-1)
-            scale_factor = getattr(self.config.vision_config, "pixel_shuffle_scale_factor", 1)
-            if scale_factor > 1:
-                vision_seq_sizes = vision_seq_sizes // int(scale_factor * scale_factor)
-
-            if vision_token_offsets is not None and vision_token_offsets.numel() != vision_seq_sizes.numel():
-                raise ValueError(
-                    "`vision_token_offsets` must match number of images inferred from vision_token_grids.`"
-                )
-            if vision_token_lengths is not None and vision_token_lengths.numel() != vision_seq_sizes.numel():
-                raise ValueError(
-                    "`vision_token_lengths` must match number of images inferred from vision_token_grids.`"
-                )
+            scale_factor = self.config.vision_config.pixel_shuffle_scale_factor
+            vision_seq_sizes = vision_seq_sizes // int(scale_factor * scale_factor)
 
             if vision_token_offsets is not None or vision_token_lengths is not None:
                 offsets = vision_token_offsets
