@@ -2281,8 +2281,35 @@ class IsaacModel(Qwen3PreTrainedModel):
         """
 
         output_attentions = kwargs.pop("output_attentions", None)
+        packed_inputs = None
 
-        if packed_inputs is not None and inputs_embeds is not None:
+        converted_from_stream = False
+        if tensor_stream is not None and packed_inputs is None:
+            packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
+
+            if position_ids is None:
+                position_ids = packed_inputs.get("position_ids")
+
+            if input_ids is None:
+                input_ids = tensor_stream_token_view(tensor_stream).to(dtype=torch.long)
+                modality_for_ids = packed_inputs.get("modality_tensor")
+                if modality_for_ids is None:
+                    modality_for_ids = modality_mask(tensor_stream)
+                modality_for_ids = modality_for_ids.to(device=input_ids.device, dtype=torch.long)
+                image_mask = modality_for_ids == ModalityType.image.value
+                if image_mask.any():
+                    safe_token_id = getattr(getattr(self.config, "text_config", self.config), "pad_token_id", None)
+                    if safe_token_id is None:
+                        safe_token_id = getattr(self.config, "pad_token_id", None)
+                    if safe_token_id is None or safe_token_id < 0:
+                        safe_token_id = int(self.config.vocab_size - 1)
+                    input_ids = input_ids.clone()
+                    input_ids[image_mask] = safe_token_id
+
+            tensor_stream = None
+            converted_from_stream = True
+
+        if packed_inputs is not None and inputs_embeds is not None and not converted_from_stream:
             raise ValueError("`inputs_embeds` should not be provided alongside `packed_inputs`.")
 
         # Resolve the input source (prefer packed_inputs > tensor_stream > ids > embeds).
@@ -2295,9 +2322,7 @@ class IsaacModel(Qwen3PreTrainedModel):
             precomputed_position_ids = packed_inputs.get("position_ids")
             if precomputed_position_ids is not None:
                 precomputed_position_ids = precomputed_position_ids.to(inputs_embeds.device)
-            tensor_stream = None  # prefer packed_inputs path once provided
-        elif tensor_stream is not None:
-            inputs_embeds = self.embed_stream(tensor_stream)
+            tensor_stream = None
         elif input_ids is not None:
             inputs_embeds = self.text_model.embed_tokens(input_ids)
         elif inputs_embeds is None:

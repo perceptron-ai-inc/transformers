@@ -1190,6 +1190,89 @@ def modality_mask(ts: TensorStream) -> torch.Tensor:
     return event_mask(ts, lambda ev: ev.type.value)
 
 
+def tensor_stream_token_view(ts: TensorStream) -> torch.Tensor:
+    """
+    Return a (B, T) token view by summing across the last dim of every
+    event and flattening over the selected token range.
+    """
+
+    def to_token_view(ev: Event) -> list[int]:
+        # collapse all but the last dim, cast to long
+        flat = ev.data.sum(dim=-1).long().reshape(-1)
+        if ev.idx_range is not None:
+            s, e = ev.idx_range
+            return flat[s:e].tolist()
+        else:
+            return flat.tolist()
+
+    return stream_apply(ts, to_token_view, compact=True)  # shape (B, T)
+
+
+def tensor_stream_to_packed_inputs(tensor_stream: TensorStream) -> dict[str, Optional[torch.Tensor]]:
+    """
+    Extract plain tensor payloads from a TensorStream so downstream code can start
+    bypassing the Event/Stream abstraction. The returned tensors cover the Event
+    fields we previously relied on:
+
+    - modality_tensor mirrors `Event.type` for every token.
+    - position_ids materialize MRoPE-ready coordinates from `Event.idx_range` and `Event.dims`.
+    - vision_token_grids store the real spatial grid from `Event.dims(real)`.
+    - vision_token_offsets/vision_token_lengths mirror `Event.idx_range` for vision events after truncation.
+    - vision_patches keeps `Event.data` (real patch vectors) concatenated.
+    """
+
+    vision_events = [ev for stream in tensor_stream.streams for ev in stream if ev.type == ModalityType.image]
+
+    seq_patches: Optional[torch.Tensor]
+    token_grids: Optional[torch.Tensor]
+    token_offsets: Optional[torch.Tensor]
+    token_lengths: Optional[torch.Tensor]
+
+    if vision_events:
+        patch_chunks: list[torch.Tensor] = []
+        grid_rows: list[tuple[int, int]] = []
+        offset_rows: list[int] = []
+        length_rows: list[int] = []
+
+        for ev in vision_events:
+            event_data = ev.data
+            if event_data.dim() > 2:
+                event_data = event_data.view(event_data.size(0), -1)
+
+            # idx_range describes how much of this event survives truncation
+            token_span = ev.idx_range
+            if token_span is None:
+                token_span = (0, math.prod(ev.dims() or [event_data.shape[0]]))
+            start, end = token_span
+
+            patch_chunks.append(event_data)
+            dims_real = ev.dims(False) or ev.dims() or [event_data.shape[0], 1, 1]
+            if len(dims_real) < 3:
+                dims_real = list(dims_real) + [1] * (3 - len(dims_real))
+            grid_rows.append((int(dims_real[1]), int(dims_real[2])))
+            offset_rows.append(int(max(0, start)))
+            length_rows.append(int(max(0, end - start)))
+
+        seq_patches = torch.cat(patch_chunks, dim=0)
+        token_grids = torch.tensor(grid_rows, dtype=torch.long, device=seq_patches.device)
+        token_offsets = torch.tensor(offset_rows, dtype=torch.long, device=seq_patches.device)
+        token_lengths = torch.tensor(length_rows, dtype=torch.long, device=seq_patches.device)
+    else:
+        seq_patches = None
+        token_grids = None
+        token_offsets = None
+        token_lengths = None
+
+    return {
+        "vision_patches": seq_patches,
+        "vision_token_grids": token_grids,
+        "vision_token_offsets": token_offsets,
+        "vision_token_lengths": token_lengths,
+        "modality_tensor": modality_mask(tensor_stream),
+        "position_ids": compute_mrope_pos_tensor(tensor_stream),
+    }
+
+
 def reconstruct_tensor_stream_from_compact_dict(
     ts: "TensorStream", compact_dict: dict[ModalityType, torch.Tensor]
 ) -> "TensorStream":
@@ -1550,8 +1633,35 @@ class IsaacModel(PreTrainedModel):
         """
 
         output_attentions = kwargs.pop("output_attentions", None)
+        packed_inputs = None
 
-        if packed_inputs is not None and inputs_embeds is not None:
+        converted_from_stream = False
+        if tensor_stream is not None and packed_inputs is None:
+            packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
+
+            if position_ids is None:
+                position_ids = packed_inputs.get("position_ids")
+
+            if input_ids is None:
+                input_ids = tensor_stream_token_view(tensor_stream).to(dtype=torch.long)
+                modality_for_ids = packed_inputs.get("modality_tensor")
+                if modality_for_ids is None:
+                    modality_for_ids = modality_mask(tensor_stream)
+                modality_for_ids = modality_for_ids.to(device=input_ids.device, dtype=torch.long)
+                image_mask = modality_for_ids == ModalityType.image.value
+                if image_mask.any():
+                    safe_token_id = getattr(getattr(self.config, "text_config", self.config), "pad_token_id", None)
+                    if safe_token_id is None:
+                        safe_token_id = getattr(self.config, "pad_token_id", None)
+                    if safe_token_id is None or safe_token_id < 0:
+                        safe_token_id = int(self.config.vocab_size - 1)
+                    input_ids = input_ids.clone()
+                    input_ids[image_mask] = safe_token_id
+
+            tensor_stream = None
+            converted_from_stream = True
+
+        if packed_inputs is not None and inputs_embeds is not None and not converted_from_stream:
             raise ValueError("`inputs_embeds` should not be provided alongside `packed_inputs`.")
 
         # Resolve the input source (prefer packed_inputs > tensor_stream > ids > embeds).
@@ -1564,9 +1674,7 @@ class IsaacModel(PreTrainedModel):
             precomputed_position_ids = packed_inputs.get("position_ids")
             if precomputed_position_ids is not None:
                 precomputed_position_ids = precomputed_position_ids.to(inputs_embeds.device)
-            tensor_stream = None  # prefer packed_inputs path once provided
-        elif tensor_stream is not None:
-            inputs_embeds = self.embed_stream(tensor_stream)
+            tensor_stream = None
         elif input_ids is not None:
             inputs_embeds = self.text_model.embed_tokens(input_ids)
         elif inputs_embeds is None:
