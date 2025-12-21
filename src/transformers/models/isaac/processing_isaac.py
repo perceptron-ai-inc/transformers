@@ -23,6 +23,7 @@ import heapq
 import math
 import re
 from collections import defaultdict
+from collections.abc import Callable
 from typing import Any, NewType, Optional, Union
 
 from ...feature_extraction_utils import BatchFeature
@@ -174,6 +175,35 @@ def schedule_events(stream: "Stream", priority: list[Category]) -> list[int]:
     return [sorted_events[i][0] for i in resolved_order]
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Generic event-labelling helper
+# ──────────────────────────────────────────────────────────────────────────
+def event_mask(
+    ts: TensorStream,
+    tag_fn: Callable[[Event], int | None],
+    default: int = -1,
+) -> torch.Tensor:
+    """
+    Build a (batch, seq_len) LongTensor whose value for every *token*
+    is given by `tag_fn(event)`, falling back to `default` when the
+    function returns None.
+
+    The work is done in a single pass via `map  →  compact`.
+    """
+
+    def to_label(ev: Event) -> Any:
+        label = tag_fn(ev)
+        if label is None:
+            label = default
+        return [label] * ev.num_tokens()
+
+    return ts.map_compact(to_label).squeeze(-1)
+
+
+def modality_mask(ts: TensorStream) -> torch.Tensor:
+    return event_mask(ts, lambda ev: ev.type.value)
+
+
 def tensor_stream_token_view(ts: TensorStream) -> torch.Tensor:
     """
     Return a (B, T) token view by summing across the last dim of every
@@ -190,6 +220,42 @@ def tensor_stream_token_view(ts: TensorStream) -> torch.Tensor:
             return flat.tolist()
 
     return ts.map_compact(to_token_view)  # shape (B, T)
+
+
+def tensor_stream_to_packed_inputs(tensor_stream: TensorStream) -> dict[str, Optional[torch.Tensor]]:
+    """
+    Extract plain tensor payloads from a TensorStream so downstream code can start
+    bypassing the Event/Stream abstraction. Returns a dict containing:
+
+    - vision_patches: concatenated vision tokens shaped (total_tokens, embed_dim) or None
+    - vision_token_grids: (num_images, 2) token grid sizes or None
+    - modality_tensor: (batch, seq_len) modality ids aligned to the stream
+    """
+
+    vision_events = [ev for stream in tensor_stream.streams for ev in stream if ev.type == VisionType.image]
+
+    seq_patches: Optional[torch.Tensor]
+    token_grids: Optional[torch.Tensor]
+
+    if vision_events:
+        seq_patches = torch.cat([ev.data for ev in vision_events], dim=0)
+        token_grids = torch.tensor(
+            [
+                (ev.dims(False) or ev.dims())[1:]  # drop the time dimension
+                for ev in vision_events
+            ],
+            dtype=torch.long,
+            device=seq_patches.device,
+        )
+    else:
+        seq_patches = None
+        token_grids = None
+
+    return {
+        "vision_patches": seq_patches,
+        "vision_token_grids": token_grids,
+        "modality_tensor": modality_mask(tensor_stream),
+    }
 
 
 # ============================================================================
@@ -395,6 +461,7 @@ class IsaacProcessor(ProcessorMixin):
         data = {
             "input_ids": input_ids,
             "tensor_stream": tensor_stream,
+            "packed_inputs": tensor_stream_to_packed_inputs(tensor_stream),
         }
 
         return BatchFeature(data=data)

@@ -1613,6 +1613,45 @@ class IsaacModel(PreTrainedModel):
         h = embedded_ts.compact()  # (B, T, D)
         return h
 
+    def embed_packed_inputs(
+        self, input_ids: torch.Tensor, packed_inputs: dict[str, Optional[torch.Tensor]]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Embed packed_inputs (plain tensors) instead of TensorStream.
+
+        Expects input_ids for text tokens and packed_inputs containing:
+        - vision_patches: concatenated vision tokens shaped (total_tokens, embed_dim) or None
+        - vision_token_grids: (num_images, 2) token grid sizes or None
+        - modality_tensor: (batch, seq_len) modality ids aligned to the sequence
+        """
+
+        if input_ids is None:
+            raise ValueError("`input_ids` must be provided when using `packed_inputs`.")
+
+        modality_tensor = packed_inputs.get("modality_tensor")
+        if modality_tensor is None:
+            modality_tensor = torch.full_like(input_ids, TextType.text.value, dtype=torch.long)
+        else:
+            modality_tensor = modality_tensor.to(device=input_ids.device, dtype=torch.long)
+
+        text_embeds = self.embed_text_tokens(input_ids)
+        embeds = text_embeds
+
+        vision_patches = packed_inputs.get("vision_patches")
+        if vision_patches is not None:
+            token_grids = packed_inputs.get("vision_token_grids")
+            if token_grids is None:
+                raise ValueError("`vision_token_grids` must accompany `vision_patches` in packed_inputs.`")
+
+            vision_embeds = self.embed_vision((vision_patches, token_grids))
+            vision_mask = modality_tensor == VisionType.image.value
+            if vision_mask.sum().item() != vision_embeds.shape[0]:
+                raise ValueError("Packed vision payload size does not match modality tensor.")
+
+            embeds = embeds.clone()
+            embeds[vision_mask] = vision_embeds.to(embeds.device)
+
+        return embeds, modality_tensor
+
     @staticmethod
     def compute_position_ids_input_ids(input_ids: torch.Tensor) -> torch.Tensor:
         return compute_position_ids_input_ids(input_ids)
@@ -1675,6 +1714,7 @@ class IsaacModel(PreTrainedModel):
         self,
         input_ids: Optional[torch.LongTensor] = None,
         tensor_stream: Optional[TensorStream] = None,
+        packed_inputs: Optional[dict[str, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         modality_tensor: Optional[torch.LongTensor] = None,
@@ -1694,6 +1734,9 @@ class IsaacModel(PreTrainedModel):
                 Packed multimodal stream of text and vision events to embed directly. Mutually exclusive with
                 `input_ids` and `inputs_embeds`. When provided, the method derives `position_ids` and `modality_tensor`
                 if they are not supplied.
+            packed_inputs (`dict`, *optional*):
+                Plain tensor payloads extracted from a TensorStream. When provided, it replaces the TensorStream path
+                and requires `input_ids` for text tokens.
             modality_tensor (`torch.LongTensor`, *optional*):
                 Modality identifiers aligned with the embedded sequence, shaped `(batch_size, seq_len)` and containing
                 values from `TextType`/`VisionType`. Automatically built from `tensor_stream` or `input_ids` when
@@ -1702,19 +1745,23 @@ class IsaacModel(PreTrainedModel):
 
         output_attentions = kwargs.pop("output_attentions", None)
 
-        # Get inputs
-        if tensor_stream is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both tensor_stream and inputs_embeds")
-        if tensor_stream is None and input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        if tensor_stream is not None and packed_inputs is not None:
+            raise ValueError("Provide only one of `tensor_stream` or `packed_inputs`.")
+        if packed_inputs is not None and inputs_embeds is not None:
+            raise ValueError("`inputs_embeds` should not be provided alongside `packed_inputs`.")
 
-        # Resolve the input source (TensorStream takes precedence over token ids).
-        if tensor_stream is not None:
+        # Resolve the input source (TensorStream / packed_inputs takes precedence over token ids).
+        precomputed_modality: Optional[torch.Tensor] = None
+        if packed_inputs is not None:
+            if input_ids is None:
+                raise ValueError("`input_ids` must be provided when using `packed_inputs`.")
+            inputs_embeds, precomputed_modality = self.embed_packed_inputs(input_ids, packed_inputs)
+        elif tensor_stream is not None:
             inputs_embeds = self.embed_stream(tensor_stream)
         elif input_ids is not None:
             inputs_embeds = self.text_model.embed_tokens(input_ids)
         elif inputs_embeds is None:
-            raise ValueError("You have to specify either tensor_stream, input_ids or inputs_embeds")
+            raise ValueError("You have to specify either tensor_stream, packed_inputs, input_ids or inputs_embeds")
 
         batch_size, seq_len = inputs_embeds.shape[:2]
 
@@ -1729,6 +1776,9 @@ class IsaacModel(PreTrainedModel):
 
         if attention_mask is None:
             attention_mask = torch.ones((batch_size, seq_len), device=inputs_embeds.device, dtype=torch.long)
+
+        if modality_tensor is None and precomputed_modality is not None:
+            modality_tensor = precomputed_modality
 
         position_ids, modality_tensor, decoder_position_ids, cos, sin = self._prepare_position_and_modality(
             position_ids=position_ids,
@@ -2051,6 +2101,7 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         self,
         input_ids: Optional[torch.LongTensor] = None,
         tensor_stream: Optional[TensorStream] = None,
+        packed_inputs: Optional[dict[str, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[list[torch.FloatTensor]] = None,
@@ -2061,12 +2112,14 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | CausalLMOutputWithPast:
         r"""
-        Forward pass for conditional generation supporting both standard inputs and TensorStream.
+        Forward pass for conditional generation supporting both standard inputs, TensorStream, and packed_inputs.
 
         tensor_stream (`TensorStream`, *optional*):
             Packed multimodal stream (text, vision, audio tokens) that already encodes spatial metadata. When provided,
             the model derives embeddings, modality masks, and 3D rotary coordinates directly from the stream instead of
             `input_ids`.
+        packed_inputs (`dict`, *optional*):
+            Plain tensors extracted from a TensorStream; requires `input_ids` for text tokens.
         """
 
         output_attentions = kwargs.pop("output_attentions", None)
@@ -2074,8 +2127,10 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         # Don't compute embeddings here - let the inner model handle it
         if tensor_stream is not None:
             input_ids = None
-        if input_ids is None and inputs_embeds is None and tensor_stream is None:
-            raise ValueError("Either input_ids, inputs_embeds, or tensor_stream must be provided.")
+        if packed_inputs is not None and input_ids is None and inputs_embeds is None:
+            raise ValueError("`input_ids` must be provided when using `packed_inputs`.")
+        if input_ids is None and inputs_embeds is None and tensor_stream is None and packed_inputs is None:
+            raise ValueError("Either input_ids, inputs_embeds, tensor_stream, or packed_inputs must be provided.")
 
         # Record rope deltas on prefill when TensorStream is provided; leave position_ids building to IsaacModel.
         if position_ids is None and tensor_stream is not None:
@@ -2099,6 +2154,7 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         outputs = self.model(
             input_ids=input_ids,
             tensor_stream=tensor_stream,
+            packed_inputs=packed_inputs,
             attention_mask=attention_mask,
             position_ids=position_ids,
             modality_tensor=None,
@@ -2178,13 +2234,14 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         attention_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         tensor_stream: Optional[TensorStream] = None,
+        packed_inputs: Optional[dict[str, torch.Tensor]] = None,
         cache_position: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         use_cache: bool = True,
         **kwargs,
     ) -> dict[str, Any]:
         """
-        Prepare inputs for generation, handling TensorStream inputs properly.
+        Prepare inputs for generation, handling TensorStream and packed_inputs inputs properly.
         """
         if cache_position is None:
             seq_length = None
@@ -2217,14 +2274,20 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
 
         cache_position = model_inputs.get("cache_position", cache_position)
 
-        # Handle TensorStream only for the prefill step
+        # Handle TensorStream/packed_inputs only for the prefill step
         first_step = cache_position is None or cache_position[0] == 0
         if tensor_stream is not None and first_step:
             model_inputs["tensor_stream"] = tensor_stream
-            # Let forward rebuild MRoPE coordinates from the TensorStream
             model_inputs["position_ids"] = None
         else:
             model_inputs["tensor_stream"] = None
+
+        if packed_inputs is not None and first_step:
+            model_inputs["packed_inputs"] = packed_inputs
+            model_inputs["position_ids"] = None
+            model_inputs["tensor_stream"] = None
+        else:
+            model_inputs["packed_inputs"] = None
 
         # TensorStream decode path: preserve rotary offsets from prefill; let forward rebuild positions
         if tensor_stream is not None and not first_step and self.rope_deltas is not None:
