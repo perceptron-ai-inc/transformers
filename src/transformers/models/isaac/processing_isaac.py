@@ -32,7 +32,7 @@ from ...processing_utils import ProcessorMixin
 from ...utils import TensorType
 from ...utils.import_utils import is_torch_available, is_vision_available
 from .configuration_isaac import IsaacConfig
-from .modeling_isaac import Event, ModalityType, Stream, TensorStream, TextType, VisionType
+from .modeling_isaac import Event, ModalityType, Stream, TensorStream
 
 
 if is_torch_available():
@@ -53,10 +53,10 @@ def create_stream(events: list["Event"], priority: list[ModalityType], schedule:
     self-contained.
 
     Example usage:
-        evt1 = Event(torch.zeros(10), TextType.text, (0.0, 1.0))
-        evt2 = Event(torch.ones(10), TextType.text, (1.0, 2.0))
+        evt1 = Event(torch.zeros(10), ModalityType.text, (0.0, 1.0))
+        evt2 = Event(torch.ones(10), ModalityType.text, (1.0, 2.0))
         my_stream = create_stream(events=[evt1, evt2],
-                                  priority=[TextType.text],
+                                  priority=[ModalityType.text],
                                   schedule=False)
         print(my_stream)
     """
@@ -181,7 +181,7 @@ def tensor_stream_to_packed_inputs(tensor_stream: TensorStream) -> dict[str, Opt
     - modality_tensor: (batch, seq_len) modality ids aligned to the stream
     """
 
-    vision_events = [ev for stream in tensor_stream.streams for ev in stream if ev.type == VisionType.image]
+    vision_events = [ev for stream in tensor_stream.streams for ev in stream if ev.type == ModalityType.image]
 
     seq_patches: Optional[torch.Tensor]
     token_grids: Optional[torch.Tensor]
@@ -242,7 +242,7 @@ def create_text_event(tokenizer: AutoTokenizer, text: str, time: float = 0.0) ->
 
     return Event(
         data=tokens,
-        type=TextType.text,
+        type=ModalityType.text,
         time=(time, time),
         dims_virtual=dims_virtual,
         dims_real=dims_real,
@@ -328,7 +328,7 @@ class IsaacProcessor(ProcessorMixin):
 
                 vision_event = Event(
                     data=patches.reshape(-1, patches.shape[-1]),
-                    type=VisionType.image,
+                    type=ModalityType.image,
                     time=(current_time, current_time),
                     dims_virtual=virtual_dims,
                     dims_real=real_dims,
@@ -342,7 +342,7 @@ class IsaacProcessor(ProcessorMixin):
                 events.append(text_event)
 
         # Create stream without scheduling (events already in order)
-        return create_stream(events, priority=[TextType.text, VisionType.image], schedule=True)
+        return create_stream(events, priority=[ModalityType.text, ModalityType.image], schedule=True)
 
     def __call__(
         self,

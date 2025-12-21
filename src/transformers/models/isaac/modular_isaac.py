@@ -47,7 +47,7 @@ if is_torchvision_available():
 
 import heapq
 from dataclasses import dataclass, field, fields, replace
-from enum import Enum
+from enum import IntEnum
 
 from ...cache_utils import DynamicCache
 from ...configuration_utils import PretrainedConfig, layer_type_validation
@@ -89,62 +89,17 @@ from ..siglip2.modeling_siglip2 import (
 # TENSORSTREAM START -------------------------------------------------------------------------------
 
 
-class ModalityType(Enum):
+class ModalityType(IntEnum):
     """
-    Base class for modality-type enumerations.
-    Each derived class (VisionType, TextType) holds
-    an integer value that identifies a specific modality.
-
-    Example usage:
-        If you have an object `my_event` of class `Event`,
-        you might write:
-            if my_event.type == VisionType.image:
-                # process an image frame
-
-    The methods below implement ordering and hashing
-    based on the integer `.value` of each enum member.
-    """
-
-    @property
-    def modality(self):
-        return self.__class__
-
-    def __lt__(self, other):
-        if isinstance(other, ModalityType):
-            return self.value < other.value
-        raise NotImplementedError()
-
-    def __eq__(self, other):
-        if isinstance(other, ModalityType):
-            return self.value == other.value
-        raise NotImplementedError()
-
-    def __hash__(self):
-        return hash(self.value)
-
-
-# NOTE: modality types need to be unique
-class VisionType(ModalityType):
-    """
-    Enum for vision modalities such as key video frames.
-    Typically used in video processing or image sequences.
+    Modality identifiers for events.
 
     Members:
-        image: A single image frame.
-    """
-
-    image = 0
-
-
-class TextType(ModalityType):
-    """
-    Enum for text tokens and padding.
-
-    Members:
-        text: Actual textual tokens.
+        image: Vision tokens (e.g., patches).
+        text: Textual tokens.
         padding: Padding tokens used in sequence batching.
     """
 
+    image = 0
     text = 1
     padding = 2
 
@@ -157,16 +112,17 @@ class Event:
 
     Attributes:
         data (Any): The actual data payload (e.g. a torch.Tensor, a string, etc.).
-        type (ModalityType): The modality type of the data (e.g., VisionType.image).
+        type (ModalityType): The modality type of the data (e.g., ModalityType.image).
         time (Tuple[float, float]): (start_time, end_time) indicating when this Event occurs.
         role (Optional[str]): The role associated with this event (e.g., "user", "agent", "system").
             If None, the event is always included in loss calculation.
 
     Example usage:
         evt = Event(data=torch.zeros((1, 224, 224, 3)),  # e.g. a single image frame
-                    type=VisionType.image,
+                    type=ModalityType.image,
                     time=(0.0, 0.04),
                     role="user")
+
     """
 
     # Descriptors
@@ -296,12 +252,12 @@ class Stream:
 
     Example usage:
         # Create two events of different types
-        evt1 = Event(torch.zeros((1, 224, 224, 3)), VisionType.image, (0.0, 0.04))
-        evt2 = Event(torch.randint(0, 1000, (16, 1)), TextType.text, (0.0, 0.32))
+        evt1 = Event(torch.zeros((1, 224, 224, 3)), ModalityType.image, (0.0, 0.04))
+        evt2 = Event(torch.randint(0, 1000, (16, 1)), ModalityType.text, (0.0, 0.32))
 
         # Make a stream with a given priority
         s = Stream(events=[evt1, evt2],
-                   priority=[VisionType.image, TextType.text])
+                   priority=[ModalityType.image, ModalityType.text])
 
         print(s)
     """
@@ -479,7 +435,7 @@ class TensorStream:
                 # ------------------------------------------------------------------
                 # Decide the dtype for *this* event.
                 # ------------------------------------------------------------------
-                if ev.type in list(TextType):
+                if ev.type in {ModalityType.text, ModalityType.padding}:
                     tgt_dtype = torch.long
                 else:
                     tgt_dtype = dtype or ev.data.dtype
@@ -535,10 +491,10 @@ def create_stream(events: list["Event"], priority: list[ModalityType], schedule:
     self-contained.
 
     Example usage:
-        evt1 = Event(torch.zeros(10), TextType.text, (0.0, 1.0))
-        evt2 = Event(torch.ones(10), TextType.text, (1.0, 2.0))
+        evt1 = Event(torch.zeros(10), ModalityType.text, (0.0, 1.0))
+        evt2 = Event(torch.ones(10), ModalityType.text, (1.0, 2.0))
         my_stream = create_stream(events=[evt1, evt2],
-                                  priority=[TextType.text],
+                                  priority=[ModalityType.text],
                                   schedule=False)
         print(my_stream)
     """
@@ -617,8 +573,8 @@ def group_streams(
 
     For example, group_fn could be:
         - lambda ev: ev.type
-        - lambda ev: ev.type.modality
-        - lambda ev: (ev.type.modality, ev.data.shape)
+        - lambda ev: (ev.type, ev.data.shape)
+        - lambda ev: (ev.type, ev.dims())
 
     Returns:
         A dictionary mapping each group key to a Stream of events belonging to that group.
@@ -845,7 +801,7 @@ def tensor_stream_to_packed_inputs(tensor_stream: TensorStream) -> dict[str, Opt
     - modality_tensor: (batch, seq_len) modality ids aligned to the stream
     """
 
-    vision_events = [ev for stream in tensor_stream.streams for ev in stream if ev.type == VisionType.image]
+    vision_events = [ev for stream in tensor_stream.streams for ev in stream if ev.type == ModalityType.image]
 
     seq_patches: Optional[torch.Tensor]
     token_grids: Optional[torch.Tensor]
@@ -2031,7 +1987,7 @@ def create_text_event(tokenizer: AutoTokenizer, text: str, time: float = 0.0) ->
 
     return Event(
         data=tokens,
-        type=TextType.text,
+        type=ModalityType.text,
         time=(time, time),
         dims_virtual=dims_virtual,
         dims_real=dims_real,
@@ -2117,7 +2073,7 @@ class IsaacProcessor(ProcessorMixin):
 
                 vision_event = Event(
                     data=patches.reshape(-1, patches.shape[-1]),
-                    type=VisionType.image,
+                    type=ModalityType.image,
                     time=(current_time, current_time),
                     dims_virtual=virtual_dims,
                     dims_real=real_dims,
@@ -2131,7 +2087,7 @@ class IsaacProcessor(ProcessorMixin):
                 events.append(text_event)
 
         # Create stream without scheduling (events already in order)
-        return create_stream(events, priority=[TextType.text, VisionType.image], schedule=True)
+        return create_stream(events, priority=[ModalityType.text, ModalityType.image], schedule=True)
 
     def __call__(
         self,
@@ -2295,7 +2251,7 @@ class IsaacRotaryEmbedding(qwen2_5_vl_modeling.Qwen2_5_VLRotaryEmbedding):
 
         with torch.no_grad():
             pos = position_ids.clone()
-            image_value = VisionType.image.value if VisionType is not None else 1
+            image_value = ModalityType.image.value
             not_spatial = modality_tensor != image_value
             if not_spatial.any():
                 data_1d = pos[not_spatial][..., 0].unsqueeze(-1)
@@ -2341,8 +2297,9 @@ class IsaacModel(Qwen3PreTrainedModel):
 
         # Dispatch table for TensorStream balanced embedding (text + vision)
         self.embed_fns = {
-            TextType: self.embed_text_tokens,
-            VisionType: self.embed_vision,
+            ModalityType.text: self.embed_text_tokens,
+            ModalityType.padding: self.embed_text_tokens,
+            ModalityType.image: self.embed_vision,
         }
 
         # Keep track of config attributes that downstream utilities may query directly on the model.
@@ -2411,7 +2368,7 @@ class IsaacModel(Qwen3PreTrainedModel):
 
         embedded_compact = {}
         for stream_type, modality_payload_tensor in per_modality_compact_stream.items():
-            if stream_type.modality == VisionType:
+            if stream_type == ModalityType.image:
                 # Build a (N_events, 2) grid tensor with spatial dims only
                 grids = token_grids.get(stream_type, [])
                 if len(grids) == 0:
@@ -2419,9 +2376,9 @@ class IsaacModel(Qwen3PreTrainedModel):
                 else:
                     token_grids_tensor = torch.tensor(grids, dtype=torch.long, device=tensor_stream.device)[:, 1:]
                     input_tensor = (modality_payload_tensor, token_grids_tensor)
-                embedded_compact[stream_type] = self.embed_fns[stream_type.modality](input_tensor)
+                embedded_compact[stream_type] = self.embed_fns[stream_type](input_tensor)
             else:
-                embedded_compact[stream_type] = self.embed_fns[stream_type.modality](modality_payload_tensor)
+                embedded_compact[stream_type] = self.embed_fns[stream_type](modality_payload_tensor)
 
         # Reconstruct a TensorStream with embedded payloads and compact
         embedded_ts = reconstruct_tensor_stream_from_compact_dict(tensor_stream, embedded_compact)
@@ -2444,7 +2401,7 @@ class IsaacModel(Qwen3PreTrainedModel):
 
         modality_tensor = packed_inputs.get("modality_tensor")
         if modality_tensor is None:
-            modality_tensor = torch.full_like(input_ids, TextType.text.value, dtype=torch.long)
+            modality_tensor = torch.full_like(input_ids, ModalityType.text.value, dtype=torch.long)
         else:
             modality_tensor = modality_tensor.to(device=input_ids.device, dtype=torch.long)
 
@@ -2458,7 +2415,7 @@ class IsaacModel(Qwen3PreTrainedModel):
                 raise ValueError("`vision_token_grids` must accompany `vision_patches` in packed_inputs.`")
 
             vision_embeds = self.embed_vision((vision_patches, token_grids))
-            vision_mask = modality_tensor == VisionType.image.value
+            vision_mask = modality_tensor == ModalityType.image.value
             if vision_mask.sum().item() != vision_embeds.shape[0]:
                 raise ValueError("Packed vision payload size does not match modality tensor.")
 
@@ -2479,7 +2436,7 @@ class IsaacModel(Qwen3PreTrainedModel):
         inputs_embeds: torch.Tensor,
         cache_position: torch.LongTensor,
     ) -> tuple[torch.LongTensor, torch.LongTensor, torch.LongTensor, torch.Tensor, torch.Tensor]:
-        text_value = TextType.text.value if TextType is not None else 0
+        text_value = ModalityType.text.value
         batch_size, seq_len = inputs_embeds.shape[:2]
 
         # Only rely on the tensor_stream for modality when none was provided.
@@ -2558,7 +2515,7 @@ class IsaacModel(Qwen3PreTrainedModel):
                 and requires `input_ids` for text tokens.
             modality_tensor (`torch.LongTensor`, *optional*):
                 Modality identifiers aligned with the embedded sequence, shaped `(batch_size, seq_len)` and containing
-                values from `TextType`/`VisionType`. Automatically built from `tensor_stream` or `input_ids` when
+                values from `ModalityType`. Automatically built from `tensor_stream` or `input_ids` when
                 omitted.
         """
 
