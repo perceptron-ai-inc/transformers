@@ -527,26 +527,12 @@ class TensorStream:
         )
 
 
-def _schedule_stream(stream: "Stream") -> "Stream":
-    """
-    Internal function that reorders (schedules) the events in a Stream
-    based on the stream's priority.
-
-    By default, this calls schedule_events(...) and reorders the events accordingly.
-    The new ordering is assigned in-place to stream.events.
-
-    Example usage (indirect):
-        new_stream = _schedule_stream(old_stream)
-    """
-    scheduled_inds = schedule_events(stream, priority=stream.priority)
-    stream.events = [stream.events[i] for i in scheduled_inds]
-    return stream
-
-
 def create_stream(events: list["Event"], priority: list[ModalityType], schedule: bool = True) -> "Stream":
     """
     Creates a new Stream with the given events and priority.
-    If 'schedule' is True, the events are reordered by calling _schedule_stream.
+    If 'schedule' is True, events are ordered inline using a deterministic
+    schedule based on start time and priority index so the function stays
+    self-contained.
 
     Example usage:
         evt1 = Event(torch.zeros(10), TextType.text, (0.0, 1.0))
@@ -556,30 +542,68 @@ def create_stream(events: list["Event"], priority: list[ModalityType], schedule:
                                   schedule=False)
         print(my_stream)
     """
-    stream = Stream(events, priority)
-    if schedule:
-        stream = _schedule_stream(stream)
-    return stream
+    if schedule and events:
+        priority_index: dict[ModalityType, int] = {category: idx for idx, category in enumerate(priority)}
+        sortable_events = []
+        for i, event in enumerate(events):
+            sortable_events.append((i, event.time[0], event.time[1], event.type))
+        sorted_events = sorted(sortable_events, key=lambda e: e[1])
+        num_events = len(sorted_events)
 
+        graph = defaultdict(set)
+        indegree = {i: 0 for i in range(num_events)}
 
-def merge_streams(streams: Iterable["Stream"]) -> "Stream":
-    """
-    Merges multiple Stream objects into one.
-    The priority of the merged stream is chosen from the longest priority list among the inputs.
-    Stream priorities must be consistent with the chosen priority.
+        for i in range(num_events):
+            idx_i, start_i, end_i, category_i = sorted_events[i]
+            prio_i = priority_index[category_i]
+            for j in range(i + 1, num_events):
+                idx_j, start_j, end_j, category_j = sorted_events[j]
+                if start_j >= end_i:
+                    break
+                if end_i > start_j and end_j > start_i:
+                    prio_j = priority_index[category_j]
+                    if prio_i < prio_j:
+                        graph[i].add(j)
+                        indegree[j] += 1
+                    elif prio_i > prio_j:
+                        graph[j].add(i)
+                        indegree[i] += 1
 
-    All events are concatenated, and a new Stream is created (and scheduled).
+        heap = [
+            (
+                sorted_events[i][1],
+                priority_index[sorted_events[i][3]],
+                sorted_events[i][0],
+                i,
+            )
+            for i in range(num_events)
+            if indegree[i] == 0
+        ]
+        heapq.heapify(heap)
+        resolved_order = []
 
-    Example usage:
-        merged = merge_streams([stream1, stream2])
-    """
-    chosen_priority = max([stream.priority for stream in streams], key=len)
-    assert all(
-        [str(stream.priority) in str([p for p in chosen_priority if p in stream.priority]) for stream in streams]
-    ), "One or more streams has a priority order that doesn't match the merged stream"
-    merged_event_list = [ev for stream in streams for ev in stream.events]
-    merged_stream = create_stream(merged_event_list, chosen_priority)  # non-root stream creation
-    return merged_stream
+        while heap:
+            _, _, _, u = heapq.heappop(heap)
+            resolved_order.append(u)
+            for v in graph[u]:
+                indegree[v] -= 1
+                if indegree[v] == 0:
+                    heapq.heappush(
+                        heap,
+                        (
+                            sorted_events[v][1],
+                            priority_index[sorted_events[v][3]],
+                            sorted_events[v][0],
+                            v,
+                        ),
+                    )
+
+        if len(resolved_order) != num_events:
+            raise ValueError("Cycle detected in events, cannot resolve order")
+
+        events = [events[sorted_events[i][0]] for i in resolved_order]
+
+    return Stream(events, priority)
 
 
 EventDescriptor = NewType("EventDescriptor", Any)
