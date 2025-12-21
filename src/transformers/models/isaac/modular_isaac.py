@@ -177,34 +177,6 @@ class Event:
     def shallow_copy(self) -> "Event":
         return replace(self)
 
-    def __hash__(self) -> int:
-        """Hash Event based on structure, excluding data."""
-
-        def make_hashable(obj):
-            """Convert any object to hashable form."""
-            if obj is None:
-                return None
-            elif isinstance(obj, str | int | float | bool | tuple):
-                return obj
-            elif isinstance(obj, list):
-                return tuple(make_hashable(item) for item in obj) if obj else None
-            elif isinstance(obj, dict):
-                return tuple(sorted((k, make_hashable(v)) for k, v in obj.items())) if obj else None
-            elif hasattr(obj, "value"):  # Enum types
-                return obj.value
-            else:
-                return str(obj)  # Fallback for other types
-
-        hash_values = []
-        for fld in fields(self):
-            if fld.name == "data":
-                continue  # Skip tensor data
-
-            value = getattr(self, fld.name)
-            hash_values.append(make_hashable(value))
-
-        return hash(tuple(hash_values))
-
 
 @dataclass
 class Stream:
@@ -296,21 +268,9 @@ class Stream:
         ).contiguous()
         return tensor
 
-    def flatten(self) -> "Stream":
-        return self.map(lambda ev: {"data": ev.data.reshape(-1, ev.data.shape[-1])})
-
     def shallow_copy(self) -> "Stream":
         events_copy = [ev.shallow_copy() for ev in self.events]
         return Stream(events=events_copy, priority=self.priority)
-
-    def __hash__(self) -> int:
-        """Hash Stream based on structure."""
-        return hash(
-            (
-                tuple(p.value for p in self.priority),  # Convert enums to values
-                tuple(hash(event) for event in self.events),  # Use Event.__hash__
-            )
-        )
 
 
 # TODO: implement all types of cool indexing which can happen since TensorStream assuems Event.data = Tensor
@@ -408,16 +368,6 @@ class TensorStream:
         # Remember where the whole TensorStream lives now.
         self._device = target_device
         return self
-
-    def __hash__(self) -> int:
-        """Hash TensorStream based on structure."""
-        return hash(
-            (
-                tuple(hash(stream) for stream in self.streams),  # Use Stream.__hash__
-                str(self._device) if self._device else None,
-                self.shape,
-            )
-        )
 
 
 def compute_mrope_pos_tensor(ts: TensorStream, n_pos_dims: int = 3) -> torch.Tensor:
