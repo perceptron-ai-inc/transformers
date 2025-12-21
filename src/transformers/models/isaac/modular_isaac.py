@@ -685,64 +685,6 @@ def reconstruct_tensor_stream_from_compact_dict(
     return TensorStream(streams)
 
 
-def slice(tensor_stream: "TensorStream", start: int, end: int) -> "TensorStream":
-    """
-    Return a new TensorStream that contains *only* the tokens in the
-    half-open interval ``[start, end)`` (0-based, inclusive-exclusive).
-    """
-    B, T = tensor_stream.shape
-    assert 0 <= start <= end <= T, f"slice [{start}, {end}) is out of bounds for sequence length {T}"
-
-    sliced_streams: list[Stream] = []
-
-    for stream in tensor_stream.streams:
-        # current position in tensor stream token dims
-        curr_global_index = 0
-        new_events: list[Event] = []
-
-        # iterate over each of the events in the stream only selecting
-        # the events that fall within the range
-        for ev in stream:
-            ev_len = ev.num_tokens()
-
-            # ev_start, ev_end are the start and end indicies of the
-            # event within the tensor stream token dim
-            global_ev_start, global_ev_end = curr_global_index, curr_global_index + ev_len
-
-            if global_ev_end <= start:
-                # The event occurs before the start skip it and move the cursor
-                # forward
-                curr_global_index = global_ev_end
-                continue
-            if global_ev_start >= end:
-                # event occurs after the end we can exit
-                break
-
-            # only consider the part of the event that falls within the range
-            keep_from = max(0, start - global_ev_start)
-            keep_to = min(ev_len, end - global_ev_start)
-            part = ev.shallow_copy()
-
-            if keep_from == 0 and keep_to == ev_len:
-                # Event lies wholly inside the slice
-                new_events.append(part)
-            else:
-                # Partial overlap → trim.
-                assert ev.is_measured
-
-                # update the local event ranges for the slices
-                sliced_event_start = part.idx_range[0] + keep_from
-                sliced_event_end = part.idx_range[0] + keep_to
-                part.slice_tokens(sliced_event_start, sliced_event_end)
-                new_events.append(part)
-
-            curr_global_index = global_ev_end
-
-        sliced_streams.append(create_stream(new_events, stream.priority))
-
-    return TensorStream(sliced_streams)
-
-
 # TENSORSTREAM END -------------------------------------------------------------------------------
 
 
