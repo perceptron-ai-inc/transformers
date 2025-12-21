@@ -1667,9 +1667,11 @@ class IsaacModel(PreTrainedModel):
         text_value = TextType.text.value if TextType is not None else 0
         batch_size, seq_len = inputs_embeds.shape[:2]
 
+        # Only rely on the tensor_stream for modality when none was provided.
+        stream_for_modality = tensor_stream if modality_tensor is None else None
         if modality_tensor is None:
-            if tensor_stream is not None:
-                modality_tensor = modality_mask(tensor_stream)
+            if stream_for_modality is not None:
+                modality_tensor = modality_mask(stream_for_modality)
             else:
                 modality_tensor = torch.full(
                     (batch_size, seq_len), text_value, device=inputs_embeds.device, dtype=torch.long
@@ -1683,9 +1685,11 @@ class IsaacModel(PreTrainedModel):
                     f"but got {tuple(modality_tensor.shape)}"
                 )
 
+        # Prefer tensor-based positions; fall back to tensor_stream only when nothing else is provided.
+        stream_for_positions = tensor_stream if position_ids is None else None
         if position_ids is None:
-            if tensor_stream is not None:
-                position_ids = compute_mrope_pos_tensor(tensor_stream)  # (B,L,3)
+            if stream_for_positions is not None:
+                position_ids = compute_mrope_pos_tensor(stream_for_positions)  # (B,L,3)
             else:
                 position_ids = cache_position.view(1, -1).expand(modality_tensor.shape[0], -1)
 
@@ -1745,17 +1749,16 @@ class IsaacModel(PreTrainedModel):
 
         output_attentions = kwargs.pop("output_attentions", None)
 
-        if tensor_stream is not None and packed_inputs is not None:
-            raise ValueError("Provide only one of `tensor_stream` or `packed_inputs`.")
         if packed_inputs is not None and inputs_embeds is not None:
             raise ValueError("`inputs_embeds` should not be provided alongside `packed_inputs`.")
 
-        # Resolve the input source (TensorStream / packed_inputs takes precedence over token ids).
+        # Resolve the input source (prefer packed_inputs > tensor_stream > ids > embeds).
         precomputed_modality: Optional[torch.Tensor] = None
         if packed_inputs is not None:
             if input_ids is None:
                 raise ValueError("`input_ids` must be provided when using `packed_inputs`.")
             inputs_embeds, precomputed_modality = self.embed_packed_inputs(input_ids, packed_inputs)
+            tensor_stream = None  # prefer packed_inputs path once provided
         elif tensor_stream is not None:
             inputs_embeds = self.embed_stream(tensor_stream)
         elif input_ids is not None:
@@ -2125,6 +2128,8 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         output_attentions = kwargs.pop("output_attentions", None)
 
         # Don't compute embeddings here - let the inner model handle it
+        if tensor_stream is not None and packed_inputs is not None:
+            tensor_stream = None  # prefer packed_inputs when both are present
         if tensor_stream is not None:
             input_ids = None
         if packed_inputs is not None and input_ids is None and inputs_embeds is None:
@@ -2243,6 +2248,9 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         """
         Prepare inputs for generation, handling TensorStream and packed_inputs inputs properly.
         """
+        if tensor_stream is not None and packed_inputs is not None:
+            raise ValueError("Provide only one of `tensor_stream` or `packed_inputs` during generation prep.")
+
         if cache_position is None:
             seq_length = None
             device = None

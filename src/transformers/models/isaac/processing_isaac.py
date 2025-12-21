@@ -400,17 +400,19 @@ class IsaacProcessor(ProcessorMixin):
         text: Union[str, list[str]],
         images: Optional[Union[Image, list[Image]]] = None,
         return_tensors: Optional[Union[str, TensorType]] = TensorType.PYTORCH,
+        return_tensor_stream: bool = True,
         **kwargs,
     ) -> BatchFeature:
         """
-        Process text and images into TensorStream format.
+        Process text and images into packed tensors (and optionally TensorStream for compatibility).
         Args:
             text: Input text or list of texts with vision tokens
             images: PIL image or list of images (optional)
             return_tensors: Format for output tensors
+            return_tensor_stream: When True, include the legacy TensorStream in the output.
 
         Returns:
-            BatchFeature with input_ids and tensor_stream
+            BatchFeature with input_ids, packed_inputs, and optionally tensor_stream
         """
         # Normalize inputs to lists
         if isinstance(text, str):
@@ -458,11 +460,13 @@ class IsaacProcessor(ProcessorMixin):
         else:
             input_ids = tokens
 
+        packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
         data = {
             "input_ids": input_ids,
-            "tensor_stream": tensor_stream,
-            "packed_inputs": tensor_stream_to_packed_inputs(tensor_stream),
+            "packed_inputs": packed_inputs,
         }
+        if return_tensor_stream:
+            data["tensor_stream"] = tensor_stream
 
         return BatchFeature(data=data)
 
