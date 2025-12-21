@@ -592,10 +592,6 @@ def group_streams(
     return dict(split_streams)
 
 
-# Define Category for clarity
-Category = NewType("Category", Any)
-
-
 def compute_mrope_pos_tensor(ts: TensorStream, n_pos_dims: int = 3) -> torch.Tensor:
     """
     Create a (batch, T, n_pos_dims) position tensor in one sweep.
