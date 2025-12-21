@@ -178,39 +178,6 @@ class Event:
 
         return hash(tuple(hash_values))
 
-    def __eq__(self, other) -> bool:
-        """
-        Compares two Event objects for strict equality,
-        allowing for float tolerances in torch.Tensors (via torch.allclose).
-        """
-        if not isinstance(other, Event):
-            return False
-
-        for fld in fields(self):
-            self_value = getattr(self, fld.name)
-            other_value = getattr(other, fld.name)
-
-            if fld.name == "data":
-                # Special handling for tensor data with float tolerance
-                if isinstance(self_value, torch.Tensor) and isinstance(other_value, torch.Tensor):
-                    if not torch.allclose(self_value, other_value):
-                        return False
-                else:
-                    if self_value != other_value:
-                        return False
-            elif fld.name == "role":
-                # Special handling for role: both must be None or both must be set and equal
-                if (self_value is None) != (other_value is None):
-                    return False
-                if self_value is not None and self_value != other_value:
-                    return False
-            else:
-                # Standard equality for all other fields
-                if self_value != other_value:
-                    return False
-
-        return True
-
 
 @dataclass
 class Stream:
@@ -318,17 +285,6 @@ class Stream:
             )
         )
 
-    def __eq__(self, other) -> bool:
-        """Compare Streams structurally."""
-        if not isinstance(other, Stream):
-            return False
-
-        return (
-            self.priority == other.priority
-            and len(self.events) == len(other.events)
-            and all(e1 == e2 for e1, e2 in zip(self.events, other.events, strict=False))
-        )
-
 
 # TODO: implement all types of cool indexing which can happen since TensorStream assuems Event.data = Tensor
 @dataclass
@@ -434,18 +390,6 @@ class TensorStream:
                 str(self._device) if self._device else None,
                 self.shape,
             )
-        )
-
-    def __eq__(self, other) -> bool:
-        """Compare TensorStreams structurally."""
-        if not isinstance(other, TensorStream):
-            return False
-
-        return (
-            self._device == other._device
-            and self.shape == other.shape
-            and len(self.streams) == len(other.streams)
-            and all(s1 == s2 for s1, s2 in zip(self.streams, other.streams, strict=False))
         )
 
 
