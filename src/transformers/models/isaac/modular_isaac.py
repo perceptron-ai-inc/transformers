@@ -1492,15 +1492,11 @@ def compute_position_ids_input_ids(input_ids: torch.Tensor) -> torch.Tensor:
 
 
 class IsaacRotaryEmbedding(qwen2_5_vl_modeling.Qwen2_5_VLRotaryEmbedding):
-    EXTRA_ROPE_KEYS = {"mrope_section", "mrope_interleaved"}
-
     def __init__(self, config: IsaacConfig, device=None):
         rope_source_cfg = config.get_text_config() if hasattr(config, "get_text_config") else config
         rope_scaling = getattr(rope_source_cfg, "rope_scaling", None) or {}
-
-        sanitized_scaling = {k: v for k, v in rope_scaling.items() if k not in self.EXTRA_ROPE_KEYS}
         config_for_rope = copy.copy(rope_source_cfg)
-        config_for_rope.rope_scaling = sanitized_scaling if sanitized_scaling else None
+        config_for_rope.rope_scaling = rope_scaling
 
         init_device = device if device is not None and getattr(device, "type", None) != "meta" else None
         super().__init__(config_for_rope, device=init_device)
@@ -1543,8 +1539,7 @@ class IsaacRotaryEmbedding(qwen2_5_vl_modeling.Qwen2_5_VLRotaryEmbedding):
 
         with torch.no_grad():
             pos = position_ids.clone()
-            image_value = ModalityType.image.value
-            not_spatial = modality_tensor != image_value
+            not_spatial = modality_tensor != ModalityType.image.value
             if not_spatial.any():
                 data_1d = pos[not_spatial][..., 0].unsqueeze(-1)
                 pos[not_spatial] = data_1d.expand(-1, pos.shape[-1])
@@ -1552,10 +1547,8 @@ class IsaacRotaryEmbedding(qwen2_5_vl_modeling.Qwen2_5_VLRotaryEmbedding):
             pos_axes = pos.permute(2, 0, 1).contiguous()
 
         cos_axes, sin_axes = super().forward(hidden_states, pos_axes)
-
         cos_axes = cos_axes.to(hidden_states.dtype)
         sin_axes = sin_axes.to(hidden_states.dtype)
-
         cos_combined = self._combine_axes(cos_axes)
         sin_combined = self._combine_axes(sin_axes)
 
