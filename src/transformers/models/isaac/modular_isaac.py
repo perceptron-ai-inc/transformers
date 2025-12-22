@@ -494,16 +494,11 @@ class IsaacVisionEmbeddings(Siglip2VisionEmbeddings):
 
     def _unpack_from_batch(self, embeddings: torch.Tensor, seq_lengths: torch.Tensor) -> torch.Tensor:
         """Flatten a padded batch back to packed sequence order using `seq_lengths`."""
-        output_chunks: list[torch.Tensor] = []
-        for batch_idx, length in enumerate(seq_lengths.tolist()):
-            if length == 0:
-                continue
-            output_chunks.append(embeddings[batch_idx, :length])
-
-        if not output_chunks:
+        lengths = seq_lengths.to(device=embeddings.device).tolist()
+        chunks = [embeddings[i, :l] for i, l in enumerate(lengths) if l > 0]
+        if not chunks:
             return embeddings.new_zeros((0, embeddings.size(-1)))
-
-        return torch.cat(output_chunks, dim=0)
+        return torch.cat(chunks, dim=0)
 
 
 class IsaacVisionAttention(Siglip2Attention):
