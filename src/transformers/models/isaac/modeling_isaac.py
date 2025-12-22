@@ -802,14 +802,6 @@ class IsaacModel(PreTrainedModel):
     def vision_model(self) -> nn.Module:
         return self.vision_embedding.vision_tower
 
-    def embed_text_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """Embed text tokens, squeezing singleton dimensions."""
-        # Text events are shaped as (..., 1); squeeze the singleton index dim
-        h = self.text_model.embed_tokens(token_ids)
-        if h.dim() >= 2 and h.size(-2) == 1:
-            h = h[..., 0, :]
-        return h
-
     def embed_packed_inputs(
         self, input_ids: torch.Tensor, packed_inputs: dict[str, Optional[torch.Tensor]]
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -824,7 +816,7 @@ class IsaacModel(PreTrainedModel):
         """
         modality = packed_inputs["modality_tensor"].to(device=input_ids.device, dtype=torch.long)
 
-        embeds = self.embed_text_tokens(input_ids)
+        embeds = self.text_model.embed_tokens(input_ids)
 
         vision_patches = packed_inputs.get("vision_patches")
         if vision_patches is None:
