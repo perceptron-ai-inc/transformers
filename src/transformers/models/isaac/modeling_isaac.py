@@ -1905,17 +1905,6 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
         output_attentions = kwargs.pop("output_attentions", None)
-
-        # ---------------------------------------------------------------------
-        # Canonicalize multimodal payload: always work with packed_inputs.
-        # If tensor_stream is provided, convert it unconditionally and discard it.
-        # ---------------------------------------------------------------------
-        if tensor_stream is not None:
-            if packed_inputs is not None:
-                raise ValueError("Provide only one of `tensor_stream` or `packed_inputs`.")
-            packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
-            tensor_stream = None  # keep forward() tensorstream-agnostic from here on
-
         # ---------------------------------------------------------------------
         # Validate input source combinations.
         # ---------------------------------------------------------------------
@@ -2102,6 +2091,13 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         if tensor_stream is not None and not first_step and self.rope_deltas is not None:
             model_inputs["position_ids"] = None
             return model_inputs
+
+        if model_inputs["tensor_stream"] is not None:
+            if packed_inputs is not None:
+                raise ValueError("Provide only one of `tensor_stream` or `packed_inputs`.")
+            packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
+            model_inputs["packed_inputs"] = packed_inputs
+            tensor_stream = None
 
         return model_inputs
 
