@@ -313,10 +313,11 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
             raise ValueError("`do_pad` is not supported by IsaacImageProcessorFast.")
 
         grouped_images, grouped_images_index = group_images_by_shape(images, disable_grouping=disable_grouping)
-        processed_patches_grouped: dict[tuple[int, ...], torch.Tensor] = {}
-        token_grids_grouped: dict[tuple[int, ...], torch.Tensor] = {}
-        virtual_dims_grouped: dict[tuple[int, ...], torch.Tensor] = {}
-        real_dims_grouped: dict[tuple[int, ...], torch.Tensor] = {}
+
+        grouped_outputs: dict[
+            tuple[int, ...],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = {}
 
         for shape, stacked_images in grouped_images.items():
             if stacked_images.ndim != 4:
@@ -402,31 +403,24 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
                 .unsqueeze(0)
                 .repeat(batch_size, 1)
             )
+            grouped_outputs[shape] = (patches, token_grid, virtual_dim, real_dim)
 
-            processed_patches_grouped[shape] = patches
-            token_grids_grouped[shape] = token_grid
-            virtual_dims_grouped[shape] = virtual_dim
-            real_dims_grouped[shape] = real_dim
+        # Helper to reorder a single item of the tuple payloads using the same grouped_images_index
+        def _reorder_grouped_item(
+            grouped: dict[tuple[int, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+            grouped_index: dict[tuple[int, ...], list[int]],
+            item_idx: int,
+        ) -> list[torch.Tensor]:
+            return reorder_images({k: v[item_idx] for k, v in grouped.items()}, grouped_index)
 
-        patches_slices = reorder_images(processed_patches_grouped, grouped_images_index)
-        token_grid_slices = reorder_images(token_grids_grouped, grouped_images_index)
-        virtual_dim_slices = reorder_images(virtual_dims_grouped, grouped_images_index)
-        real_dim_slices = reorder_images(real_dims_grouped, grouped_images_index)
+        keys = ("patches", "token_grids", "virtual_pixel_size", "real_pixel_size")
+        tensors: dict[str, torch.Tensor] = {}
 
-        patches_tensor = torch.stack(patches_slices, dim=0)
-        token_grids_tensor = torch.stack(token_grid_slices, dim=0)
-        virtual_dims_tensor = torch.stack(virtual_dim_slices, dim=0)
-        real_dims_tensor = torch.stack(real_dim_slices, dim=0)
+        for i, key in enumerate(keys):
+            slices = _reorder_grouped_item(grouped_outputs, grouped_images_index, i)
+            tensors[key] = torch.stack(slices, dim=0)
 
-        return BatchFeature(
-            data={
-                "patches": patches_tensor,
-                "token_grids": token_grids_tensor,
-                "virtual_pixel_size": virtual_dims_tensor,
-                "real_pixel_size": real_dims_tensor,
-            },
-            tensor_type=return_tensors,
-        )
+        return BatchFeature(data=tensors, tensor_type=return_tensors)
 
 
 def document_mask_function_from_cu_seqlens(cu_seqlens: Optional[torch.Tensor]) -> Optional[Callable]:
