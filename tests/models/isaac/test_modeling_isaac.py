@@ -481,6 +481,10 @@ class IsaacModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
     def test_assisted_decoding_matches_greedy_search_1_same(self):
         pass
 
+    @unittest.skip(reason="Unsupported")
+    def test_flash_attn_kernels_inference_equivalence(self):
+        pass
+
     @unittest.skip(reason="Assisted decoding not supported; Qwen3 backbone does not implement returning attentions")
     def test_assisted_decoding_sample(self):
         pass
