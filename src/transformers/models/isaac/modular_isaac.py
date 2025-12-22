@@ -23,6 +23,8 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any, Optional, Union, NewType
 
+from transformers.testing_utils import PackedDeviceProperties
+
 from ...utils.import_utils import (
     is_torch_available,
     is_torchdynamo_compiling,
@@ -2099,15 +2101,14 @@ class IsaacModel(Qwen3PreTrainedModel):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        tensor_stream: Optional[TensorStream] = None,
         packed_inputs: Optional[dict[str, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        modality_tensor: Optional[torch.LongTensor] = None,
         past_key_values: Optional[list[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        converted_from_stream=False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | BaseModelOutputWithPast:
         """
@@ -2116,10 +2117,6 @@ class IsaacModel(Qwen3PreTrainedModel):
         Computes position embeddings once and passes them through all layers.
 
         Args:
-            tensor_stream (`TensorStream`, *optional*):
-                Packed multimodal stream of text and vision events to embed directly. Mutually exclusive with
-                `input_ids` and `inputs_embeds`. When provided, the method derives `position_ids` and `modality_tensor`
-                if they are not supplied.
             packed_inputs (`dict`, *optional*):
                 Plain tensor payloads extracted from a TensorStream. When provided, it replaces the TensorStream path
                 and requires `input_ids` for text tokens.
@@ -2129,13 +2126,11 @@ class IsaacModel(Qwen3PreTrainedModel):
                 omitted.
         """
 
+        modality_tensor = None
         output_attentions = kwargs.pop("output_attentions", None)
 
-        converted_from_stream = False
-        if tensor_stream is not None and packed_inputs is None:
-            packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
+        if converted_from_stream:
             text_token_ids = packed_inputs.get("text_token_ids")
-            tensor_stream = None
 
             if position_ids is None:
                 position_ids = packed_inputs.get("position_ids")
@@ -2166,8 +2161,6 @@ class IsaacModel(Qwen3PreTrainedModel):
                     input_ids = input_ids.clone()
                     input_ids[image_mask] = safe_token_id
 
-            converted_from_stream = True
-
         if packed_inputs is not None and inputs_embeds is not None and not converted_from_stream:
             raise ValueError("`inputs_embeds` should not be provided alongside `packed_inputs`.")
 
@@ -2181,7 +2174,6 @@ class IsaacModel(Qwen3PreTrainedModel):
             precomputed_position_ids = packed_inputs.get("position_ids")
             if precomputed_position_ids is not None:
                 precomputed_position_ids = precomputed_position_ids.to(inputs_embeds.device)
-            tensor_stream = None
         elif input_ids is not None:
             inputs_embeds = self.text_model.embed_tokens(input_ids)
         elif inputs_embeds is None:
@@ -2334,18 +2326,23 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
                 rope_delta = rope_delta.repeat_interleave(base_position_ids.shape[0] // rope_delta.shape[0], dim=0)
             position_ids = base_position_ids.add(rope_delta)
 
+        if tensor_stream is not None and packed_inputs is None:
+            packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
+            converted_from_stream = True
+        else:
+            converted_from_stream = False
+
         outputs = self.model(
             input_ids=input_ids,
-            tensor_stream=tensor_stream,
             packed_inputs=packed_inputs,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            modality_tensor=None,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
             cache_position=cache_position,
+            converted_from_stream=converted_from_stream,
             **kwargs,
         )
 
