@@ -1597,18 +1597,15 @@ class IsaacModel(Qwen3PreTrainedModel):
                 position_ids=decoder_position_ids,
             )
 
-        is_attention_mask_dict = isinstance(attention_mask, dict)
-
+        is_mask_dict = isinstance(attention_mask, dict)
         hidden_states = inputs_embeds
         all_attentions = [] if output_attentions else None
 
-        for decoder_layer in self.text_model.layers:
-            layer_attention_mask = (
-                attention_mask[decoder_layer.attention_type] if is_attention_mask_dict else attention_mask
-            )
-            layer_outputs = decoder_layer(
+        for layer in self.text_model.layers:
+            layer_mask = attention_mask[layer.attention_type] if is_mask_dict else attention_mask
+            layer_outputs = layer(
                 hidden_states,
-                attention_mask=layer_attention_mask,
+                attention_mask=layer_mask,
                 position_ids=decoder_position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
