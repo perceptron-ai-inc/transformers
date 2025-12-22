@@ -2426,7 +2426,7 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
         Prepare inputs for generation, handling TensorStream and packed_inputs inputs properly.
         """
         if tensor_stream is not None and packed_inputs is not None:
-            raise ValueError("Provide only one of `tensor_stream` or `packed_inputs` during generation prep.")
+            tensor_stream = None
 
         if cache_position is None:
             seq_length = None
@@ -2451,6 +2451,8 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
             **kwargs,
         )
 
+        packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
+
         cache_position = model_inputs.get("cache_position", cache_position)
 
         # Handle TensorStream/packed_inputs only for the prefill step
@@ -2472,13 +2474,6 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
         if tensor_stream is not None and not first_step and self.rope_deltas is not None:
             model_inputs["position_ids"] = None
             return model_inputs
-
-        if model_inputs["tensor_stream"] is not None:
-            if packed_inputs is not None:
-                raise ValueError("Provide only one of `tensor_stream` or `packed_inputs`.")
-            packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
-            model_inputs["packed_inputs"] = packed_inputs
-            tensor_stream = None
 
         return model_inputs
 
