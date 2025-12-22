@@ -131,9 +131,7 @@ class IsaacProcessor(ProcessorMixin):
         self.current_processor = self.image_processor
         self.config = config
 
-        # Mirror tokenizer chat template so ProcessorMixin.apply_chat_template works.
         self.chat_template = getattr(self.tokenizer, "chat_template", None)
-
         self.vision_token = vision_token
         self.max_sequence_length = max_sequence_length
 

@@ -733,12 +733,6 @@ class IsaacRotaryEmbedding(qwen2_5_vl_modeling.Qwen2_5_VLRotaryEmbedding):
             return base
 
         section = [int(v) for v in section]
-        if len(section) != 3:
-            raise ValueError("`mrope_section` must contain exactly three elements (temporal, height, width)")
-        if sum(section) != rotary_half_dim:
-            raise ValueError(
-                f"`mrope_section` must sum to the rotary half-dimension ({rotary_half_dim}). Received {section}."
-            )
         return section
 
     def _combine_axes(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -752,11 +746,6 @@ class IsaacRotaryEmbedding(qwen2_5_vl_modeling.Qwen2_5_VLRotaryEmbedding):
         modality_tensor: torch.Tensor,
         hidden_states: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if position_ids.ndim != 3 or position_ids.size(-1) != 3:
-            raise ValueError("`position_ids` must have shape (batch, seq_len, 3) for MRoPE")
-        if modality_tensor.shape != position_ids.shape[:2]:
-            raise ValueError("`modality_tensor` must align with the first two dims of `position_ids`")
-
         if hidden_states is None:
             batch, seq_len, _ = position_ids.shape
             hidden_states = torch.zeros(
@@ -835,29 +824,6 @@ def tensor_stream_token_view(
     return tokens
 
 
-# ============================================================================
-# Model
-# ============================================================================
-
-
-def compute_position_ids_input_ids(input_ids: torch.Tensor) -> torch.Tensor:
-    r"""Create 3D positional indices for token input.
-
-    Args:
-        input_ids (`torch.Tensor`):
-            Tensor of shape `(batch_size, seq_len)` containing token ids.
-
-    Returns:
-        `torch.Tensor`: Positional indices with shape `(batch_size, seq_len, 3)` where each channel duplicates the
-        1D position so it can be consumed by the 3-axis MRoPE rotary embedding.
-    """
-    batch_size, seq_length = input_ids.shape
-    position_ids = torch.arange(seq_length, device=input_ids.device)
-    position_ids = position_ids.view(1, -1).expand(batch_size, -1)
-    position_ids = position_ids.unsqueeze(2).expand(-1, -1, 3)  # Add 3D for MRoPE
-    return position_ids
-
-
 @auto_docstring
 class IsaacModel(PreTrainedModel):
     config: IsaacConfig
@@ -889,8 +855,6 @@ class IsaacModel(PreTrainedModel):
 
         self.vision_embedding = IsaacVisionEmbedding(config)
         self.vision_embedding._supports_sdpa = True
-
-        # Keep track of config attributes that downstream utilities may query directly on the model.
         self.max_sequence_length = config.max_sequence_length
         self.vision_rescale_factor = config.vision_rescale_factor
         self.vision_token = config.vision_token
@@ -1010,10 +974,6 @@ class IsaacModel(PreTrainedModel):
             embeds[vision_mask] = vision_embeds.to(embeds.device)
 
         return embeds, modality_tensor
-
-    @staticmethod
-    def compute_position_ids_input_ids(input_ids: torch.Tensor) -> torch.Tensor:
-        return compute_position_ids_input_ids(input_ids)
 
     def _prepare_position_and_modality(
         self,
@@ -1458,6 +1418,24 @@ class IsaacPreTrainedModel(PreTrainedModel):
         "hidden_states": IsaacDecoderLayer,
         "attentions": IsaacAttention,
     }
+
+
+def compute_position_ids_input_ids(input_ids: torch.Tensor) -> torch.Tensor:
+    r"""Create 3D positional indices for token input.
+
+    Args:
+        input_ids (`torch.Tensor`):
+            Tensor of shape `(batch_size, seq_len)` containing token ids.
+
+    Returns:
+        `torch.Tensor`: Positional indices with shape `(batch_size, seq_len, 3)` where each channel duplicates the
+        1D position so it can be consumed by the 3-axis MRoPE rotary embedding.
+    """
+    batch_size, seq_length = input_ids.shape
+    position_ids = torch.arange(seq_length, device=input_ids.device)
+    position_ids = position_ids.view(1, -1).expand(batch_size, -1)
+    position_ids = position_ids.unsqueeze(2).expand(-1, -1, 3)  # Add 3D for MRoPE
+    return position_ids
 
 
 @auto_docstring
