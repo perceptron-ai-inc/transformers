@@ -2062,21 +2062,14 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
 
         # Handle TensorStream/packed_inputs only for the prefill step
         first_step = cache_position is None or cache_position[0] == 0
-        if tensor_stream is not None and first_step:
-            model_inputs["tensor_stream"] = tensor_stream
-            model_inputs["position_ids"] = None
-        else:
-            model_inputs["tensor_stream"] = None
 
         if packed_inputs is not None and first_step:
             model_inputs["packed_inputs"] = packed_inputs
             model_inputs["position_ids"] = None
-            model_inputs["tensor_stream"] = None
         else:
             model_inputs["packed_inputs"] = None
 
-        # TensorStream decode path: preserve rotary offsets from prefill; let forward rebuild positions
-        if tensor_stream is not None and not first_step and self.rope_deltas is not None:
+        if packed_inputs is not None and not first_step and self.rope_deltas is not None:
             model_inputs["position_ids"] = None
             return model_inputs
 
