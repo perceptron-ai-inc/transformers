@@ -19,11 +19,8 @@ import copy
 import itertools
 import math
 import re
-from collections import defaultdict
-from collections.abc import Callable, Iterable, Sequence
-from typing import Any, Optional, Union, NewType
-
-from transformers.testing_utils import PackedDeviceProperties
+from collections.abc import Callable, Sequence
+from typing import Any, Optional, Union
 
 from ...utils.import_utils import (
     is_torch_available,
@@ -47,8 +44,7 @@ else:
 if is_torchvision_available():
     from ..pix2struct.image_processing_pix2struct_fast import torch_extract_patches
 
-import heapq
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, field, replace
 from enum import IntEnum
 
 from ...cache_utils import DynamicCache
