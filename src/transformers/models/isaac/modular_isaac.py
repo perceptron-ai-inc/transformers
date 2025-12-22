@@ -1712,15 +1712,15 @@ class IsaacModel(Qwen3PreTrainedModel):
         inputs_embeds: torch.Tensor,
         cache_position: torch.LongTensor,
     ) -> tuple[torch.LongTensor, torch.LongTensor, torch.LongTensor, torch.Tensor, torch.Tensor]:
-        text_value = ModalityType.text.value
+        device = inputs_embeds.device
         batch_size, seq_len = inputs_embeds.shape[:2]
 
         if modality_tensor is None:
             modality_tensor = torch.full(
-                (batch_size, seq_len), text_value, device=inputs_embeds.device, dtype=torch.long
+                (batch_size, seq_len), ModalityType.text.value, device=device, dtype=torch.long
             )
         else:
-            modality_tensor = modality_tensor.to(device=inputs_embeds.device, dtype=torch.long)
+            modality_tensor = modality_tensor.to(device=device, dtype=torch.long)
             expected_shape = (batch_size, seq_len)
             if modality_tensor.shape != torch.Size(expected_shape):
                 raise ValueError(
@@ -1729,23 +1729,17 @@ class IsaacModel(Qwen3PreTrainedModel):
                 )
 
         if position_ids is None:
-            position_ids = cache_position.view(1, -1).expand(modality_tensor.shape[0], -1)
+            position_ids = cache_position.view(1, -1).expand(batch_size, -1)
 
+        position_ids = position_ids.to(device=device)
         if position_ids.ndim == 2:
-            position_ids = position_ids.to(device=inputs_embeds.device)
             position_ids = position_ids.unsqueeze(-1).expand(-1, -1, 3)
-
         if position_ids.shape[1] != seq_len:
             start_positions = position_ids[:, :1, 0]
-            position_ids = torch.arange(seq_len, device=inputs_embeds.device).view(1, -1)
-            position_ids = position_ids + start_positions
+            position_ids = torch.arange(seq_len, device=device).view(1, -1) + start_positions
             position_ids = position_ids.unsqueeze(-1).expand(-1, -1, 3)
 
-        cos, sin = self.rotary_emb(
-            position_ids,
-            modality_tensor,
-            hidden_states=inputs_embeds,
-        )
+        cos, sin = self.rotary_emb(position_ids, modality_tensor, hidden_states=inputs_embeds)
 
         decoder_position_ids = position_ids[..., 0] if position_ids.ndim == 3 else position_ids
         return position_ids, modality_tensor, decoder_position_ids, cos, sin
