@@ -861,11 +861,6 @@ class IsaacModel(PreTrainedModel):
             h = h[..., 0, :]
         return h
 
-    def embed_vision(self, vision_tokens: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
-        """Embed vision tokens using the vision encoder."""
-        # vision tokens is (seq_patches, token_grids)
-        return self.vision_embedding(vision_tokens)
-
     def embed_packed_inputs(
         self, input_ids: torch.Tensor, packed_inputs: dict[str, Optional[torch.Tensor]]
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -891,7 +886,7 @@ class IsaacModel(PreTrainedModel):
             token_grids = packed_inputs.get("vision_token_grids")
             vision_token_offsets = packed_inputs.get("vision_token_offsets")
             vision_token_lengths = packed_inputs.get("vision_token_lengths")
-            vision_embeds = self.embed_vision((vision_patches, token_grids))
+            vision_embeds = self.vision_embedding((vision_patches, token_grids))
 
             vision_seq_sizes = torch.prod(token_grids.to(device=vision_embeds.device), dim=-1)
             scale_factor = self.config.vision_config.pixel_shuffle_scale_factor
