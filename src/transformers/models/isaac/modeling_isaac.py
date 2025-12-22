@@ -1871,7 +1871,6 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        tensor_stream: Optional[TensorStream] = None,
         packed_inputs: Optional[dict[str, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -1905,6 +1904,7 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
         output_attentions = kwargs.pop("output_attentions", None)
+
         # ---------------------------------------------------------------------
         # Validate input source combinations.
         # ---------------------------------------------------------------------
@@ -1918,10 +1918,6 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         if input_ids is None and inputs_embeds is None and packed_inputs is None:
             raise ValueError("Either input_ids, inputs_embeds, or packed_inputs must be provided.")
 
-        # ---------------------------------------------------------------------
-        # RoPE delta capture on prefill when packed position_ids are available.
-        # (Prefer position_ids presence; do NOT key off tensor_stream.)
-        # ---------------------------------------------------------------------
         if position_ids is None and packed_inputs is not None:
             pos_3d = packed_inputs.get("position_ids")
             if pos_3d is not None:
