@@ -43,7 +43,7 @@ from transformers.models.isaac.modeling_isaac import (
     IsaacVisionConfig,
     document_mask_function_from_cu_seqlens,
 )
-from transformers.models.isaac.processing_isaac import IsaacProcessor, tensor_stream_to_packed_inputs
+from transformers.models.isaac.processing_isaac import IsaacProcessor
 
 from transformers.testing_utils import (
     require_flash_attn,
@@ -824,12 +824,15 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
         ]
         prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True).strip()
         processor_output = self.processor(text=prompt, images=images, return_tensors="pt")
-        tensor_stream = processor_output["tensor_stream"].to(self.device)
-        packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
+        packed_inputs = processor_output["packed_inputs"]
+        device = next(self.model.parameters()).device
+
+        # Move packed tensors to model device
+        packed_inputs = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in packed_inputs.items()}
 
         with torch.no_grad():
             outputs = self.model.generate(
-                tensor_stream=tensor_stream,
+                packed_inputs=packed_inputs,
                 max_new_tokens=num_tokens or self.max_new_tokens,
                 do_sample=False,
                 pad_token_id=self.tokenizer.eos_token_id,
