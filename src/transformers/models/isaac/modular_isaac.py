@@ -594,11 +594,9 @@ class IsaacVisionAttention(Siglip2Attention):
         if attn_impl != "sdpa":
             attention_interface = ALL_ATTENTION_FUNCTIONS[attn_impl]
 
-        dropout = 0.0 if not self.training else self.dropout
         attention_kwargs: dict[str, Any] = {
             "is_causal": False,
             "scaling": self.scale,
-            "dropout": dropout,
         }
 
         supports_varlen = cu_seqlens is not None and attn_impl in {
@@ -608,10 +606,6 @@ class IsaacVisionAttention(Siglip2Attention):
             "paged|flash_attention_2",
             "paged|flash_attention_3",
         }
-
-        if output_attentions and attn_impl == "eager":
-            attention_kwargs["output_attentions"] = True
-
         if supports_varlen:
             if max_seqlen is not None:
                 max_q = max_k = int(max_seqlen)
@@ -638,9 +632,7 @@ class IsaacVisionAttention(Siglip2Attention):
             attention_mask,
             **attention_kwargs,
         )
-
         attn_output = attn_output.reshape(batch_size, seq_length, embed_dim).contiguous()
-
         attn_output = self.out_proj(attn_output)
 
         return attn_output, attn_weights
