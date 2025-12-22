@@ -232,15 +232,8 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
         antialias: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        resize_mode: Any = interpolation
-        if hasattr(resize_mode, "value"):
-            resize_mode = resize_mode.value
-        elif hasattr(resize_mode, "name"):
-            resize_mode = resize_mode.name.lower()
-        elif resize_mode is None:
-            resize_mode = "bilinear"
-
         resize_kwargs: dict[str, Any] = {"align_corners": False}
+        resize_mode = "bilinear"
 
         return F.interpolate(
             image,
