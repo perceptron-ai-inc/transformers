@@ -443,21 +443,15 @@ def document_mask_function_from_cu_seqlens(cu_seqlens: Optional[torch.Tensor]) -
     The returned callable matches the signature expected by ``masking_utils`` mask factories and
     yields ``True`` only when query/key positions belong to the same packed segment.
     """
-
-    if cu_seqlens is None:
-        return None
-
-    if cu_seqlens.numel() < 2:
+    if cu_seqlens is None or cu_seqlens.numel() < 2:
         return None
 
     seq_sizes = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
-    if seq_sizes.numel() == 0:
+    if seq_sizes.numel() == 0 or int(seq_sizes.sum()) == 0:
         return None
 
-    total_tokens = int(seq_sizes.sum().item())
     seg_ids = torch.repeat_interleave(torch.arange(seq_sizes.numel(), device=cu_seqlens.device), seq_sizes)
-    packed_sequence_mask = seg_ids.view(1, total_tokens)
-    return packed_sequence_mask_function(packed_sequence_mask)
+    return packed_sequence_mask_function(seg_ids.view(1, -1))
 
 
 def create_document_attention_mask(
@@ -626,8 +620,7 @@ class IsaacVisionTransformer(nn.Module):
         hidden_states = hidden_states.unsqueeze(0)
 
         # Generate cumulative sequence lengths for variable-length attention
-        cu_seqlens = torch.zeros(seq_sizes.size(0) + 1, dtype=torch.int32, device=hidden_states.device)
-        cu_seqlens[1:] = seq_sizes.cumsum(0)
+        cu_seqlens = F.pad(seq_sizes.cumsum(0).to(torch.int32), (1, 0))
 
         attention_mask = create_document_attention_mask(self.config, hidden_states, cu_seqlens)
 
