@@ -702,23 +702,6 @@ class IsaacVisionEncoder(Siglip2Encoder):
         super().__init__(config)
         self.layers = nn.ModuleList([IsaacVisionEncoderLayer(config) for _ in range(config.num_hidden_layers)])
 
-    @can_return_tuple
-    @check_model_inputs
-    def forward(
-        self,
-        inputs_embeds,
-        attention_mask: Optional[torch.Tensor] = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ):
-        hidden_states = inputs_embeds
-        for encoder_layer in self.layers:
-            hidden_states = encoder_layer(
-                hidden_states,
-                attention_mask,
-                **kwargs,
-            )
-        return BaseModelOutput(last_hidden_state=hidden_states)
-
 
 def create_pixel_shuffle_index_map(
     seq_sizes: torch.Tensor,
@@ -1437,8 +1420,7 @@ class IsaacRotaryEmbedding(qwen2_5_vl_modeling.Qwen2_5_VLRotaryEmbedding):
         cos_axes, sin_axes = super().forward(hidden_states, pos_axes)
         cos_axes = cos_axes.to(hidden_states.dtype)
         sin_axes = sin_axes.to(hidden_states.dtype)
-        cos_combined = self._combine_axes(cos_axes)
-        sin_combined = self._combine_axes(sin_axes)
+        cos_combined, sin_combined = self._combine_axes(cos_axes), self._combine_axes(sin_axes)
 
         return cos_combined, sin_combined
 
