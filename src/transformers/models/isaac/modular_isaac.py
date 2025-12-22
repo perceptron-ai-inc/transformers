@@ -2434,12 +2434,6 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
             if input_ids is not None:
                 seq_length = input_ids.shape[1]
                 device = input_ids.device
-            elif inputs_embeds is not None:
-                seq_length = inputs_embeds.shape[1]
-                device = inputs_embeds.device
-            elif tensor_stream is not None:
-                _, seq_length = tensor_stream.shape
-                device = tensor_stream.device
             if seq_length is not None:
                 # prepare_inputs_for_generation may be invoked outside `generate`, so synthesize the
                 # same cache positions that GenerationMixin would have created during prefill.
