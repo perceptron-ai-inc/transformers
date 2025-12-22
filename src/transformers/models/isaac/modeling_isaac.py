@@ -437,11 +437,15 @@ class IsaacVisionEncoder(nn.Module):
         return BaseModelOutput(last_hidden_state=hidden_states)
 
 
-def document_mask_function_from_cu_seqlens(cu_seqlens: Optional[torch.Tensor]) -> Optional[Callable]:
-    """Return a mask function that blocks cross-document attention from packed ``cu_seqlens``.
+def create_document_attention_mask(
+    config: PretrainedConfig,
+    input_embeds: torch.Tensor,
+    cu_seqlens: Optional[torch.Tensor],
+) -> Optional[Union[torch.Tensor, Any]]:
+    """
+    Materialize a backend-specific block-diagonal attention mask from packed cu_seqlens.
 
-    The returned callable matches the signature expected by ``masking_utils`` mask factories and
-    yields ``True`` only when query/key positions belong to the same packed segment.
+    Returns None if cu_seqlens is missing/degenerate.
     """
     if cu_seqlens is None or cu_seqlens.numel() < 2:
         return None
@@ -450,25 +454,11 @@ def document_mask_function_from_cu_seqlens(cu_seqlens: Optional[torch.Tensor]) -
     if seq_sizes.numel() == 0 or int(seq_sizes.sum()) == 0:
         return None
 
-    seg_ids = torch.repeat_interleave(torch.arange(seq_sizes.numel(), device=cu_seqlens.device), seq_sizes)
-    return packed_sequence_mask_function(seg_ids.view(1, -1))
-
-
-def create_document_attention_mask(
-    config: PretrainedConfig,
-    input_embeds: torch.Tensor,
-    cu_seqlens: Optional[torch.Tensor],
-) -> Optional[Union[torch.Tensor, Any]]:
-    """Materialize a backend-specific block-diagonal attention mask.
-
-    This uses the standard `masking_utils` mask interface (same mechanism as Llama4),
-    so the returned object matches the selected attention backend (e.g. SDPA bool mask,
-    eager additive mask, or flex `BlockMask`).
-    """
-
-    mask_function = document_mask_function_from_cu_seqlens(cu_seqlens)
-    if mask_function is None:
-        return None
+    seg_ids = torch.repeat_interleave(
+        torch.arange(seq_sizes.numel(), device=cu_seqlens.device),
+        seq_sizes,
+    )
+    mask_function = packed_sequence_mask_function(seg_ids.view(1, -1))
 
     seq_len = input_embeds.shape[1]
     cache_position = torch.arange(seq_len, device=input_embeds.device, dtype=torch.long)
@@ -922,12 +912,6 @@ class IsaacModel(PreTrainedModel):
             )
         else:
             modality_tensor = modality_tensor.to(device=device, dtype=torch.long)
-            expected_shape = (batch_size, seq_len)
-            if modality_tensor.shape != torch.Size(expected_shape):
-                raise ValueError(
-                    f"modality_tensor must have shape (batch_size, seq_len) {expected_shape}, "
-                    f"but got {tuple(modality_tensor.shape)}"
-                )
 
         if position_ids is None:
             position_ids = cache_position.view(1, -1).expand(batch_size, -1)

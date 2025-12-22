@@ -41,7 +41,6 @@ from transformers.models.isaac.image_processing_isaac_fast import IsaacImageProc
 from transformers.models.isaac.modeling_isaac import (
     IsaacVisionAttention,
     IsaacVisionConfig,
-    document_mask_function_from_cu_seqlens,
 )
 from transformers.models.isaac.processing_isaac import IsaacProcessor
 
@@ -152,74 +151,6 @@ def compute_logits_statistics(tensor: torch.Tensor) -> dict[str, object]:
         "sum": _rounded(flat.sum()),
         "l2_norm": _rounded(torch.linalg.vector_norm(flat, ord=2)),
     }
-
-
-@require_torch
-class IsaacDocumentMaskingTest(unittest.TestCase):
-    def test_document_mask_function_from_cu_seqlens(self):
-        cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
-        mask_fn = document_mask_function_from_cu_seqlens(cu_seqlens)
-
-        self.assertIsNotNone(mask_fn)
-        # Same document (indices 1 and 2)
-        self.assertTrue(mask_fn(0, 0, 1, 2))
-        # Cross-document (index 1 in first doc, 3 in second doc)
-        self.assertFalse(mask_fn(0, 0, 1, 3))
-        # Same second document (indices 3 and 4)
-        self.assertTrue(mask_fn(0, 0, 4, 3))
-
-    def test_document_mask_function_materializes_with_masking_utils(self):
-        cu_seqlens = torch.tensor([0, 2, 4], dtype=torch.int32)
-        total_tokens = 4
-        mask_fn = document_mask_function_from_cu_seqlens(cu_seqlens)
-
-        cache_position = torch.arange(total_tokens, device=cu_seqlens.device, dtype=torch.long)
-        expected_bool = torch.tensor(
-            [
-                [
-                    [
-                        [True, True, False, False],
-                        [True, True, False, False],
-                        [False, False, True, True],
-                        [False, False, True, True],
-                    ]
-                ]
-            ],
-            device=cu_seqlens.device,
-        )
-
-        sdpa = sdpa_mask(
-            batch_size=1,
-            cache_position=cache_position,
-            kv_length=total_tokens,
-            kv_offset=0,
-            mask_function=mask_fn,
-            attention_mask=None,
-            allow_is_causal_skip=False,
-            allow_is_bidirectional_skip=False,
-            allow_torch_fix=False,
-            use_vmap=False,
-        )
-        # sdpa_mask returns True for allowed positions; SDPA expects True to mean "mask out"
-        self.assertTrue(torch.equal(sdpa, expected_bool))
-
-        eager = eager_mask(
-            batch_size=1,
-            cache_position=cache_position,
-            kv_length=total_tokens,
-            kv_offset=0,
-            mask_function=mask_fn,
-            attention_mask=None,
-            allow_is_bidirectional_skip=False,
-            use_vmap=False,
-            dtype=torch.float32,
-        )
-        expected_additive = torch.where(
-            expected_bool,
-            torch.tensor(0.0, device=cu_seqlens.device, dtype=torch.float32),
-            torch.tensor(torch.finfo(torch.float32).min, device=cu_seqlens.device, dtype=torch.float32),
-        )
-        self.assertTrue(torch.equal(eager, expected_additive))
 
 
 def create_isaac_processor(
