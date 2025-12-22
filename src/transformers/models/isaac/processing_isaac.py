@@ -22,7 +22,7 @@
 import itertools
 import math
 import re
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from ...feature_extraction_utils import BatchFeature
 from ...models.auto.tokenization_auto import AutoTokenizer
@@ -41,56 +41,6 @@ if is_vision_available():
     from PIL.Image import Image
 else:
     Image = None
-
-
-def _infer_device_from_streams(streams: list[Stream]) -> torch.device | str:
-    return next(
-        (ev.data.device for stream in streams for ev in stream.events if isinstance(ev.data, torch.Tensor)),
-        "cpu",
-    )
-
-
-def compute_mrope_pos_tensor(ts: TensorStream, n_pos_dims: int = 3) -> torch.Tensor:
-    """
-    Create a (batch, T, n_pos_dims) position tensor in one sweep.
-    The first dim is the running “time” index, the rest are spatial (or 1-fillers).
-
-    Args:
-        ts         : TensorStream
-        n_pos_dims : total coordinate dimensions (default 3)
-
-    Returns:
-        torch.LongTensor  - shape (batch_size, seq_len, n_pos_dims)
-    """
-
-    # Manually iterate through streams and events like map_compact does,
-    # but maintain cumulative time offset for each stream
-    all_coords = []
-    for stream in ts.streams:  # one Stream == one batch sample
-        cumulative_offset = 0  # running time index for this stream
-
-        for event in stream:
-            # --- build coordinate grid for THIS event using itertools (no tensor ops) ---
-            dims = (event.dims() or [1]) + [1] * (n_pos_dims - len(event.dims() or []))
-
-            # Create ranges for each dimension (similar to old _finalize implementation)
-            first_dim = range(cumulative_offset, cumulative_offset + dims[0])
-            cumulative_offset += dims[0]  # advance time for the next event
-            other_dims = [range(d) for d in dims[1:]]
-
-            # Use itertools.product to create all coordinate combinations
-            full_coords = list(itertools.product(first_dim, *other_dims))
-
-            # Slice if the event is partial
-            s, e = event.idx_range
-            coords = full_coords[s:e]
-
-            # Extend the flattened coordinate list
-            all_coords.extend(coords)
-
-    # Convert to tensor and reshape to (B, T, n_pos_dims)
-    B, T = ts.shape
-    return torch.tensor(all_coords, dtype=torch.long, device=ts.device).reshape(B, T, n_pos_dims)
 
 
 def tensor_stream_token_view(
@@ -138,120 +88,6 @@ def tensor_stream_token_view(
         )
 
     return tokens
-
-
-def tensor_stream_to_packed_inputs(tensor_stream: TensorStream) -> dict[str, Optional[torch.Tensor]]:
-    """
-    Extract plain tensor payloads from a TensorStream so downstream code can start
-    bypassing the Event/Stream abstraction. The returned tensors cover the Event
-    fields we previously relied on:
-
-    - modality_tensor mirrors `Event.type` for every token.
-    - position_ids materialize MRoPE-ready coordinates from `Event.idx_range` and `Event.dims`.
-    - vision_token_grids store the real spatial grid from `Event.dims(real)`.
-    - vision_token_offsets/vision_token_lengths mirror `Event.idx_range` for vision events after truncation.
-    - vision_patches keeps `Event.data` (real patch vectors) concatenated.
-    - text_token_ids preserves the text token payloads (batch, num_text_tokens).
-    """
-
-    device = tensor_stream.device or torch.device(_infer_device_from_streams(tensor_stream.streams))
-
-    text_token_batches: list[torch.Tensor] = []
-    for stream in tensor_stream.streams:
-        stream_tokens: list[torch.Tensor] = []
-        for ev in stream:
-            if ev.type != ModalityType.text:
-                continue
-            tokens = ev.data
-            if tokens.dim() > 1:
-                tokens = tokens.reshape(-1)
-            if ev.idx_range is not None:
-                start, end = ev.idx_range
-                tokens = tokens[start:end]
-            stream_tokens.append(tokens.to(device=device, dtype=torch.long))
-        if stream_tokens:
-            text_token_batches.append(torch.cat(stream_tokens, dim=0))
-        else:
-            text_token_batches.append(torch.zeros((0,), device=device, dtype=torch.long))
-
-    max_text_len = max(tokens.numel() for tokens in text_token_batches) if text_token_batches else 0
-    text_token_ids = torch.zeros((len(text_token_batches), max_text_len), device=device, dtype=torch.long)
-    for idx, tokens in enumerate(text_token_batches):
-        if tokens.numel():
-            text_token_ids[idx, : tokens.numel()] = tokens
-
-    modality_batches: list[torch.Tensor] = []
-    pad_value = ModalityType.padding.value
-    for stream in tensor_stream.streams:
-        token_labels: list[torch.Tensor] = []
-        for ev in stream:
-            num = ev.idx_range[1] - ev.idx_range[0] if ev.idx_range is not None else ev.num_tokens()
-            token_labels.append(torch.full((num,), ev.type.value, device=device, dtype=torch.long))
-        if token_labels:
-            modality_batches.append(torch.cat(token_labels, dim=0))
-        else:
-            modality_batches.append(torch.zeros((0,), device=device, dtype=torch.long))
-
-    max_modality_len = max(m.numel() for m in modality_batches) if modality_batches else 0
-    modality_tensor = torch.full((len(modality_batches), max_modality_len), pad_value, device=device, dtype=torch.long)
-    for idx, labels in enumerate(modality_batches):
-        if labels.numel():
-            modality_tensor[idx, : labels.numel()] = labels
-
-    vision_events = [ev for stream in tensor_stream.streams for ev in stream if ev.type == ModalityType.image]
-
-    seq_patches: Optional[torch.Tensor]
-    token_grids: Optional[torch.Tensor]
-    token_offsets: Optional[torch.Tensor]
-    token_lengths: Optional[torch.Tensor]
-
-    if vision_events:
-        patch_chunks: list[torch.Tensor] = []
-        grid_rows: list[tuple[int, int]] = []
-        offset_rows: list[int] = []
-        length_rows: list[int] = []
-
-        for ev in vision_events:
-            event_data = ev.data
-            if event_data.dim() > 2:
-                event_data = event_data.view(event_data.size(0), -1)
-
-            # idx_range describes how much of this event survives truncation
-            token_span = ev.idx_range
-            if token_span is None:
-                token_span = (0, math.prod(ev.dims() or [event_data.shape[0]]))
-            start, end = token_span
-
-            patch_chunks.append(event_data)
-            dims_real = ev.dims(False) or ev.dims() or [event_data.shape[0], 1, 1]
-            if len(dims_real) < 3:
-                dims_real = list(dims_real) + [1] * (3 - len(dims_real))
-            grid_rows.append((int(dims_real[1]), int(dims_real[2])))
-            offset_rows.append(int(max(0, start)))
-            length_rows.append(int(max(0, end - start)))
-
-        seq_patches = torch.cat(patch_chunks, dim=0)
-        token_grids = torch.tensor(grid_rows, dtype=torch.long, device=seq_patches.device)
-        token_offsets = torch.tensor(offset_rows, dtype=torch.long, device=seq_patches.device)
-        token_lengths = torch.tensor(length_rows, dtype=torch.long, device=seq_patches.device)
-    else:
-        seq_patches = None
-        token_grids = None
-        token_offsets = None
-        token_lengths = None
-
-    if modality_tensor.dim() != 2:
-        raise ValueError("`modality_tensor` must be 2D (batch, seq_len).")
-
-    return {
-        "vision_patches": seq_patches,
-        "vision_token_grids": token_grids,
-        "vision_token_offsets": token_offsets,
-        "vision_token_lengths": token_lengths,
-        "modality_tensor": modality_tensor,
-        "position_ids": compute_mrope_pos_tensor(tensor_stream),
-        "text_token_ids": text_token_ids,
-    }
 
 
 # ============================================================================
@@ -390,6 +226,167 @@ class IsaacProcessor(ProcessorMixin):
         # Create stream without scheduling (events already in order)
         return Stream(events, priority=[ModalityType.text, ModalityType.image])
 
+    def _segment_inputs(
+        self,
+        text: str,
+        images: Optional[list[Image]],
+    ) -> list[dict[str, Any]]:
+        pattern = re.escape(self.vision_token)
+        parts = re.split(f"({pattern})", text)
+
+        segments: list[dict[str, Any]] = []
+        image_idx = 0
+        for part in parts:
+            if part == self.vision_token:
+                if images is None or image_idx >= len(images):
+                    raise ValueError("Encountered vision token without a corresponding image.")
+
+                features = self.image_processor(
+                    images=images[image_idx],
+                    return_tensors=TensorType.PYTORCH,
+                )
+
+                patches = features["patches"][0]
+                virtual_dims = [int(v) for v in features["virtual_pixel_size"][0].tolist()]
+                real_dims = [int(v) for v in features["real_pixel_size"][0].tolist()]
+
+                segments.append(
+                    {
+                        "type": "image",
+                        "seq_length": int(math.prod(virtual_dims)),
+                        "patches": patches.reshape(-1, patches.shape[-1]),
+                        "virtual_dims": virtual_dims,
+                        "real_dims": real_dims,
+                    }
+                )
+                image_idx += 1
+            elif part:
+                tokens = self.tokenizer.encode(part, add_special_tokens=False, return_tensors="pt").squeeze(0)
+                tokens = tokens.to(dtype=torch.long)
+                segments.append(
+                    {
+                        "type": "text",
+                        "length": int(tokens.shape[0]),
+                        "tokens": tokens,
+                    }
+                )
+
+        return segments
+
+    def _build_packed_inputs_from_segments(self, segments: list[dict[str, Any]]) -> dict[str, Optional[torch.Tensor]]:
+        total_len = 0
+        for seg in segments:
+            if seg["type"] == "text":
+                total_len += int(seg["length"])
+            else:
+                total_len += int(seg.get("seq_length", seg["patches"].shape[0]))
+
+        start_keep = max(0, total_len - self.max_sequence_length)
+        end_keep = total_len
+
+        modality_values: list[int] = []
+        coords: list[tuple[int, int, int]] = []
+        text_chunks: list[torch.Tensor] = []
+        vision_chunks: list[torch.Tensor] = []
+        token_grids: list[tuple[int, int]] = []
+        token_offsets: list[int] = []
+        token_lengths: list[int] = []
+
+        token_cursor = 0
+        time_offset = 0
+
+        for seg in segments:
+            if seg["type"] == "text":
+                seq_len = int(seg["length"])
+                dims = [seq_len, 1, 1]
+                data = seg["tokens"]
+            else:
+                dims = list(seg["virtual_dims"])
+                if len(dims) < 3:
+                    dims = dims + [1] * (3 - len(dims))
+                seq_len = int(seg.get("seq_length", math.prod(dims)))
+                data = seg["patches"]
+
+            seg_len = seq_len
+            seg_start = token_cursor
+            seg_end = seg_start + seg_len
+
+            overlap_start = max(start_keep, seg_start)
+            overlap_end = min(end_keep, seg_end)
+            overlap_len = overlap_end - overlap_start
+
+            first_dim = range(time_offset, time_offset + dims[0])
+            other_dims = [range(d) for d in dims[1:]]
+            full_coords = list(itertools.product(first_dim, *other_dims))
+
+            if overlap_len > 0:
+                slice_start = overlap_start - seg_start
+                slice_end = slice_start + overlap_len
+                coords.extend(full_coords[slice_start:slice_end])
+
+                modality_value = ModalityType.text.value if seg["type"] == "text" else ModalityType.image.value
+                modality_values.extend([modality_value] * overlap_len)
+
+                if seg["type"] == "text":
+                    text_1d = data.view(-1)
+                    text_chunks.append(text_1d[slice_start:slice_end])
+                else:
+                    vision_chunks.append(data)
+                    real_dims = seg["real_dims"]
+                    token_grids.append((int(real_dims[1]), int(real_dims[2])))
+                    token_offsets.append(int(slice_start))
+                    token_lengths.append(int(overlap_len))
+
+            token_cursor = seg_end
+            time_offset += dims[0]
+
+        if vision_chunks:
+            base_device = vision_chunks[0].device
+        elif text_chunks:
+            base_device = text_chunks[0].device
+        else:
+            base_device = torch.device("cpu")
+
+        if modality_values:
+            modality_tensor = torch.tensor(modality_values, dtype=torch.long, device=base_device).unsqueeze(0)
+        else:
+            modality_tensor = torch.zeros((1, 0), dtype=torch.long, device=base_device)
+
+        if coords:
+            position_ids = torch.tensor(coords, dtype=torch.long, device=base_device).reshape(1, len(coords), 3)
+        else:
+            position_ids = torch.zeros((1, 0, 3), dtype=torch.long, device=base_device)
+
+        if text_chunks:
+            text_concat = torch.cat(text_chunks, dim=0).to(device=base_device, dtype=torch.long)
+        else:
+            text_concat = torch.zeros((0,), dtype=torch.long, device=base_device)
+
+        text_token_ids = torch.zeros((1, text_concat.numel()), dtype=torch.long, device=base_device)
+        if text_concat.numel():
+            text_token_ids[0, : text_concat.numel()] = text_concat
+
+        if vision_chunks:
+            vision_patches = torch.cat(vision_chunks, dim=0)
+            vision_token_grids = torch.tensor(token_grids, dtype=torch.long, device=vision_patches.device)
+            vision_token_offsets = torch.tensor(token_offsets, dtype=torch.long, device=vision_patches.device)
+            vision_token_lengths = torch.tensor(token_lengths, dtype=torch.long, device=vision_patches.device)
+        else:
+            vision_patches = None
+            vision_token_grids = None
+            vision_token_offsets = None
+            vision_token_lengths = None
+
+        return {
+            "vision_patches": vision_patches,
+            "vision_token_grids": vision_token_grids,
+            "vision_token_offsets": vision_token_offsets,
+            "vision_token_lengths": vision_token_lengths,
+            "modality_tensor": modality_tensor,
+            "position_ids": position_ids,
+            "text_token_ids": text_token_ids,
+        }
+
     def __call__(
         self,
         text: Union[str, list[str]],
@@ -436,13 +433,15 @@ class IsaacProcessor(ProcessorMixin):
                     f"must match number of images ({len(images_list)})"
                 )
 
-        # Build event stream
+        segments = self._segment_inputs(texts[0], images_list)
+        packed_inputs = self._build_packed_inputs_from_segments(segments)
+
+        # Build event stream (kept for compatibility) and TensorStream output
         stream = self.build_event_stream_simple(
             text=texts[0],
             images=images_list,
         )
 
-        # Create TensorStream
         tensor_stream = TensorStream([stream])
 
         # Slice to max length if needed
@@ -450,9 +449,7 @@ class IsaacProcessor(ProcessorMixin):
         if T > self.max_sequence_length:
             tensor_stream = ts_slice(tensor_stream, start=T - self.max_sequence_length, end=T)
 
-        packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
         text_token_ids = packed_inputs.get("text_token_ids")
-
         if text_token_ids is None:
             raise ValueError("`text_token_ids` is required to build input ids from packed inputs.")
 

@@ -1690,6 +1690,167 @@ class IsaacProcessor(ProcessorMixin):
         # Create stream without scheduling (events already in order)
         return Stream(events, priority=[ModalityType.text, ModalityType.image])
 
+    def _segment_inputs(
+        self,
+        text: str,
+        images: Optional[list[Image]],
+    ) -> list[dict[str, Any]]:
+        pattern = re.escape(self.vision_token)
+        parts = re.split(f"({pattern})", text)
+
+        segments: list[dict[str, Any]] = []
+        image_idx = 0
+        for part in parts:
+            if part == self.vision_token:
+                if images is None or image_idx >= len(images):
+                    raise ValueError("Encountered vision token without a corresponding image.")
+
+                features = self.image_processor(
+                    images=images[image_idx],
+                    return_tensors=TensorType.PYTORCH,
+                )
+
+                patches = features["patches"][0]
+                virtual_dims = [int(v) for v in features["virtual_pixel_size"][0].tolist()]
+                real_dims = [int(v) for v in features["real_pixel_size"][0].tolist()]
+
+                segments.append(
+                    {
+                        "type": "image",
+                        "seq_length": int(math.prod(virtual_dims)),
+                        "patches": patches.reshape(-1, patches.shape[-1]),
+                        "virtual_dims": virtual_dims,
+                        "real_dims": real_dims,
+                    }
+                )
+                image_idx += 1
+            elif part:
+                tokens = self.tokenizer.encode(part, add_special_tokens=False, return_tensors="pt").squeeze(0)
+                tokens = tokens.to(dtype=torch.long)
+                segments.append(
+                    {
+                        "type": "text",
+                        "length": int(tokens.shape[0]),
+                        "tokens": tokens,
+                    }
+                )
+
+        return segments
+
+    def _build_packed_inputs_from_segments(self, segments: list[dict[str, Any]]) -> dict[str, Optional[torch.Tensor]]:
+        total_len = 0
+        for seg in segments:
+            if seg["type"] == "text":
+                total_len += int(seg["length"])
+            else:
+                total_len += int(seg.get("seq_length", seg["patches"].shape[0]))
+
+        start_keep = max(0, total_len - self.max_sequence_length)
+        end_keep = total_len
+
+        modality_values: list[int] = []
+        coords: list[tuple[int, int, int]] = []
+        text_chunks: list[torch.Tensor] = []
+        vision_chunks: list[torch.Tensor] = []
+        token_grids: list[tuple[int, int]] = []
+        token_offsets: list[int] = []
+        token_lengths: list[int] = []
+
+        token_cursor = 0
+        time_offset = 0
+
+        for seg in segments:
+            if seg["type"] == "text":
+                seq_len = int(seg["length"])
+                dims = [seq_len, 1, 1]
+                data = seg["tokens"]
+            else:
+                dims = list(seg["virtual_dims"])
+                if len(dims) < 3:
+                    dims = dims + [1] * (3 - len(dims))
+                seq_len = int(seg.get("seq_length", math.prod(dims)))
+                data = seg["patches"]
+
+            seg_len = seq_len
+            seg_start = token_cursor
+            seg_end = seg_start + seg_len
+
+            overlap_start = max(start_keep, seg_start)
+            overlap_end = min(end_keep, seg_end)
+            overlap_len = overlap_end - overlap_start
+
+            first_dim = range(time_offset, time_offset + dims[0])
+            other_dims = [range(d) for d in dims[1:]]
+            full_coords = list(itertools.product(first_dim, *other_dims))
+
+            if overlap_len > 0:
+                slice_start = overlap_start - seg_start
+                slice_end = slice_start + overlap_len
+                coords.extend(full_coords[slice_start:slice_end])
+
+                modality_value = ModalityType.text.value if seg["type"] == "text" else ModalityType.image.value
+                modality_values.extend([modality_value] * overlap_len)
+
+                if seg["type"] == "text":
+                    text_1d = data.view(-1)
+                    text_chunks.append(text_1d[slice_start:slice_end])
+                else:
+                    vision_chunks.append(data)
+                    real_dims = seg["real_dims"]
+                    token_grids.append((int(real_dims[1]), int(real_dims[2])))
+                    token_offsets.append(int(slice_start))
+                    token_lengths.append(int(overlap_len))
+
+            token_cursor = seg_end
+            time_offset += dims[0]
+
+        if vision_chunks:
+            base_device = vision_chunks[0].device
+        elif text_chunks:
+            base_device = text_chunks[0].device
+        else:
+            base_device = torch.device("cpu")
+
+        if modality_values:
+            modality_tensor = torch.tensor(modality_values, dtype=torch.long, device=base_device).unsqueeze(0)
+        else:
+            modality_tensor = torch.zeros((1, 0), dtype=torch.long, device=base_device)
+
+        if coords:
+            position_ids = torch.tensor(coords, dtype=torch.long, device=base_device).reshape(1, len(coords), 3)
+        else:
+            position_ids = torch.zeros((1, 0, 3), dtype=torch.long, device=base_device)
+
+        if text_chunks:
+            text_concat = torch.cat(text_chunks, dim=0).to(device=base_device, dtype=torch.long)
+        else:
+            text_concat = torch.zeros((0,), dtype=torch.long, device=base_device)
+
+        text_token_ids = torch.zeros((1, text_concat.numel()), dtype=torch.long, device=base_device)
+        if text_concat.numel():
+            text_token_ids[0, : text_concat.numel()] = text_concat
+
+        if vision_chunks:
+            vision_patches = torch.cat(vision_chunks, dim=0)
+            vision_token_grids = torch.tensor(token_grids, dtype=torch.long, device=vision_patches.device)
+            vision_token_offsets = torch.tensor(token_offsets, dtype=torch.long, device=vision_patches.device)
+            vision_token_lengths = torch.tensor(token_lengths, dtype=torch.long, device=vision_patches.device)
+        else:
+            vision_patches = None
+            vision_token_grids = None
+            vision_token_offsets = None
+            vision_token_lengths = None
+
+        return {
+            "vision_patches": vision_patches,
+            "vision_token_grids": vision_token_grids,
+            "vision_token_offsets": vision_token_offsets,
+            "vision_token_lengths": vision_token_lengths,
+            "modality_tensor": modality_tensor,
+            "position_ids": position_ids,
+            "text_token_ids": text_token_ids,
+        }
+
     def __call__(
         self,
         text: Union[str, list[str]],
@@ -1736,13 +1897,15 @@ class IsaacProcessor(ProcessorMixin):
                     f"must match number of images ({len(images_list)})"
                 )
 
-        # Build event stream
+        segments = self._segment_inputs(texts[0], images_list)
+        packed_inputs = self._build_packed_inputs_from_segments(segments)
+
+        # Build event stream (kept for compatibility) and TensorStream output
         stream = self.build_event_stream_simple(
             text=texts[0],
             images=images_list,
         )
 
-        # Create TensorStream
         tensor_stream = TensorStream([stream])
 
         # Slice to max length if needed
@@ -1750,9 +1913,7 @@ class IsaacProcessor(ProcessorMixin):
         if T > self.max_sequence_length:
             tensor_stream = ts_slice(tensor_stream, start=T - self.max_sequence_length, end=T)
 
-        packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
         text_token_ids = packed_inputs.get("text_token_ids")
-
         if text_token_ids is None:
             raise ValueError("`text_token_ids` is required to build input ids from packed inputs.")
 
