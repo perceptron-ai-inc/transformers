@@ -924,10 +924,6 @@ class IsaacModel(PreTrainedModel):
                 )
 
             vision_mask = modality_tensor == ModalityType.image.value
-            expected_image_tokens = int(vision_mask.sum().item())
-            if expected_image_tokens != vision_embeds.shape[0]:
-                raise ValueError("Packed vision payload size does not match modality tensor.")
-
             embeds = embeds.clone()
             embeds[vision_mask] = vision_embeds.to(embeds.device)
 
@@ -1563,11 +1559,10 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             **kwargs,
         )
-
-        cache_position = model_inputs.get("cache_position", cache_position)
         if packed_inputs is None:
             return model_inputs
 
+        cache_position = model_inputs.get("cache_position", cache_position)
         first_step = cache_position is None or cache_position[0] == 0
         model_inputs["packed_inputs"] = packed_inputs if first_step else None
         if first_step or (self.rope_deltas is not None and not first_step):
