@@ -240,14 +240,7 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
         elif resize_mode is None:
             resize_mode = "bilinear"
 
-        if isinstance(resize_mode, str):
-            mode_key = resize_mode.lower()
-        else:
-            mode_key = resize_mode
-
-        resize_kwargs: dict[str, Any] = {}
-        if mode_key in {"linear", "bilinear", "bicubic", "trilinear"}:
-            resize_kwargs["align_corners"] = False
+        resize_kwargs: dict[str, Any] = {"align_corners": False}
 
         return F.interpolate(
             image,
