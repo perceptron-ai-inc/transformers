@@ -2103,7 +2103,6 @@ class IsaacModel(Qwen3PreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        converted_from_stream=False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | BaseModelOutputWithPast:
         """
@@ -2123,8 +2122,9 @@ class IsaacModel(Qwen3PreTrainedModel):
 
         modality_tensor = None
         output_attentions = kwargs.pop("output_attentions", None)
+        text_token_ids_present = packed_inputs is not None and "text_token_ids" in packed_inputs
 
-        if converted_from_stream:
+        if text_token_ids_present:
             text_token_ids = packed_inputs.get("text_token_ids")
 
             if position_ids is None:
@@ -2156,7 +2156,7 @@ class IsaacModel(Qwen3PreTrainedModel):
                     input_ids = input_ids.clone()
                     input_ids[image_mask] = safe_token_id
 
-        if packed_inputs is not None and inputs_embeds is not None and not converted_from_stream:
+        if packed_inputs is not None and inputs_embeds is not None and not text_token_ids_present:
             raise ValueError("`inputs_embeds` should not be provided alongside `packed_inputs`.")
 
         # Resolve the input source (prefer packed_inputs > tensor_stream > ids > embeds).
@@ -2352,7 +2352,6 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
             use_cache=use_cache,
             output_attentions=output_attentions,
             cache_position=cache_position,
-            converted_from_stream=converted_from_stream,
             **kwargs,
         )
 
