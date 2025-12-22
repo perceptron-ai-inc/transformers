@@ -108,41 +108,21 @@ def tensor_stream_token_view(
     Compose a (batch, seq_len) token tensor using text token ids and a modality map.
     Non-text positions are filled with ``fill_value``.
     """
-    if modality_tensor.dim() != 2:
-        raise ValueError("`modality_tensor` must be 2D (batch, seq_len).")
-
     if text_token_ids.dim() == 1:
         text_token_ids = text_token_ids.unsqueeze(0)
-    if text_token_ids.dim() != 2:
-        raise ValueError("`text_token_ids` must be 1D or 2D.")
 
-    batch_size, seq_len = modality_tensor.shape
-    token_batch = text_token_ids.shape[0]
-    if token_batch not in {1, batch_size}:
-        raise ValueError("`text_token_ids` batch dimension must match `modality_tensor` or be 1.")
+    B, L = modality_tensor.shape
+    if text_token_ids.size(0) == 1 and B > 1:
+        text_token_ids = text_token_ids.expand(B, -1)
 
-    if token_batch == 1 and batch_size > 1:
-        text_token_ids = text_token_ids.expand(batch_size, -1)
+    text_mask = modality_tensor.eq(ModalityType.text.value)
+    # rank of each text position within its row: 0..need-1
+    rank = text_mask.cumsum(dim=1) - 1  # -1 where mask is False
 
-    text_mask = modality_tensor == ModalityType.text.value
-    text_counts = text_mask.sum(dim=1)
-    max_text_needed = int(text_counts.max().item()) if text_counts.numel() else 0
-
-    if text_token_ids.size(1) < max_text_needed:
-        raise ValueError("`text_token_ids` does not have enough tokens for the provided modalities.")
-
-    tokens = modality_tensor.new_full(
-        (batch_size, seq_len), fill_value, dtype=torch.long, device=modality_tensor.device
-    )
-    for batch_idx in range(batch_size):
-        needed = int(text_counts[batch_idx].item())
-        if needed == 0:
-            continue
-        tokens[batch_idx, text_mask[batch_idx]] = text_token_ids[batch_idx, :needed].to(
-            device=tokens.device, dtype=torch.long
-        )
-
-    return tokens
+    out = modality_tensor.new_full((B, L), fill_value, dtype=torch.long)
+    gathered = text_token_ids.gather(1, rank.clamp_min(0))
+    out[text_mask] = gathered[text_mask]
+    return out
 
 
 class IsaacVisionConfig(Siglip2VisionConfig):
