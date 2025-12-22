@@ -1946,19 +1946,6 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
     ) -> tuple | CausalLMOutputWithPast:
         output_attentions = kwargs.pop("output_attentions", None)
 
-        # ---------------------------------------------------------------------
-        # Validate input source combinations.
-        # ---------------------------------------------------------------------
-        if packed_inputs is not None and inputs_embeds is not None:
-            raise ValueError("`inputs_embeds` should not be provided alongside `packed_inputs`.")
-
-        # Allow input_ids to be None only if the inner model can reconstruct it from text_token_ids.
-        if packed_inputs is not None and input_ids is None and "text_token_ids" not in packed_inputs:
-            raise ValueError("`input_ids` must be provided when using `packed_inputs` without `text_token_ids`.")
-
-        if input_ids is None and inputs_embeds is None and packed_inputs is None:
-            raise ValueError("Either input_ids, inputs_embeds, or packed_inputs must be provided.")
-
         if position_ids is None and packed_inputs is not None:
             pos_3d = packed_inputs.get("position_ids")
             if pos_3d is not None:
@@ -2038,8 +2025,6 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
         - Else, if `input_ids` is provided, position ids are synthesized as (B, L, 3).
         - `rope_deltas` is (B, 1) used to advance positions during decode.
         """
-        if position_ids is None and input_ids is None:
-            raise ValueError("Either `position_ids` or `input_ids` must be provided to compute rope indices.")
 
         if position_ids is None:
             pos_3d = compute_position_ids_input_ids(input_ids)
@@ -2088,17 +2073,13 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
         )
 
         cache_position = model_inputs.get("cache_position", cache_position)
-        first_step = cache_position is None or cache_position[0] == 0
-
-        if packed_inputs is not None and first_step:
-            model_inputs["packed_inputs"] = packed_inputs
-            model_inputs["position_ids"] = None
-        else:
-            model_inputs["packed_inputs"] = None
-
-        if packed_inputs is not None and not first_step and self.rope_deltas is not None:
-            model_inputs["position_ids"] = None
+        if packed_inputs is None:
             return model_inputs
+
+        first_step = cache_position is None or cache_position[0] == 0
+        model_inputs["packed_inputs"] = packed_inputs if first_step else None
+        if first_step or (self.rope_deltas is not None and not first_step):
+            model_inputs["position_ids"] = None
 
         return model_inputs
 
