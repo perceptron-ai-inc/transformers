@@ -999,11 +999,9 @@ class IsaacModel(PreTrainedModel):
         modality_tensor = None
         output_attentions = kwargs.pop("output_attentions", None)
 
-        # -------------------------------------------------------------------------
         # Canonicalize / rebuild input_ids when packed_inputs carry text_token_ids.
         # This is critical for generation: GenerationMixin may slice input_ids, but
         # packed_inputs describes the multimodal layout and must stay aligned.
-        # -------------------------------------------------------------------------
         text_token_ids_present = packed_inputs is not None and "text_token_ids" in packed_inputs
         if text_token_ids_present:
             text_token_ids = packed_inputs.get("text_token_ids")
@@ -1032,9 +1030,7 @@ class IsaacModel(PreTrainedModel):
                     input_ids = input_ids.clone()
                     input_ids[image_mask] = safe_token_id
 
-        # -------------------------------------------------------------------------
         # Resolve the input source (prefer packed_inputs > ids > embeds).
-        # -------------------------------------------------------------------------
         precomputed_modality: Optional[torch.Tensor] = None
         precomputed_position_ids: Optional[torch.Tensor] = None
 
@@ -1548,7 +1544,6 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         Prepare inputs for generation, handling TensorStream and packed_inputs inputs properly.
         """
 
-        # Call parent preparation
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
             past_key_values=past_key_values,

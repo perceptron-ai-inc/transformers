@@ -185,11 +185,6 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
     ) -> None:
         super().__init__(**kwargs)
 
-        pixel_shuffle_scale = 1 if self.pixel_shuffle_scale is None else int(self.pixel_shuffle_scale)
-        if pixel_shuffle_scale < 1:
-            raise ValueError("`pixel_shuffle_scale` must be >= 1")
-        self.pixel_shuffle_scale = pixel_shuffle_scale
-
     def _validate_preprocess_kwargs(self, **kwargs):
         # Allow callers to omit resize-related placeholders that BaseImageProcessorFast checks for.
         kwargs.pop("do_resize", None)
