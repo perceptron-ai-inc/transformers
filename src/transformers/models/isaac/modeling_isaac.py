@@ -1492,10 +1492,6 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         use_cache: bool = True,
         **kwargs,
     ) -> dict[str, Any]:
-        """
-        Prepare inputs for generation, handling TensorStream and packed_inputs inputs properly.
-        """
-
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
             past_key_values=past_key_values,
@@ -1512,8 +1508,7 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         cache_position = model_inputs.get("cache_position", cache_position)
         first_step = cache_position is None or cache_position[0] == 0
         model_inputs["packed_inputs"] = packed_inputs if first_step else None
-        if first_step or (self.rope_deltas is not None and not first_step):
-            model_inputs["position_ids"] = None
+        model_inputs["position_ids"] = None
 
         return model_inputs
 
