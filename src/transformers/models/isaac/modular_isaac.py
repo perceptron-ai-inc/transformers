@@ -472,45 +472,24 @@ class IsaacVisionEmbeddings(Siglip2VisionEmbeddings):
         """Rebatch a packed patch sequence using per-image grids to align embeddings.
 
         Args:
-            seq_patches (`torch.Tensor`): Packed patches of shape `(total_patches, patch_dim)`.
-            spatial_shapes (`torch.Tensor`): Per-image patch grids of shape `(num_images, 2)` as `(H_tokens, W_tokens)`.
+            seq_patches: Packed patches of shape (total_patches, patch_dim).
+            spatial_shapes: Per-image patch grids of shape (num_images, 2) as (H_tokens, W_tokens).
 
         Returns:
-            `tuple[Optional[torch.Tensor], torch.Tensor]`: A padded batch tensor shaped
-            `(batch, max_len, patch_dim)` plus `seq_lengths` used to form `cu_seqlens` for
-            variable-length attention.
+            (packed_pixel_values, seq_lengths) where:
+            - packed_pixel_values: (batch, max_len, patch_dim) padded with zeros, or None if batch_size == 0
+            - seq_lengths: (batch,) lengths for each image
         """
-        if seq_patches.ndim != 2:
-            raise ValueError("`seq_patches` is expected to be 2D (total_patches, patch_dim).")
-        if spatial_shapes.ndim != 2 or spatial_shapes.size(-1) != 2:
-            raise ValueError("`spatial_shapes` must have shape (num_images, 2) with (height_tokens, width_tokens).")
-
-        seq_lengths = spatial_shapes.long().prod(dim=-1)
-        total_patches = int(seq_lengths.sum().item())
-        if total_patches != seq_patches.size(0):
-            raise ValueError(
-                "Mismatch between packed patches and spatial shapes: got "
-                f"{seq_patches.size(0)} patches but spatial shapes imply {total_patches}."
-            )
-
-        batch_size = spatial_shapes.size(0)
+        # Per-image token counts
+        seq_lengths = spatial_shapes.long().prod(dim=-1)  # (B,)
+        batch_size = int(seq_lengths.numel())
         if batch_size == 0:
             return None, seq_lengths
 
-        max_length = int(seq_lengths.max().item())
-        patch_dim = seq_patches.size(-1)
-        device = seq_patches.device
-
-        packed_pixel_values = seq_patches.new_zeros((batch_size, max_length, patch_dim), device=device)
-
-        start = 0
-        for batch_idx, length in enumerate(seq_lengths.tolist()):
-            if length == 0:
-                continue
-            end = start + length
-            packed_pixel_values[batch_idx, :length] = seq_patches[start:end]
-            start = end
-
+        # Split the packed sequence into per-image chunks, then pad to a batch
+        lengths_list = seq_lengths.tolist()
+        chunks = seq_patches.split(lengths_list, dim=0)
+        packed_pixel_values = nn.utils.rnn.pad_sequence(chunks, batch_first=True)  # zero-padded by default
         return packed_pixel_values, seq_lengths
 
     def _unpack_from_batch(self, embeddings: torch.Tensor, seq_lengths: torch.Tensor) -> torch.Tensor:
