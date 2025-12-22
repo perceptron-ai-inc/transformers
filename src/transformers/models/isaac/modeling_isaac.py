@@ -1897,15 +1897,12 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         # -------------------------------------------------------------------------
         if tensor_stream is not None and packed_inputs is None:
             packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
-            converted_from_stream = True
-        else:
-            converted_from_stream = False
 
         # -------------------------------------------------------------------------
         # Existing rope logic (UNCHANGED for now): still operates on tensor_stream.
         # Next change will remove this dependency by using packed_inputs["position_ids"].
         # -------------------------------------------------------------------------
-        if position_ids is None and converted_from_stream:
+        if position_ids is None and packed_inputs is not None and "text_token_ids" in packed_inputs:
             pos_3d = None if packed_inputs is None else packed_inputs.get("position_ids")
             if pos_3d is None:
                 raise ValueError("`packed_inputs['position_ids']` is required when converting from `tensor_stream`.")
