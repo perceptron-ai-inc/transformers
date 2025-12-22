@@ -100,28 +100,6 @@ class IsaacVisionEmbeddings(nn.Module):
         self.position_embedding_size = int(self.num_patches**0.5)
         self.position_embedding = nn.Embedding(self.num_patches, self.embed_dim)
 
-    def forward(self, seq_patches: torch.Tensor, spatial_shapes: torch.Tensor) -> torch.Tensor:
-        # Rebatch packed variable-resolution patches to resize per-image position embeddings
-        # and track lengths for varlen attention metadata.
-        packed_pixel_values, seq_lengths = self._pack_to_batch(seq_patches, spatial_shapes)
-        if packed_pixel_values is None:
-            return seq_patches.new_zeros((0, self.embed_dim))
-
-        target_dtype = self.patch_embedding.weight.dtype
-        patch_embeds = self.patch_embedding(packed_pixel_values.to(dtype=target_dtype))
-
-        positional_embeddings = self.position_embedding.weight.reshape(
-            self.position_embedding_size,
-            self.position_embedding_size,
-            -1,
-        )
-        resized_positional_embeddings = self.resize_positional_embeddings(
-            positional_embeddings, spatial_shapes, max_length=packed_pixel_values.shape[1]
-        )
-
-        embeddings = patch_embeds + resized_positional_embeddings
-        return self._unpack_from_batch(embeddings, seq_lengths)
-
     @staticmethod
     def resize_positional_embeddings(
         positional_embeddings: torch.Tensor,
@@ -180,6 +158,35 @@ class IsaacVisionEmbeddings(nn.Module):
             resulted_positional_embeddings[i, height * width :] = resized_embeddings[0]
 
         return resulted_positional_embeddings
+
+    def forward(self, seq_patches: torch.Tensor, spatial_shapes: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pixel_values (`torch.FloatTensor`):
+                Pixel values of shape (batch_size, max_num_patches, num_channels * patch_size * patch_size)
+            spatial_shapes (`list[tuple[int, int]]`):
+                Spatial shapes of shape (batch_size, 2) to resize the positional embeddings to
+        """
+        # Rebatch packed variable-resolution patches to resize per-image position embeddings
+        # and track lengths for varlen attention metadata.
+        packed_pixel_values, seq_lengths = self._pack_to_batch(seq_patches, spatial_shapes)
+        if packed_pixel_values is None:
+            return seq_patches.new_zeros((0, self.embed_dim))
+
+        target_dtype = self.patch_embedding.weight.dtype
+        patch_embeds = self.patch_embedding(packed_pixel_values.to(dtype=target_dtype))
+
+        positional_embeddings = self.position_embedding.weight.reshape(
+            self.position_embedding_size,
+            self.position_embedding_size,
+            -1,
+        )
+        resized_positional_embeddings = self.resize_positional_embeddings(
+            positional_embeddings, spatial_shapes, max_length=packed_pixel_values.shape[1]
+        )
+
+        embeddings = patch_embeds + resized_positional_embeddings
+        return self._unpack_from_batch(embeddings, seq_lengths)
 
     def _pack_to_batch(
         self,

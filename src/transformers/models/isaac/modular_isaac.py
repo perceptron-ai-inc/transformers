@@ -80,6 +80,7 @@ from ..siglip2.modeling_siglip2 import (
     Siglip2Attention,
     Siglip2Encoder,
     Siglip2EncoderLayer,
+    Siglip2VisionEmbeddings,
 )
 
 
@@ -461,7 +462,7 @@ def create_document_attention_mask(
     )
 
 
-class IsaacVisionEmbeddings(nn.Module):
+class IsaacVisionEmbeddings(Siglip2VisionEmbeddings):
     """Adapter around SigLIP2 vision embeddings that consumes packed patch sequences.
 
     Isaac accepts variable-resolution vision inputs as a single packed sequence with per-image
@@ -470,7 +471,7 @@ class IsaacVisionEmbeddings(nn.Module):
     """
 
     def __init__(self, config: IsaacVisionConfig):
-        super().__init__()
+        super().__init__(config)
         self.config = config
         self.embed_dim = config.hidden_size
         self.patch_size = config.patch_size
@@ -505,65 +506,6 @@ class IsaacVisionEmbeddings(nn.Module):
 
         embeddings = patch_embeds + resized_positional_embeddings
         return self._unpack_from_batch(embeddings, seq_lengths)
-
-    @staticmethod
-    def resize_positional_embeddings(
-        positional_embeddings: torch.Tensor,
-        spatial_shapes: torch.LongTensor,
-        max_length: int,
-    ) -> torch.Tensor:
-        """
-        Resize positional embeddings to image-specific size and pad to a fixed size.
-
-        Args:
-            positional_embeddings (`torch.Tensor`):
-                Position embeddings of shape (height, width, embed_dim)
-            spatial_shapes (`torch.LongTensor`):
-                Spatial shapes of shape (batch_size, 2) to resize the positional embeddings to
-            max_length (`int`):
-                Maximum length of the positional embeddings to pad resized positional embeddings to
-
-        Returns:
-            `torch.Tensor`: Embeddings of shape (batch_size, max_length, embed_dim)
-        """
-        batch_size = spatial_shapes.shape[0]
-        embed_dim = positional_embeddings.shape[-1]
-        source_dtype = positional_embeddings.dtype
-
-        resulted_positional_embeddings = torch.empty(
-            (batch_size, max_length, embed_dim),
-            device=positional_embeddings.device,
-            dtype=source_dtype,
-        )
-
-        # (height, width, embed_dim) -> (1, embed_dim, height, width) for interpolation
-        positional_embeddings = positional_embeddings.permute(2, 0, 1).unsqueeze(0)
-
-        # Upcast to float32 on CPU because antialias is not supported for bfloat16/float16 on CPU
-        if positional_embeddings.device.type == "cpu":
-            positional_embeddings = positional_embeddings.to(torch.float32)
-
-        for i in range(batch_size):
-            # (1, dim, height, width) -> (1, dim, target_height, target_width)
-            height, width = spatial_shapes[i]
-            resized_embeddings = F.interpolate(
-                positional_embeddings,
-                size=(height, width),
-                mode="bilinear",
-                align_corners=False,
-                antialias=True,
-            )
-
-            # (1, dim, target_height, target_width) -> (target_height * target_width, dim)
-            resized_embeddings = resized_embeddings.reshape(embed_dim, height * width).transpose(0, 1)
-
-            # Cast to original dtype
-            resized_embeddings = resized_embeddings.to(source_dtype)
-
-            resulted_positional_embeddings[i, : height * width] = resized_embeddings
-            resulted_positional_embeddings[i, height * width :] = resized_embeddings[0]
-
-        return resulted_positional_embeddings
 
     def _pack_to_batch(
         self,
