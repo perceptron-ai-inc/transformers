@@ -491,7 +491,6 @@ def tensor_stream_to_packed_inputs(tensor_stream: TensorStream) -> dict[str, Opt
 
     if modality_tensor.dim() != 2:
         raise ValueError("`modality_tensor` must be 2D (batch, seq_len).")
-    modality_tensor.to(dtype=torch.long)
 
     return {
         "vision_patches": seq_patches,
@@ -2319,8 +2318,14 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
         # Existing rope logic (UNCHANGED for now): still operates on tensor_stream.
         # Next change will remove this dependency by using packed_inputs["position_ids"].
         # -------------------------------------------------------------------------
-        if position_ids is None and tensor_stream is not None:
-            position_ids, self.rope_deltas = self.get_rope_index(input_ids, tensor_stream, attention_mask)
+        if position_ids is None and converted_from_stream:
+            pos_3d = None if packed_inputs is None else packed_inputs.get("position_ids")
+            if pos_3d is None:
+                raise ValueError("`packed_inputs['position_ids']` is required when converting from `tensor_stream`.")
+            position_ids, self.rope_deltas = self.get_rope_index(
+                position_ids=pos_3d,
+                attention_mask=attention_mask,
+            )
         elif position_ids is None and cache_position is not None and self.rope_deltas is not None:
             # Decode continuation after TensorStream prefill: advance positions using cached rope offsets.
             if input_ids is not None:
@@ -2381,31 +2386,33 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
 
     def get_rope_index(
         self,
-        input_ids: Optional[torch.Tensor],
-        tensor_stream: Optional[TensorStream],
-        attention_mask: Optional[torch.Tensor],
+        *,
+        input_ids: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute MRoPE position ids from a TensorStream (or 1D fallback).
-
-        Returns (position_ids, rope_deltas). position_ids is (B,L,3) for MRoPE.
-        rope_deltas is (B,1) used to advance positions in decode.
         """
-        # tensor_stream present: compute 3D coords
-        if tensor_stream is None and input_ids is None:
-            raise ValueError("`tensor_stream` or `input_ids` must be provided to compute rope indices")
+        Compute (position_ids_3d, rope_deltas) without TensorStream.
 
-        if tensor_stream is not None:
-            pos_3d = compute_mrope_pos_tensor(tensor_stream)  # (B,L,3)
-        else:
+        - If `position_ids` is provided, it must be shape (B, L, 3).
+        - Else, if `input_ids` is provided, position ids are synthesized as (B, L, 3).
+        - `rope_deltas` is (B, 1) used to advance positions during decode.
+        """
+        if position_ids is None and input_ids is None:
+            raise ValueError("Either `position_ids` or `input_ids` must be provided to compute rope indices.")
+
+        if position_ids is None:
             pos_3d = compute_position_ids_input_ids(input_ids)
-        B, L, _ = pos_3d.shape
+        else:
+            pos_3d = position_ids
+            if pos_3d.ndim != 3 or pos_3d.size(-1) != 3:
+                raise ValueError("`position_ids` must have shape (batch, seq_len, 3) for MRoPE")
 
-        # Max position per batch across the 3 planes and sequence dimension: (B,)
+        B, L, _ = pos_3d.shape
         m_per_batch = pos_3d.amax(dim=(1, 2))
 
-        # Sequence lengths per batch: (B,)
         if attention_mask is None:
-            seq_lens = torch.full_like(m_per_batch, L)
+            seq_lens = torch.full((B,), L, device=pos_3d.device, dtype=m_per_batch.dtype)
         else:
             seq_lens = attention_mask.eq(1).sum(dim=-1).to(dtype=m_per_batch.dtype, device=m_per_batch.device)
 

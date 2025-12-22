@@ -242,7 +242,6 @@ def tensor_stream_to_packed_inputs(tensor_stream: TensorStream) -> dict[str, Opt
 
     if modality_tensor.dim() != 2:
         raise ValueError("`modality_tensor` must be 2D (batch, seq_len).")
-    modality_tensor.to(dtype=torch.long)
 
     return {
         "vision_patches": seq_patches,
