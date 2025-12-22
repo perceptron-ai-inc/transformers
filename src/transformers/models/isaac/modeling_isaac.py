@@ -524,8 +524,6 @@ def create_pixel_shuffle_index_map(
         device = seq_sizes.device
 
     scale_factor = int(scale_factor)
-    if scale_factor < 2:
-        raise ValueError("`scale_factor` must be ≥ 2")
 
     # Safety: all spatial dims must be divisible by the scale factor
     # Cannot run under torch compile fullgraph mode hence
