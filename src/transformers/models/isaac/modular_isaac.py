@@ -1738,15 +1738,7 @@ class IsaacModel(Qwen3PreTrainedModel):
         if text_token_ids_present:
             text_token_ids = packed_inputs.get("text_token_ids")
             modality_for_ids = packed_inputs.get("modality_tensor")
-
-            if modality_for_ids is None:
-                raise ValueError("`modality_tensor` is required when `text_token_ids` is present in packed_inputs.")
-            if text_token_ids is None:
-                raise ValueError("`text_token_ids` is required when `text_token_ids` key is present in packed_inputs.")
-
-            # Prefer packed position ids unless explicitly provided.
-            if position_ids is None:
-                position_ids = packed_inputs.get("position_ids")
+            position_ids = packed_inputs.get("position_ids")
 
             # Rebuild canonical input_ids if missing OR if shapes don't match modality layout.
             if input_ids is None or input_ids.shape[:2] != modality_for_ids.shape:
@@ -1827,7 +1819,6 @@ class IsaacModel(Qwen3PreTrainedModel):
 
         is_attention_mask_dict = isinstance(attention_mask, dict)
 
-        # Initialize hidden states
         hidden_states = inputs_embeds
         all_attentions = [] if output_attentions else None
 
@@ -1852,7 +1843,6 @@ class IsaacModel(Qwen3PreTrainedModel):
             if output_attentions and layer_outputs_is_tuple:
                 all_attentions.append(layer_outputs[1])
 
-        # Final layer norm
         hidden_states = self.text_model.norm(hidden_states)
 
         return BaseModelOutputWithPast(
@@ -1876,7 +1866,6 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
         self.model = IsaacModel(config)  # Use our custom model
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        # Tracks rotary position offsets computed during a full forward pass so decode steps can reuse them.
         self.rope_deltas = None
 
     def forward(
@@ -1902,13 +1891,10 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
                     attention_mask=attention_mask,
                 )
 
-        # Decode continuation: advance positions using cached rope offsets.
         elif position_ids is None and cache_position is not None and self.rope_deltas is not None:
             if input_ids is not None:
                 base_position_ids = compute_position_ids_input_ids(input_ids)
             else:
-                if inputs_embeds is None:
-                    raise ValueError("inputs_embeds must be provided when input_ids is None during decode")
                 batch_size, seq_len = inputs_embeds.shape[:2]
                 dummy_ids = torch.zeros((batch_size, seq_len), device=inputs_embeds.device, dtype=torch.long)
                 base_position_ids = compute_position_ids_input_ids(dummy_ids)
