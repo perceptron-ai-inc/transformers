@@ -162,7 +162,7 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
     resample = PILImageResampling.BILINEAR
     model_input_names = ["patches", "token_grids"]
     valid_kwargs = IsaacImageProcessorFastKwargs
-    unused_kwargs = ["size", "do_center_crop", "crop_size"]
+    unused_kwargs = ["size", "do_center_crop", "crop_size", "pad_size", "do_pad"]
 
     do_resize = True
     do_center_crop = False
@@ -236,11 +236,6 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
         pixel_shuffle_scale: Optional[int] = None,
         **kwargs,
     ) -> BatchFeature:
-        if do_center_crop:
-            raise ValueError("`do_center_crop` is not supported by IsaacImageProcessorFast.")
-        if do_pad:
-            raise ValueError("`do_pad` is not supported by IsaacImageProcessorFast.")
-
         grouped_images, grouped_images_index = group_images_by_shape(images, disable_grouping=disable_grouping)
 
         grouped_outputs: dict[
