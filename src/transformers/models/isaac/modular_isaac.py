@@ -2075,17 +2075,6 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
         Prepare inputs for generation, handling TensorStream and packed_inputs inputs properly.
         """
 
-        if cache_position is None:
-            seq_length = None
-            device = None
-            if input_ids is not None:
-                seq_length = input_ids.shape[1]
-                device = input_ids.device
-            if seq_length is not None:
-                # prepare_inputs_for_generation may be invoked outside `generate`, so synthesize the
-                # same cache positions that GenerationMixin would have created during prefill.
-                cache_position = torch.arange(seq_length, dtype=torch.long, device=device)
-
         # Call parent preparation
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
