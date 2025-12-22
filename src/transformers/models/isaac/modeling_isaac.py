@@ -871,7 +871,6 @@ class IsaacModel(PreTrainedModel):
     _can_compile_fullgraph = False
     _supports_attention_backend = True
     _can_record_outputs = {"attentions": OutputRecorder(IsaacVisionAttention, index=1)}
-    # Expose tied-weights mapping even if empty for base model tests.
     all_tied_weights_keys: dict[str, str] = {}
 
     def __init__(self, config: IsaacConfig):
@@ -890,13 +889,6 @@ class IsaacModel(PreTrainedModel):
 
         self.vision_embedding = IsaacVisionEmbedding(config)
         self.vision_embedding._supports_sdpa = True
-
-        # Dispatch table for TensorStream balanced embedding (text + vision)
-        self.embed_fns = {
-            ModalityType.text: self.embed_text_tokens,
-            ModalityType.padding: self.embed_text_tokens,
-            ModalityType.image: self.embed_vision,
-        }
 
         # Keep track of config attributes that downstream utilities may query directly on the model.
         self.max_sequence_length = config.max_sequence_length
@@ -970,12 +962,8 @@ class IsaacModel(PreTrainedModel):
         vision_patches = packed_inputs.get("vision_patches")
         if vision_patches is not None:
             token_grids = packed_inputs.get("vision_token_grids")
-            if token_grids is None:
-                raise ValueError("`vision_token_grids` must accompany `vision_patches` in packed_inputs.`")
-
             vision_token_offsets = packed_inputs.get("vision_token_offsets")
             vision_token_lengths = packed_inputs.get("vision_token_lengths")
-
             vision_embeds = self.embed_vision((vision_patches, token_grids))
 
             vision_seq_sizes = torch.prod(token_grids.to(device=vision_embeds.device), dim=-1)
@@ -1143,15 +1131,6 @@ class IsaacModel(PreTrainedModel):
                         safe_token_id = int(self.config.vocab_size - 1)
                     input_ids = input_ids.clone()
                     input_ids[image_mask] = safe_token_id
-
-        # If packed_inputs is provided without text_token_ids, we require aligned input_ids
-        # (otherwise we cannot guarantee the mm layout matches the provided ids).
-        if packed_inputs is not None and not text_token_ids_present:
-            if input_ids is None:
-                raise ValueError("`input_ids` must be provided when using `packed_inputs` without `text_token_ids`.")
-
-        if packed_inputs is not None and inputs_embeds is not None and not text_token_ids_present:
-            raise ValueError("`inputs_embeds` should not be provided alongside `packed_inputs`.")
 
         # -------------------------------------------------------------------------
         # Resolve the input source (prefer packed_inputs > ids > embeds).
@@ -1671,7 +1650,7 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         """
         Prepare inputs for generation, handling TensorStream and packed_inputs inputs properly.
         """
-        # packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
+
         if cache_position is None:
             seq_length = None
             device = None
@@ -1696,8 +1675,6 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         )
 
         cache_position = model_inputs.get("cache_position", cache_position)
-
-        # Handle TensorStream/packed_inputs only for the prefill step
         first_step = cache_position is None or cache_position[0] == 0
 
         if packed_inputs is not None and first_step:
