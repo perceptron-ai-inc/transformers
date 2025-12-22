@@ -363,9 +363,7 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
                     image_std=image_std,
                 )
 
-            nhwc_images = image_batch.permute(0, 2, 3, 1)
-
-            patches = torch_extract_patches(nhwc_images.permute(0, 3, 1, 2), patch_size, patch_size)
+            patches = torch_extract_patches(image_batch, patch_size, patch_size)
             _, height_tokens, width_tokens, _ = patches.shape
 
             token_grid = (
