@@ -805,42 +805,32 @@ def create_pixel_shuffle_index_map(
     if device is None:
         device = seq_sizes.device
 
-    scale_factor = int(scale_factor)
+    s = int(scale_factor)
+    if s < 1:
+        raise ValueError(f"scale_factor must be >= 1, got {s}")
 
-    # Safety: all spatial dims must be divisible by the scale factor
-    # Cannot run under torch compile fullgraph mode hence
     if not is_torchdynamo_compiling():
-        if not ((token_grids[:, 0] % scale_factor == 0).all() and (token_grids[:, 1] % scale_factor == 0).all()):
+        if (token_grids % s).any():
             raise AssertionError(
-                "Every (H,W) in `token_grids` must be divisible by "
-                f"scale_factor={scale_factor}, got {token_grids.tolist()}"
+                f"Every (H,W) in token_grids must be divisible by scale_factor={s}, got {token_grids.tolist()}"
             )
 
     gather_chunks: list[torch.Tensor] = []
     tok_offset = 0
 
-    for seq_len, (h, w) in zip(seq_sizes.tolist(), token_grids.tolist(), strict=False):
-        # Build the (H, W) grid of flat indices for this image
-        grid = torch.arange(seq_len, device=device, dtype=torch.int64) + tok_offset
-        grid = grid.view(h, w)  # (H, W)
+    for seq_len, (h, w) in zip(seq_sizes.tolist(), token_grids.tolist()):
+        # Flat indices for this image's packed segment
+        grid = torch.arange(seq_len, device=device, dtype=torch.int64).view(h, w) + tok_offset
 
-        # -------- identical ordering to your fixed-res routine --------
-        # Step 1: split width into blocks of scale_factor
-        grid = grid.view(h, w // scale_factor, scale_factor)  # (H, W/scale_factor, scale_factor)
-        # Step 2: now split height into blocks of scale_factor
-        grid = grid.view(h // scale_factor, scale_factor, w // scale_factor, scale_factor)
-        # (H/scale_factor, scale_factor, W/scale_factor, scale_factor)
-        # Step 3: final permutation to (H/scale_factor, W/scale_factor, scale_factor, scale_factor)
-        grid = grid.permute(0, 2, 1, 3).contiguous()  # (H/scale_factor, W/scale_factor, scale_factor, scale_factor)
-        # Step 4: each (scale_factor, scale_factor) block forms one output token
-        gather_chunks.append(grid.reshape(-1, scale_factor * scale_factor))
-        # (H*W / scale_factor**2, scale_factor**2)
+        # Block into (H/s, W/s) groups; each group contributes s*s indices
+        grid = grid.view(h // s, s, w // s, s).permute(0, 2, 1, 3).contiguous()
+        gather_chunks.append(grid.view(-1, s * s))
 
         tok_offset += seq_len
 
-    # Concatenate over all images in the packed batch
-    gather_idx = torch.cat(gather_chunks, dim=0)  # (Σ_i HᵢWᵢ/scale_factor**2, scale_factor**2)
-    return gather_idx
+    return (
+        torch.cat(gather_chunks, dim=0) if gather_chunks else torch.empty((0, s * s), device=device, dtype=torch.int64)
+    )
 
 
 def pixel_shuffle_varlen(
