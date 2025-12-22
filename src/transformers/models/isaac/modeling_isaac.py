@@ -856,8 +856,7 @@ class IsaacModel(PreTrainedModel):
     def embed_packed_inputs(
         self, input_ids: torch.Tensor, packed_inputs: dict[str, Optional[torch.Tensor]]
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Embed packed_inputs (plain tensors) instead of TensorStream.
-
+        """
         Expects input_ids for text tokens and packed_inputs containing:
         - modality_tensor: (batch, seq_len) modality ids aligned to the sequence
         - position_ids: (batch, seq_len, 3) MRoPE coordinates (optional)
@@ -866,60 +865,53 @@ class IsaacModel(PreTrainedModel):
         - vision_token_offsets: (num_images,) offsets into each image's virtual token span (optional)
         - vision_token_lengths: (num_images,) surviving virtual token lengths per image (optional)
         """
+        modality = packed_inputs["modality_tensor"].to(device=input_ids.device, dtype=torch.long)
 
-        modality_tensor = packed_inputs.get("modality_tensor")
-        modality_tensor = modality_tensor.to(device=input_ids.device, dtype=torch.long)
-
-        text_embeds = self.embed_text_tokens(input_ids)
-        embeds = text_embeds
+        embeds = self.embed_text_tokens(input_ids)
 
         vision_patches = packed_inputs.get("vision_patches")
-        if vision_patches is not None:
-            token_grids = packed_inputs.get("vision_token_grids")
-            vision_token_offsets = packed_inputs.get("vision_token_offsets")
-            vision_token_lengths = packed_inputs.get("vision_token_lengths")
-            vision_embeds = self.vision_embedding((vision_patches, token_grids))
+        if vision_patches is None:
+            return embeds, modality
 
-            vision_seq_sizes = torch.prod(token_grids.to(device=vision_embeds.device), dim=-1)
-            scale_factor = self.config.vision_config.pixel_shuffle_scale_factor
-            vision_seq_sizes = vision_seq_sizes // int(scale_factor * scale_factor)
+        token_grids = packed_inputs["vision_token_grids"].to(device=vision_patches.device, dtype=torch.long)
+        vision = self.vision_embedding((vision_patches, token_grids))  # (total_tokens, hidden)
 
-            if vision_token_offsets is not None or vision_token_lengths is not None:
-                offsets = vision_token_offsets
-                lengths = vision_token_lengths
-                if offsets is None:
-                    offsets = torch.zeros_like(vision_seq_sizes, dtype=torch.long, device=vision_seq_sizes.device)
-                else:
-                    offsets = offsets.to(device=vision_embeds.device, dtype=torch.long)
-                if lengths is None:
-                    lengths = vision_seq_sizes.to(device=vision_embeds.device)
-                else:
-                    lengths = lengths.to(device=vision_embeds.device, dtype=torch.long)
+        # per-image token counts AFTER pixel-shuffle
+        s = int(self.config.vision_config.pixel_shuffle_scale_factor)
+        sizes = token_grids.prod(-1).div(s * s, rounding_mode="floor").tolist()
 
-                selected_chunks: list[torch.Tensor] = []
-                cursor = 0
-                for seq_len, offset, length in zip(vision_seq_sizes.tolist(), offsets.tolist(), lengths.tolist()):
-                    end = cursor + seq_len
-                    if seq_len == 0:
-                        cursor = end
-                        continue
-                    chunk = vision_embeds[cursor:end]
-                    chunk_offset = max(0, min(offset, seq_len))
-                    chunk_length = max(0, min(length, seq_len - chunk_offset))
-                    selected_chunks.append(chunk[chunk_offset : chunk_offset + chunk_length])
-                    cursor = end
+        offsets = packed_inputs.get("vision_token_offsets")
+        lengths = packed_inputs.get("vision_token_lengths")
 
-                vision_embeds = (
-                    torch.cat(selected_chunks, dim=0)
-                    if selected_chunks
-                    else vision_embeds.new_zeros((0, vision_embeds.size(-1)))
-                )
+        if offsets is not None or lengths is not None:
+            # defaults: offset=0, length=size
+            off = (
+                offsets.to(device=vision.device, dtype=torch.long)
+                if offsets is not None
+                else torch.zeros(len(sizes), device=vision.device, dtype=torch.long)
+            )
+            ln = (
+                lengths.to(device=vision.device, dtype=torch.long)
+                if lengths is not None
+                else torch.tensor(sizes, device=vision.device, dtype=torch.long)
+            )
 
-            vision_mask = modality_tensor == ModalityType.image.value
-            embeds = embeds.clone()
-            embeds[vision_mask] = vision_embeds.to(embeds.device)
+            chunks = vision.split(sizes, dim=0)
+            picked: list[torch.Tensor] = []
+            for c, n, o, l in zip(chunks, sizes, off.tolist(), ln.tolist()):
+                if n <= 0:
+                    continue
+                o = max(0, min(int(o), n))
+                l = max(0, min(int(l), n - o))
+                if l:
+                    picked.append(c[o : o + l])
+            vision = torch.cat(picked, 0) if picked else vision.new_zeros((0, vision.size(-1)))
 
-        return embeds, modality_tensor
+        m = modality == ModalityType.image.value
+        embeds = embeds.clone()
+        embeds[m] = vision.to(device=embeds.device, dtype=embeds.dtype)
+
+        return embeds, modality
 
     def _prepare_position_and_modality(
         self,
