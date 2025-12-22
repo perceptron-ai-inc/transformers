@@ -21,9 +21,7 @@
 
 
 import copy
-import math
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
 from enum import IntEnum
 from typing import Any, Optional, Union
 
@@ -57,9 +55,6 @@ if is_torch_available():
     import torch.nn.functional as F
 
 
-# TENSORSTREAM START -------------------------------------------------------------------------------
-
-
 class ModalityType(IntEnum):
     """
     Modality identifiers for events.
@@ -73,196 +68,6 @@ class ModalityType(IntEnum):
     image = 0
     text = 1
     padding = 2
-
-
-# @dataclass
-@dataclass(slots=True)
-class Event:
-    """
-    Represents a single data occurrence (with a specific type, time interval, and data payload).
-
-    Attributes:
-        data (Any): The actual data payload (e.g. a torch.Tensor, a string, etc.).
-        type (ModalityType): The modality type of the data (e.g., ModalityType.image).
-        time (Tuple[float, float]): (start_time, end_time) indicating when this Event occurs.
-        role (Optional[str]): The role associated with this event (e.g., "user", "agent", "system").
-            If None, the event is always included in loss calculation.
-
-    Example usage:
-        evt = Event(data=torch.zeros((1, 224, 224, 3)),  # e.g. a single image frame
-                    type=ModalityType.image,
-                    time=(0.0, 0.04),
-                    role="user")
-
-    """
-
-    # Descriptors
-    data: Any
-    time: tuple[float, float]
-    type: ModalityType
-    role: str | None = None
-
-    # Structure
-    dims_virtual: list[int] | None = None  # virtual/processed dimensions (e.g., pixel-shuffled)
-    dims_real: list[int] | None = None  # real/actual tensor dimensions
-    idx_range: tuple[int, int] | None = None
-
-    # Misc Tags (data source, shard idx, etc.)
-    tags: dict = field(default_factory=dict)
-
-    def dims(self, virtual: bool = True) -> list[int] | None:
-        """
-        Get the dimensions of this event.
-
-        Args:
-            virtual: If True (default), return virtual/processed dimensions (e.g., pixel-shuffled).
-                    If False, return real/actual tensor dimensions.
-
-        Returns:
-            Dimensions list or None if not measured.
-        """
-        if virtual:
-            return self.dims_virtual
-        else:
-            return self.dims_real
-
-    @property
-    def is_measured(self):
-        return self.dims_virtual is not None
-
-    def num_tokens(self, partial=True, virtual=True) -> int:
-        if not virtual:
-            assert partial is False and isinstance(self.data, torch.Tensor)
-            return math.prod(self.dims(virtual=False))
-        return self.idx_range[1] - self.idx_range[0] if partial else math.prod(self.dims())
-
-    def shallow_copy(self) -> "Event":
-        return replace(self)
-
-
-@dataclass
-class Stream:
-    """
-    Represents an ordered sequence of Event objects, each with
-    a specific ModalityType and a time range.
-
-    Attributes:
-        events (List[Event]): The list of Event objects in the stream.
-        priority (List[ModalityType]): A list of modality types that define
-            how we might want to reorder or prioritize events if scheduling is needed.
-
-    Example usage:
-        # Create two events of different types
-        evt1 = Event(torch.zeros((1, 224, 224, 3)), ModalityType.image, (0.0, 0.04))
-        evt2 = Event(torch.randint(0, 1000, (16, 1)), ModalityType.text, (0.0, 0.32))
-
-        # Make a stream with a given priority
-        s = Stream(events=[evt1, evt2],
-                   priority=[ModalityType.image, ModalityType.text])
-
-        print(s)
-    """
-
-    events: list[Event]
-    priority: list[ModalityType]  # priority of stream ordering
-
-    def __len__(self):
-        """Returns the number of Event objects in this Stream."""
-        return len(self.events)
-
-    def __getitem__(self, key: int) -> "Stream | Event":
-        return self.events[key]
-
-    def __iter__(self):
-        """
-        Yields each Event in the Stream, enabling iteration like:
-            for event in my_stream:
-                ...
-        """
-        yield from self.events
-
-    def shallow_copy(self) -> "Stream":
-        events_copy = [ev.shallow_copy() for ev in self.events]
-        return Stream(events=events_copy, priority=self.priority)
-
-
-# TODO: implement all types of cool indexing which can happen since TensorStream assuems Event.data = Tensor
-@dataclass
-class TensorStream:
-    streams: list[Stream]
-    _device: torch.device | None = None
-
-    def __post_init__(self):
-        for stream in self.streams:
-            for event in stream.events:
-                assert isinstance(event.data, torch.Tensor)
-                if self._device is None:
-                    self._device = torch.device(event.data.device)
-
-    @property
-    def device(self):
-        return self._device
-
-    @property
-    def shape(self):
-        seq_lens = [sum([ev.num_tokens() for ev in stream]) for stream in self.streams]
-        assert all([sl == seq_lens[0] for sl in seq_lens]), (
-            f"each stream must have same token count to have a shape: {seq_lens}"
-        )
-        return (len(seq_lens), seq_lens[0])
-
-    def to(
-        self,
-        device: torch.device | str,
-        dtype: torch.dtype | None = None,
-        non_blocking: bool = True,
-    ) -> "TensorStream":
-        """
-        Move **all** `Event.data` tensors to *device*.
-
-        We send each tensor individually instead of the
-        flatten → unflatten round-trip:
-
-        * one async H2D copy per tensor (still overlapped when
-          `pin_memory=True` is set on the DataLoader),
-        * no extra host-side concat, no extra device allocation,
-        * `requires_grad` flags are preserved.
-
-        NOTE: textual modalities are always cast to `torch.long`;
-        everything else keeps its original
-        dtype unless an explicit *dtype* argument is supplied.
-        """
-        target_device = torch.device(device)
-
-        for stream in self.streams:
-            for ev in stream:
-                # ------------------------------------------------------------------
-                # Decide the dtype for *this* event.
-                # ------------------------------------------------------------------
-                if ev.type in {ModalityType.text, ModalityType.padding}:
-                    tgt_dtype = torch.long
-                else:
-                    tgt_dtype = dtype or ev.data.dtype
-
-                # ------------------------------------------------------------------
-                # Perform the device / dtype move.
-                # ------------------------------------------------------------------
-                # We clone no tensor here; torch will reuse storage
-                # if `dtype` and `device` are unchanged.
-                moved = ev.data.to(
-                    device=target_device,
-                    dtype=tgt_dtype,
-                    non_blocking=non_blocking,
-                )
-
-                # Preserve autograd leaf & grad-enabled state.
-                moved.requires_grad_(ev.data.requires_grad)
-
-                ev.data = moved
-
-        # Remember where the whole TensorStream lives now.
-        self._device = target_device
-        return self
 
 
 class IsaacImageProcessorFastKwargs(ImagesKwargs, total=False):
@@ -1859,7 +1664,6 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         past_key_values: Optional[list[torch.FloatTensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        tensor_stream: Optional[TensorStream] = None,
         packed_inputs: Optional[dict[str, torch.Tensor]] = None,
         cache_position: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,

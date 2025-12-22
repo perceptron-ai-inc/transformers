@@ -25,12 +25,11 @@ import re
 from typing import Any, Optional, Union
 
 from ...feature_extraction_utils import BatchFeature
-from ...models.auto.tokenization_auto import AutoTokenizer
 from ...processing_utils import ProcessorMixin
 from ...utils import TensorType
 from ...utils.import_utils import is_torch_available, is_vision_available
 from .configuration_isaac import IsaacConfig
-from .modeling_isaac import Event, ModalityType, Stream, TensorStream
+from .modeling_isaac import ModalityType
 
 
 if is_torch_available():
@@ -91,48 +90,6 @@ def tensor_stream_token_view(
 
 
 # ============================================================================
-# Processor Components
-# ============================================================================
-
-
-def create_text_event(tokenizer: AutoTokenizer, text: str, time: float = 0.0) -> "Event":
-    r"""Wrap a text into an `Event` compatible with the multimodal TensorStream.
-
-    Args:
-        tokenizer (`AutoTokenizer`):
-            Tokenizer used to convert text into model vocabulary ids.
-        text (`str`):
-            Plain-text fragment to encode.
-        time (`float`, *optional*, defaults to 0.0):
-            Timeline coordinate associated with the event. Both start and end times use the same value because text
-            segments are instantaneous in the scheduler.
-
-    Returns:
-        `Event`: Event carrying a `(num_tokens, 1)` tensor of token ids with matching
-        metadata so that downstream processors can compute modality-specific embeddings.
-    """
-    tokens = tokenizer.encode(text, add_special_tokens=False, return_tensors="pt").squeeze(0)
-
-    # Calculate dimensions for the event
-    num_tokens = len(tokens)
-    dims_virtual = [num_tokens, 1]  # [sequence_length, 1]
-    dims_real = dims_virtual.copy()
-
-    # Keep a trailing dimension so downstream flattening preserves token order
-    if tokens.dim() == 1:
-        tokens = tokens.unsqueeze(-1)
-
-    return Event(
-        data=tokens,
-        type=ModalityType.text,
-        time=(time, time),
-        dims_virtual=dims_virtual,
-        dims_real=dims_real,
-        idx_range=(0, num_tokens),
-    )
-
-
-# ============================================================================
 # Processor
 # ============================================================================
 
@@ -179,52 +136,6 @@ class IsaacProcessor(ProcessorMixin):
 
         self.vision_token = vision_token
         self.max_sequence_length = max_sequence_length
-
-    def build_event_stream_simple(
-        self,
-        text: str,
-        images: Optional[list[Image]] = None,
-    ) -> "Stream":
-        events = []
-        # Process text and images
-        # Find all occurrences of vision token
-
-        pattern = re.escape(self.vision_token)
-        parts = re.split(f"({pattern})", text)  # Keep the delimiter in the result
-
-        image_idx = 0
-        for current_time, part in enumerate(parts):
-            if part == self.vision_token:
-                # Replace vision token with image event
-                if images is None or image_idx >= len(images):
-                    raise ValueError("Encountered vision token without a corresponding image.")
-
-                features = self.image_processor(
-                    images=images[image_idx],
-                    return_tensors=TensorType.PYTORCH,
-                )
-
-                patches = features["patches"][0]  # (H_tokens, W_tokens, embed)
-                virtual_dims = features["virtual_pixel_size"][0].tolist()
-                real_dims = features["real_pixel_size"][0].tolist()
-
-                vision_event = Event(
-                    data=patches.reshape(-1, patches.shape[-1]),
-                    type=ModalityType.image,
-                    time=(current_time, current_time),
-                    dims_virtual=virtual_dims,
-                    dims_real=real_dims,
-                    idx_range=(0, math.prod(virtual_dims)),
-                )
-                events.append(vision_event)
-                image_idx += 1
-            elif part:  # Non-empty text part
-                # tokens = self.text_processor.tokenize(part, add_special_tokens=False)
-                text_event = create_text_event(self.tokenizer, part, time=current_time)
-                events.append(text_event)
-
-        # Create stream without scheduling (events already in order)
-        return Stream(events, priority=[ModalityType.text, ModalityType.image])
 
     def _segment_inputs(
         self,
@@ -392,7 +303,6 @@ class IsaacProcessor(ProcessorMixin):
         text: Union[str, list[str]],
         images: Optional[Union[Image, list[Image]]] = None,
         return_tensors: Optional[Union[str, TensorType]] = TensorType.PYTORCH,
-        return_tensor_stream: bool = True,
         **kwargs,
     ) -> BatchFeature:
         """
@@ -436,19 +346,6 @@ class IsaacProcessor(ProcessorMixin):
         segments = self._segment_inputs(texts[0], images_list)
         packed_inputs = self._build_packed_inputs_from_segments(segments)
 
-        # Build event stream (kept for compatibility) and TensorStream output
-        stream = self.build_event_stream_simple(
-            text=texts[0],
-            images=images_list,
-        )
-
-        tensor_stream = TensorStream([stream])
-
-        # Slice to max length if needed
-        _, T = tensor_stream.shape
-        if T > self.max_sequence_length:
-            tensor_stream = ts_slice(tensor_stream, start=T - self.max_sequence_length, end=T)
-
         text_token_ids = packed_inputs.get("text_token_ids")
         if text_token_ids is None:
             raise ValueError("`text_token_ids` is required to build input ids from packed inputs.")
@@ -471,8 +368,6 @@ class IsaacProcessor(ProcessorMixin):
             "input_ids": input_ids,
             "packed_inputs": packed_inputs,
         }
-        if return_tensor_stream:
-            data["tensor_stream"] = tensor_stream
 
         return BatchFeature(data=data)
 

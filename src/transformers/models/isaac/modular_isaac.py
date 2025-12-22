@@ -84,9 +84,6 @@ from ..siglip2.modeling_siglip2 import (
 )
 
 
-# TENSORSTREAM START -------------------------------------------------------------------------------
-
-
 class ModalityType(IntEnum):
     """
     Modality identifiers for events.
@@ -100,246 +97,6 @@ class ModalityType(IntEnum):
     image = 0
     text = 1
     padding = 2
-
-
-# @dataclass
-@dataclass(slots=True)
-class Event:
-    """
-    Represents a single data occurrence (with a specific type, time interval, and data payload).
-
-    Attributes:
-        data (Any): The actual data payload (e.g. a torch.Tensor, a string, etc.).
-        type (ModalityType): The modality type of the data (e.g., ModalityType.image).
-        time (Tuple[float, float]): (start_time, end_time) indicating when this Event occurs.
-        role (Optional[str]): The role associated with this event (e.g., "user", "agent", "system").
-            If None, the event is always included in loss calculation.
-
-    Example usage:
-        evt = Event(data=torch.zeros((1, 224, 224, 3)),  # e.g. a single image frame
-                    type=ModalityType.image,
-                    time=(0.0, 0.04),
-                    role="user")
-
-    """
-
-    # Descriptors
-    data: Any
-    time: tuple[float, float]
-    type: ModalityType
-    role: str | None = None
-
-    # Structure
-    dims_virtual: list[int] | None = None  # virtual/processed dimensions (e.g., pixel-shuffled)
-    dims_real: list[int] | None = None  # real/actual tensor dimensions
-    idx_range: tuple[int, int] | None = None
-
-    # Misc Tags (data source, shard idx, etc.)
-    tags: dict = field(default_factory=dict)
-
-    def dims(self, virtual: bool = True) -> list[int] | None:
-        """
-        Get the dimensions of this event.
-
-        Args:
-            virtual: If True (default), return virtual/processed dimensions (e.g., pixel-shuffled).
-                    If False, return real/actual tensor dimensions.
-
-        Returns:
-            Dimensions list or None if not measured.
-        """
-        if virtual:
-            return self.dims_virtual
-        else:
-            return self.dims_real
-
-    @property
-    def is_measured(self):
-        return self.dims_virtual is not None
-
-    def num_tokens(self, partial=True, virtual=True) -> int:
-        if not virtual:
-            assert partial is False and isinstance(self.data, torch.Tensor)
-            return math.prod(self.dims(virtual=False))
-        return self.idx_range[1] - self.idx_range[0] if partial else math.prod(self.dims())
-
-    def shallow_copy(self) -> "Event":
-        return replace(self)
-
-
-@dataclass
-class Stream:
-    """
-    Represents an ordered sequence of Event objects, each with
-    a specific ModalityType and a time range.
-
-    Attributes:
-        events (List[Event]): The list of Event objects in the stream.
-        priority (List[ModalityType]): A list of modality types that define
-            how we might want to reorder or prioritize events if scheduling is needed.
-
-    Example usage:
-        # Create two events of different types
-        evt1 = Event(torch.zeros((1, 224, 224, 3)), ModalityType.image, (0.0, 0.04))
-        evt2 = Event(torch.randint(0, 1000, (16, 1)), ModalityType.text, (0.0, 0.32))
-
-        # Make a stream with a given priority
-        s = Stream(events=[evt1, evt2],
-                   priority=[ModalityType.image, ModalityType.text])
-
-        print(s)
-    """
-
-    events: list[Event]
-    priority: list[ModalityType]  # priority of stream ordering
-
-    def __len__(self):
-        """Returns the number of Event objects in this Stream."""
-        return len(self.events)
-
-    def __getitem__(self, key: int) -> "Stream | Event":
-        return self.events[key]
-
-    def __iter__(self):
-        """
-        Yields each Event in the Stream, enabling iteration like:
-            for event in my_stream:
-                ...
-        """
-        yield from self.events
-
-    def shallow_copy(self) -> "Stream":
-        events_copy = [ev.shallow_copy() for ev in self.events]
-        return Stream(events=events_copy, priority=self.priority)
-
-
-# TODO: implement all types of cool indexing which can happen since TensorStream assuems Event.data = Tensor
-@dataclass
-class TensorStream:
-    streams: list[Stream]
-    _device: torch.device | None = None
-
-    def __post_init__(self):
-        for stream in self.streams:
-            for event in stream.events:
-                assert isinstance(event.data, torch.Tensor)
-                if self._device is None:
-                    self._device = torch.device(event.data.device)
-
-    @property
-    def device(self):
-        return self._device
-
-    @property
-    def shape(self):
-        seq_lens = [sum([ev.num_tokens() for ev in stream]) for stream in self.streams]
-        assert all([sl == seq_lens[0] for sl in seq_lens]), (
-            f"each stream must have same token count to have a shape: {seq_lens}"
-        )
-        return (len(seq_lens), seq_lens[0])
-
-    def to(
-        self,
-        device: torch.device | str,
-        dtype: torch.dtype | None = None,
-        non_blocking: bool = True,
-    ) -> "TensorStream":
-        """
-        Move **all** `Event.data` tensors to *device*.
-
-        We send each tensor individually instead of the
-        flatten → unflatten round-trip:
-
-        * one async H2D copy per tensor (still overlapped when
-          `pin_memory=True` is set on the DataLoader),
-        * no extra host-side concat, no extra device allocation,
-        * `requires_grad` flags are preserved.
-
-        NOTE: textual modalities are always cast to `torch.long`;
-        everything else keeps its original
-        dtype unless an explicit *dtype* argument is supplied.
-        """
-        target_device = torch.device(device)
-
-        for stream in self.streams:
-            for ev in stream:
-                # ------------------------------------------------------------------
-                # Decide the dtype for *this* event.
-                # ------------------------------------------------------------------
-                if ev.type in {ModalityType.text, ModalityType.padding}:
-                    tgt_dtype = torch.long
-                else:
-                    tgt_dtype = dtype or ev.data.dtype
-
-                # ------------------------------------------------------------------
-                # Perform the device / dtype move.
-                # ------------------------------------------------------------------
-                # We clone no tensor here; torch will reuse storage
-                # if `dtype` and `device` are unchanged.
-                moved = ev.data.to(
-                    device=target_device,
-                    dtype=tgt_dtype,
-                    non_blocking=non_blocking,
-                )
-
-                # Preserve autograd leaf & grad-enabled state.
-                moved.requires_grad_(ev.data.requires_grad)
-
-                ev.data = moved
-
-        # Remember where the whole TensorStream lives now.
-        self._device = target_device
-        return self
-
-
-def _infer_device_from_streams(streams: list[Stream]) -> torch.device | str:
-    return next(
-        (ev.data.device for stream in streams for ev in stream.events if isinstance(ev.data, torch.Tensor)),
-        "cpu",
-    )
-
-
-def compute_mrope_pos_tensor(ts: TensorStream, n_pos_dims: int = 3) -> torch.Tensor:
-    """
-    Create a (batch, T, n_pos_dims) position tensor in one sweep.
-    The first dim is the running “time” index, the rest are spatial (or 1-fillers).
-
-    Args:
-        ts         : TensorStream
-        n_pos_dims : total coordinate dimensions (default 3)
-
-    Returns:
-        torch.LongTensor  - shape (batch_size, seq_len, n_pos_dims)
-    """
-
-    # Manually iterate through streams and events like map_compact does,
-    # but maintain cumulative time offset for each stream
-    all_coords = []
-    for stream in ts.streams:  # one Stream == one batch sample
-        cumulative_offset = 0  # running time index for this stream
-
-        for event in stream:
-            # --- build coordinate grid for THIS event using itertools (no tensor ops) ---
-            dims = (event.dims() or [1]) + [1] * (n_pos_dims - len(event.dims() or []))
-
-            # Create ranges for each dimension (similar to old _finalize implementation)
-            first_dim = range(cumulative_offset, cumulative_offset + dims[0])
-            cumulative_offset += dims[0]  # advance time for the next event
-            other_dims = [range(d) for d in dims[1:]]
-
-            # Use itertools.product to create all coordinate combinations
-            full_coords = list(itertools.product(first_dim, *other_dims))
-
-            # Slice if the event is partial
-            s, e = event.idx_range
-            coords = full_coords[s:e]
-
-            # Extend the flattened coordinate list
-            all_coords.extend(coords)
-
-    # Convert to tensor and reshape to (B, T, n_pos_dims)
-    B, T = ts.shape
-    return torch.tensor(all_coords, dtype=torch.long, device=ts.device).reshape(B, T, n_pos_dims)
 
 
 def tensor_stream_token_view(
@@ -387,123 +144,6 @@ def tensor_stream_token_view(
         )
 
     return tokens
-
-
-def tensor_stream_to_packed_inputs(tensor_stream: TensorStream) -> dict[str, Optional[torch.Tensor]]:
-    """
-    Extract plain tensor payloads from a TensorStream so downstream code can start
-    bypassing the Event/Stream abstraction. The returned tensors cover the Event
-    fields we previously relied on:
-
-    - modality_tensor mirrors `Event.type` for every token.
-    - position_ids materialize MRoPE-ready coordinates from `Event.idx_range` and `Event.dims`.
-    - vision_token_grids store the real spatial grid from `Event.dims(real)`.
-    - vision_token_offsets/vision_token_lengths mirror `Event.idx_range` for vision events after truncation.
-    - vision_patches keeps `Event.data` (real patch vectors) concatenated.
-    - text_token_ids preserves the text token payloads (batch, num_text_tokens).
-    """
-
-    device = tensor_stream.device or torch.device(_infer_device_from_streams(tensor_stream.streams))
-
-    text_token_batches: list[torch.Tensor] = []
-    for stream in tensor_stream.streams:
-        stream_tokens: list[torch.Tensor] = []
-        for ev in stream:
-            if ev.type != ModalityType.text:
-                continue
-            tokens = ev.data
-            if tokens.dim() > 1:
-                tokens = tokens.reshape(-1)
-            if ev.idx_range is not None:
-                start, end = ev.idx_range
-                tokens = tokens[start:end]
-            stream_tokens.append(tokens.to(device=device, dtype=torch.long))
-        if stream_tokens:
-            text_token_batches.append(torch.cat(stream_tokens, dim=0))
-        else:
-            text_token_batches.append(torch.zeros((0,), device=device, dtype=torch.long))
-
-    max_text_len = max(tokens.numel() for tokens in text_token_batches) if text_token_batches else 0
-    text_token_ids = torch.zeros((len(text_token_batches), max_text_len), device=device, dtype=torch.long)
-    for idx, tokens in enumerate(text_token_batches):
-        if tokens.numel():
-            text_token_ids[idx, : tokens.numel()] = tokens
-
-    modality_batches: list[torch.Tensor] = []
-    pad_value = ModalityType.padding.value
-    for stream in tensor_stream.streams:
-        token_labels: list[torch.Tensor] = []
-        for ev in stream:
-            num = ev.idx_range[1] - ev.idx_range[0] if ev.idx_range is not None else ev.num_tokens()
-            token_labels.append(torch.full((num,), ev.type.value, device=device, dtype=torch.long))
-        if token_labels:
-            modality_batches.append(torch.cat(token_labels, dim=0))
-        else:
-            modality_batches.append(torch.zeros((0,), device=device, dtype=torch.long))
-
-    max_modality_len = max(m.numel() for m in modality_batches) if modality_batches else 0
-    modality_tensor = torch.full((len(modality_batches), max_modality_len), pad_value, device=device, dtype=torch.long)
-    for idx, labels in enumerate(modality_batches):
-        if labels.numel():
-            modality_tensor[idx, : labels.numel()] = labels
-
-    vision_events = [ev for stream in tensor_stream.streams for ev in stream if ev.type == ModalityType.image]
-
-    seq_patches: Optional[torch.Tensor]
-    token_grids: Optional[torch.Tensor]
-    token_offsets: Optional[torch.Tensor]
-    token_lengths: Optional[torch.Tensor]
-
-    if vision_events:
-        patch_chunks: list[torch.Tensor] = []
-        grid_rows: list[tuple[int, int]] = []
-        offset_rows: list[int] = []
-        length_rows: list[int] = []
-
-        for ev in vision_events:
-            event_data = ev.data
-            if event_data.dim() > 2:
-                event_data = event_data.view(event_data.size(0), -1)
-
-            # idx_range describes how much of this event survives truncation
-            token_span = ev.idx_range
-            if token_span is None:
-                token_span = (0, math.prod(ev.dims() or [event_data.shape[0]]))
-            start, end = token_span
-
-            patch_chunks.append(event_data)
-            dims_real = ev.dims(False) or ev.dims() or [event_data.shape[0], 1, 1]
-            if len(dims_real) < 3:
-                dims_real = list(dims_real) + [1] * (3 - len(dims_real))
-            grid_rows.append((int(dims_real[1]), int(dims_real[2])))
-            offset_rows.append(int(max(0, start)))
-            length_rows.append(int(max(0, end - start)))
-
-        seq_patches = torch.cat(patch_chunks, dim=0)
-        token_grids = torch.tensor(grid_rows, dtype=torch.long, device=seq_patches.device)
-        token_offsets = torch.tensor(offset_rows, dtype=torch.long, device=seq_patches.device)
-        token_lengths = torch.tensor(length_rows, dtype=torch.long, device=seq_patches.device)
-    else:
-        seq_patches = None
-        token_grids = None
-        token_offsets = None
-        token_lengths = None
-
-    if modality_tensor.dim() != 2:
-        raise ValueError("`modality_tensor` must be 2D (batch, seq_len).")
-
-    return {
-        "vision_patches": seq_patches,
-        "vision_token_grids": token_grids,
-        "vision_token_offsets": token_offsets,
-        "vision_token_lengths": token_lengths,
-        "modality_tensor": modality_tensor,
-        "position_ids": compute_mrope_pos_tensor(tensor_stream),
-        "text_token_ids": text_token_ids,
-    }
-
-
-# TENSORSTREAM END -------------------------------------------------------------------------------
 
 
 class IsaacVisionConfig(Siglip2VisionConfig):
@@ -1555,48 +1195,6 @@ class IsaacConfig(PretrainedConfig):
 
 
 # ============================================================================
-# Processor Components
-# ============================================================================
-
-
-def create_text_event(tokenizer: AutoTokenizer, text: str, time: float = 0.0) -> "Event":
-    r"""Wrap a text into an `Event` compatible with the multimodal TensorStream.
-
-    Args:
-        tokenizer (`AutoTokenizer`):
-            Tokenizer used to convert text into model vocabulary ids.
-        text (`str`):
-            Plain-text fragment to encode.
-        time (`float`, *optional*, defaults to 0.0):
-            Timeline coordinate associated with the event. Both start and end times use the same value because text
-            segments are instantaneous in the scheduler.
-
-    Returns:
-        `Event`: Event carrying a `(num_tokens, 1)` tensor of token ids with matching
-        metadata so that downstream processors can compute modality-specific embeddings.
-    """
-    tokens = tokenizer.encode(text, add_special_tokens=False, return_tensors="pt").squeeze(0)
-
-    # Calculate dimensions for the event
-    num_tokens = len(tokens)
-    dims_virtual = [num_tokens, 1]  # [sequence_length, 1]
-    dims_real = dims_virtual.copy()
-
-    # Keep a trailing dimension so downstream flattening preserves token order
-    if tokens.dim() == 1:
-        tokens = tokens.unsqueeze(-1)
-
-    return Event(
-        data=tokens,
-        type=ModalityType.text,
-        time=(time, time),
-        dims_virtual=dims_virtual,
-        dims_real=dims_real,
-        idx_range=(0, num_tokens),
-    )
-
-
-# ============================================================================
 # Processor
 # ============================================================================
 
@@ -1643,52 +1241,6 @@ class IsaacProcessor(ProcessorMixin):
 
         self.vision_token = vision_token
         self.max_sequence_length = max_sequence_length
-
-    def build_event_stream_simple(
-        self,
-        text: str,
-        images: Optional[list[Image]] = None,
-    ) -> "Stream":
-        events = []
-        # Process text and images
-        # Find all occurrences of vision token
-
-        pattern = re.escape(self.vision_token)
-        parts = re.split(f"({pattern})", text)  # Keep the delimiter in the result
-
-        image_idx = 0
-        for current_time, part in enumerate(parts):
-            if part == self.vision_token:
-                # Replace vision token with image event
-                if images is None or image_idx >= len(images):
-                    raise ValueError("Encountered vision token without a corresponding image.")
-
-                features = self.image_processor(
-                    images=images[image_idx],
-                    return_tensors=TensorType.PYTORCH,
-                )
-
-                patches = features["patches"][0]  # (H_tokens, W_tokens, embed)
-                virtual_dims = features["virtual_pixel_size"][0].tolist()
-                real_dims = features["real_pixel_size"][0].tolist()
-
-                vision_event = Event(
-                    data=patches.reshape(-1, patches.shape[-1]),
-                    type=ModalityType.image,
-                    time=(current_time, current_time),
-                    dims_virtual=virtual_dims,
-                    dims_real=real_dims,
-                    idx_range=(0, math.prod(virtual_dims)),
-                )
-                events.append(vision_event)
-                image_idx += 1
-            elif part:  # Non-empty text part
-                # tokens = self.text_processor.tokenize(part, add_special_tokens=False)
-                text_event = create_text_event(self.tokenizer, part, time=current_time)
-                events.append(text_event)
-
-        # Create stream without scheduling (events already in order)
-        return Stream(events, priority=[ModalityType.text, ModalityType.image])
 
     def _segment_inputs(
         self,
@@ -1856,7 +1408,6 @@ class IsaacProcessor(ProcessorMixin):
         text: Union[str, list[str]],
         images: Optional[Union[Image, list[Image]]] = None,
         return_tensors: Optional[Union[str, TensorType]] = TensorType.PYTORCH,
-        return_tensor_stream: bool = True,
         **kwargs,
     ) -> BatchFeature:
         """
@@ -1900,19 +1451,6 @@ class IsaacProcessor(ProcessorMixin):
         segments = self._segment_inputs(texts[0], images_list)
         packed_inputs = self._build_packed_inputs_from_segments(segments)
 
-        # Build event stream (kept for compatibility) and TensorStream output
-        stream = self.build_event_stream_simple(
-            text=texts[0],
-            images=images_list,
-        )
-
-        tensor_stream = TensorStream([stream])
-
-        # Slice to max length if needed
-        _, T = tensor_stream.shape
-        if T > self.max_sequence_length:
-            tensor_stream = ts_slice(tensor_stream, start=T - self.max_sequence_length, end=T)
-
         text_token_ids = packed_inputs.get("text_token_ids")
         if text_token_ids is None:
             raise ValueError("`text_token_ids` is required to build input ids from packed inputs.")
@@ -1935,8 +1473,6 @@ class IsaacProcessor(ProcessorMixin):
             "input_ids": input_ids,
             "packed_inputs": packed_inputs,
         }
-        if return_tensor_stream:
-            data["tensor_stream"] = tensor_stream
 
         return BatchFeature(data=data)
 
@@ -2576,7 +2112,6 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
         past_key_values: Optional[list[torch.FloatTensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        tensor_stream: Optional[TensorStream] = None,
         packed_inputs: Optional[dict[str, torch.Tensor]] = None,
         cache_position: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
