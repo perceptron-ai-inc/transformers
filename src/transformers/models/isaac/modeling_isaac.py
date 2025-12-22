@@ -21,7 +21,6 @@
 
 
 import copy
-import itertools
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -1679,170 +1678,6 @@ class IsaacPreTrainedModel(PreTrainedModel):
     }
 
 
-def _infer_device_from_streams(streams: list[Stream]) -> torch.device | str:
-    return next(
-        (ev.data.device for stream in streams for ev in stream.events if isinstance(ev.data, torch.Tensor)),
-        "cpu",
-    )
-
-
-def compute_mrope_pos_tensor(ts: TensorStream, n_pos_dims: int = 3) -> torch.Tensor:
-    """
-    Create a (batch, T, n_pos_dims) position tensor in one sweep.
-    The first dim is the running “time” index, the rest are spatial (or 1-fillers).
-
-    Args:
-        ts         : TensorStream
-        n_pos_dims : total coordinate dimensions (default 3)
-
-    Returns:
-        torch.LongTensor  - shape (batch_size, seq_len, n_pos_dims)
-    """
-
-    # Manually iterate through streams and events like map_compact does,
-    # but maintain cumulative time offset for each stream
-    all_coords = []
-    for stream in ts.streams:  # one Stream == one batch sample
-        cumulative_offset = 0  # running time index for this stream
-
-        for event in stream:
-            # --- build coordinate grid for THIS event using itertools (no tensor ops) ---
-            dims = (event.dims() or [1]) + [1] * (n_pos_dims - len(event.dims() or []))
-
-            # Create ranges for each dimension (similar to old _finalize implementation)
-            first_dim = range(cumulative_offset, cumulative_offset + dims[0])
-            cumulative_offset += dims[0]  # advance time for the next event
-            other_dims = [range(d) for d in dims[1:]]
-
-            # Use itertools.product to create all coordinate combinations
-            full_coords = list(itertools.product(first_dim, *other_dims))
-
-            # Slice if the event is partial
-            s, e = event.idx_range
-            coords = full_coords[s:e]
-
-            # Extend the flattened coordinate list
-            all_coords.extend(coords)
-
-    # Convert to tensor and reshape to (B, T, n_pos_dims)
-    B, T = ts.shape
-    return torch.tensor(all_coords, dtype=torch.long, device=ts.device).reshape(B, T, n_pos_dims)
-
-
-def tensor_stream_to_packed_inputs(tensor_stream: TensorStream) -> dict[str, Optional[torch.Tensor]]:
-    """
-    Extract plain tensor payloads from a TensorStream so downstream code can start
-    bypassing the Event/Stream abstraction. The returned tensors cover the Event
-    fields we previously relied on:
-
-    - modality_tensor mirrors `Event.type` for every token.
-    - position_ids materialize MRoPE-ready coordinates from `Event.idx_range` and `Event.dims`.
-    - vision_token_grids store the real spatial grid from `Event.dims(real)`.
-    - vision_token_offsets/vision_token_lengths mirror `Event.idx_range` for vision events after truncation.
-    - vision_patches keeps `Event.data` (real patch vectors) concatenated.
-    - text_token_ids preserves the text token payloads (batch, num_text_tokens).
-    """
-
-    device = tensor_stream.device or torch.device(_infer_device_from_streams(tensor_stream.streams))
-
-    text_token_batches: list[torch.Tensor] = []
-    for stream in tensor_stream.streams:
-        stream_tokens: list[torch.Tensor] = []
-        for ev in stream:
-            if ev.type != ModalityType.text:
-                continue
-            tokens = ev.data
-            if tokens.dim() > 1:
-                tokens = tokens.reshape(-1)
-            if ev.idx_range is not None:
-                start, end = ev.idx_range
-                tokens = tokens[start:end]
-            stream_tokens.append(tokens.to(device=device, dtype=torch.long))
-        if stream_tokens:
-            text_token_batches.append(torch.cat(stream_tokens, dim=0))
-        else:
-            text_token_batches.append(torch.zeros((0,), device=device, dtype=torch.long))
-
-    max_text_len = max(tokens.numel() for tokens in text_token_batches) if text_token_batches else 0
-    text_token_ids = torch.zeros((len(text_token_batches), max_text_len), device=device, dtype=torch.long)
-    for idx, tokens in enumerate(text_token_batches):
-        if tokens.numel():
-            text_token_ids[idx, : tokens.numel()] = tokens
-
-    modality_batches: list[torch.Tensor] = []
-    pad_value = ModalityType.padding.value
-    for stream in tensor_stream.streams:
-        token_labels: list[torch.Tensor] = []
-        for ev in stream:
-            num = ev.idx_range[1] - ev.idx_range[0] if ev.idx_range is not None else ev.num_tokens()
-            token_labels.append(torch.full((num,), ev.type.value, device=device, dtype=torch.long))
-        if token_labels:
-            modality_batches.append(torch.cat(token_labels, dim=0))
-        else:
-            modality_batches.append(torch.zeros((0,), device=device, dtype=torch.long))
-
-    max_modality_len = max(m.numel() for m in modality_batches) if modality_batches else 0
-    modality_tensor = torch.full((len(modality_batches), max_modality_len), pad_value, device=device, dtype=torch.long)
-    for idx, labels in enumerate(modality_batches):
-        if labels.numel():
-            modality_tensor[idx, : labels.numel()] = labels
-
-    vision_events = [ev for stream in tensor_stream.streams for ev in stream if ev.type == ModalityType.image]
-
-    seq_patches: Optional[torch.Tensor]
-    token_grids: Optional[torch.Tensor]
-    token_offsets: Optional[torch.Tensor]
-    token_lengths: Optional[torch.Tensor]
-
-    if vision_events:
-        patch_chunks: list[torch.Tensor] = []
-        grid_rows: list[tuple[int, int]] = []
-        offset_rows: list[int] = []
-        length_rows: list[int] = []
-
-        for ev in vision_events:
-            event_data = ev.data
-            if event_data.dim() > 2:
-                event_data = event_data.view(event_data.size(0), -1)
-
-            # idx_range describes how much of this event survives truncation
-            token_span = ev.idx_range
-            if token_span is None:
-                token_span = (0, math.prod(ev.dims() or [event_data.shape[0]]))
-            start, end = token_span
-
-            patch_chunks.append(event_data)
-            dims_real = ev.dims(False) or ev.dims() or [event_data.shape[0], 1, 1]
-            if len(dims_real) < 3:
-                dims_real = list(dims_real) + [1] * (3 - len(dims_real))
-            grid_rows.append((int(dims_real[1]), int(dims_real[2])))
-            offset_rows.append(int(max(0, start)))
-            length_rows.append(int(max(0, end - start)))
-
-        seq_patches = torch.cat(patch_chunks, dim=0)
-        token_grids = torch.tensor(grid_rows, dtype=torch.long, device=seq_patches.device)
-        token_offsets = torch.tensor(offset_rows, dtype=torch.long, device=seq_patches.device)
-        token_lengths = torch.tensor(length_rows, dtype=torch.long, device=seq_patches.device)
-    else:
-        seq_patches = None
-        token_grids = None
-        token_offsets = None
-        token_lengths = None
-
-    if modality_tensor.dim() != 2:
-        raise ValueError("`modality_tensor` must be 2D (batch, seq_len).")
-
-    return {
-        "vision_patches": seq_patches,
-        "vision_token_grids": token_grids,
-        "vision_token_offsets": token_offsets,
-        "vision_token_lengths": token_lengths,
-        "modality_tensor": modality_tensor,
-        "position_ids": compute_mrope_pos_tensor(tensor_stream),
-        "text_token_ids": text_token_ids,
-    }
-
-
 @auto_docstring
 class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
     """Isaac multimodal model for conditional generation."""
@@ -2034,7 +1869,7 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         """
         Prepare inputs for generation, handling TensorStream and packed_inputs inputs properly.
         """
-        packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
+        # packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
         if cache_position is None:
             seq_length = None
             device = None

@@ -2425,7 +2425,7 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
         """
         Prepare inputs for generation, handling TensorStream and packed_inputs inputs properly.
         """
-        packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
+        # packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
         if cache_position is None:
             seq_length = None
             device = None
