@@ -802,35 +802,29 @@ def create_pixel_shuffle_index_map(
                  packed sequence for the j-th sub-patch that forms the
                  i-th output token.
     """
-    if device is None:
-        device = seq_sizes.device
-
-    s = int(scale_factor)
-    if s < 1:
-        raise ValueError(f"scale_factor must be >= 1, got {s}")
-
     if not is_torchdynamo_compiling():
-        if (token_grids % s).any():
+        if (token_grids % scale_factor).any():
             raise AssertionError(
-                f"Every (H,W) in token_grids must be divisible by scale_factor={s}, got {token_grids.tolist()}"
+                f"Every (H,W) in token_grids must be divisible by scale_factor={scale_factor}, got {token_grids.tolist()}"
             )
 
     gather_chunks: list[torch.Tensor] = []
     tok_offset = 0
-
     for seq_len, (h, w) in zip(seq_sizes.tolist(), token_grids.tolist()):
         # Flat indices for this image's packed segment
         grid = torch.arange(seq_len, device=device, dtype=torch.int64).view(h, w) + tok_offset
 
         # Block into (H/s, W/s) groups; each group contributes s*s indices
-        grid = grid.view(h // s, s, w // s, s).permute(0, 2, 1, 3).contiguous()
-        gather_chunks.append(grid.view(-1, s * s))
+        grid = (
+            grid.view(h // scale_factor, scale_factor, w // scale_factor, scale_factor)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+        gather_chunks.append(grid.view(-1, scale_factor * scale_factor))
 
         tok_offset += seq_len
 
-    return (
-        torch.cat(gather_chunks, dim=0) if gather_chunks else torch.empty((0, s * s), device=device, dtype=torch.int64)
-    )
+    return torch.cat(gather_chunks, dim=0)
 
 
 def pixel_shuffle_varlen(
@@ -1173,9 +1167,6 @@ class IsaacProcessor(ProcessorMixin):
         rescale_factor: Optional[float] = None,
         config: Optional[Union[IsaacConfig, dict]] = None,
     ) -> None:
-        if tokenizer is None:
-            raise ValueError("`tokenizer` must be provided to initialize IsaacProcessor.")
-
         if isinstance(config, dict):
             config = IsaacConfig(**config)
 
@@ -1409,13 +1400,7 @@ class IsaacProcessor(ProcessorMixin):
         packed_inputs = self._build_packed_inputs_from_segments(segments)
 
         text_token_ids = packed_inputs.get("text_token_ids")
-        if text_token_ids is None:
-            raise ValueError("`text_token_ids` is required to build input ids from packed inputs.")
-
         modality_tensor = packed_inputs.get("modality_tensor")
-        if modality_tensor is None:
-            raise ValueError("`modality_tensor` is required to build input ids from packed inputs.")
-
         fill_value = getattr(self.tokenizer, "pad_token_id", None)
         if fill_value is None or fill_value < 0:
             fill_value = 0

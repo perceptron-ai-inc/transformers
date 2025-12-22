@@ -89,9 +89,6 @@ class IsaacProcessor(ProcessorMixin):
         rescale_factor: Optional[float] = None,
         config: Optional[Union[IsaacConfig, dict]] = None,
     ) -> None:
-        if tokenizer is None:
-            raise ValueError("`tokenizer` must be provided to initialize IsaacProcessor.")
-
         if isinstance(config, dict):
             config = IsaacConfig(**config)
 
@@ -325,13 +322,7 @@ class IsaacProcessor(ProcessorMixin):
         packed_inputs = self._build_packed_inputs_from_segments(segments)
 
         text_token_ids = packed_inputs.get("text_token_ids")
-        if text_token_ids is None:
-            raise ValueError("`text_token_ids` is required to build input ids from packed inputs.")
-
         modality_tensor = packed_inputs.get("modality_tensor")
-        if modality_tensor is None:
-            raise ValueError("`modality_tensor` is required to build input ids from packed inputs.")
-
         fill_value = getattr(self.tokenizer, "pad_token_id", None)
         if fill_value is None or fill_value < 0:
             fill_value = 0
