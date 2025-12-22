@@ -990,10 +990,6 @@ class IsaacModel(PreTrainedModel):
 
         modality_tensor = None
         output_attentions = kwargs.pop("output_attentions", None)
-
-        # Canonicalize / rebuild input_ids when packed_inputs carry text_token_ids.
-        # This is critical for generation: GenerationMixin may slice input_ids, but
-        # packed_inputs describes the multimodal layout and must stay aligned.
         text_token_ids_present = packed_inputs is not None and "text_token_ids" in packed_inputs
         if text_token_ids_present:
             text_token_ids = packed_inputs.get("text_token_ids")
@@ -1034,8 +1030,6 @@ class IsaacModel(PreTrainedModel):
                 precomputed_position_ids = precomputed_position_ids.to(inputs_embeds.device)
         elif input_ids is not None:
             inputs_embeds = self.text_model.embed_tokens(input_ids)
-        elif inputs_embeds is None:
-            raise ValueError("You have to specify either packed_inputs, input_ids or inputs_embeds")
 
         batch_size, seq_len = inputs_embeds.shape[:2]
 
@@ -1357,11 +1351,8 @@ def compute_position_ids_input_ids(input_ids: torch.Tensor) -> torch.Tensor:
         `torch.Tensor`: Positional indices with shape `(batch_size, seq_len, 3)` where each channel duplicates the
         1D position so it can be consumed by the 3-axis MRoPE rotary embedding.
     """
-    batch_size, seq_length = input_ids.shape
-    position_ids = torch.arange(seq_length, device=input_ids.device)
-    position_ids = position_ids.view(1, -1).expand(batch_size, -1)
-    position_ids = position_ids.unsqueeze(2).expand(-1, -1, 3)  # Add 3D for MRoPE
-    return position_ids
+    _, seq_length = input_ids.shape
+    return torch.arange(seq_length, device=input_ids.device)[None, :, None].expand(input_ids.size(0), -1, 3)
 
 
 @auto_docstring

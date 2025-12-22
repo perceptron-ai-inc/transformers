@@ -202,9 +202,6 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
         antialias: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        if size.height is None or size.width is None:
-            raise ValueError("IsaacImageProcessorFast requires explicit `height` and `width` when resizing.")
-
         resize_mode: Any = interpolation
         if hasattr(resize_mode, "value"):
             resize_mode = resize_mode.value
