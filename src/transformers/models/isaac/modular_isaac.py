@@ -2293,17 +2293,32 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
 
         output_attentions = kwargs.pop("output_attentions", None)
 
-        # Don't compute embeddings here - let the inner model handle it
+        # Prefer packed_inputs when both are present.
         if tensor_stream is not None and packed_inputs is not None:
-            tensor_stream = None  # prefer packed_inputs when both are present
+            tensor_stream = None
+
+        # TensorStream path: let the inner model rebuild ids/embeds from packed inputs.
         if tensor_stream is not None:
             input_ids = None
+
         if packed_inputs is not None and input_ids is None and inputs_embeds is None:
             raise ValueError("`input_ids` must be provided when using `packed_inputs`.")
         if input_ids is None and inputs_embeds is None and tensor_stream is None and packed_inputs is None:
             raise ValueError("Either input_ids, inputs_embeds, tensor_stream, or packed_inputs must be provided.")
 
-        # Record rope deltas on prefill when TensorStream is provided; leave position_ids building to IsaacModel.
+        # -------------------------------------------------------------------------
+        # REORDER: Convert TensorStream -> packed_inputs early (before rope logic).
+        # -------------------------------------------------------------------------
+        if tensor_stream is not None and packed_inputs is None:
+            packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
+            converted_from_stream = True
+        else:
+            converted_from_stream = False
+
+        # -------------------------------------------------------------------------
+        # Existing rope logic (UNCHANGED for now): still operates on tensor_stream.
+        # Next change will remove this dependency by using packed_inputs["position_ids"].
+        # -------------------------------------------------------------------------
         if position_ids is None and tensor_stream is not None:
             position_ids, self.rope_deltas = self.get_rope_index(input_ids, tensor_stream, attention_mask)
         elif position_ids is None and cache_position is not None and self.rope_deltas is not None:
@@ -2321,12 +2336,6 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
             if not isinstance(rope_delta, int):
                 rope_delta = rope_delta.repeat_interleave(base_position_ids.shape[0] // rope_delta.shape[0], dim=0)
             position_ids = base_position_ids.add(rope_delta)
-
-        if tensor_stream is not None and packed_inputs is None:
-            packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
-            converted_from_stream = True
-        else:
-            converted_from_stream = False
 
         outputs = self.model(
             input_ids=input_ids,
