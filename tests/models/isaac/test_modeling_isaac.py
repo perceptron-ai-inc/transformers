@@ -43,7 +43,8 @@ from transformers.models.isaac.modeling_isaac import (
     IsaacVisionConfig,
     document_mask_function_from_cu_seqlens,
 )
-from transformers.models.isaac.processing_isaac import IsaacProcessor
+from transformers.models.isaac.processing_isaac import IsaacProcessor, tensor_stream_to_packed_inputs
+
 from transformers.testing_utils import (
     require_flash_attn,
     require_torch,
@@ -824,6 +825,7 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
         prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True).strip()
         processor_output = self.processor(text=prompt, images=images, return_tensors="pt")
         tensor_stream = processor_output["tensor_stream"].to(self.device)
+        packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
 
         with torch.no_grad():
             outputs = self.model.generate(

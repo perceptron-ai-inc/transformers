@@ -2034,9 +2034,7 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         """
         Prepare inputs for generation, handling TensorStream and packed_inputs inputs properly.
         """
-        if tensor_stream is not None and packed_inputs is not None:
-            tensor_stream = None
-
+        packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
         if cache_position is None:
             seq_length = None
             device = None
@@ -2059,8 +2057,6 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             **kwargs,
         )
-
-        packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
 
         cache_position = model_inputs.get("cache_position", cache_position)
 
