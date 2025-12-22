@@ -44,7 +44,6 @@ else:
 if is_torchvision_available():
     from ..pix2struct.image_processing_pix2struct_fast import torch_extract_patches
 
-from dataclasses import dataclass, field, replace
 from enum import IntEnum
 
 from ...cache_utils import DynamicCache
