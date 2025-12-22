@@ -1481,12 +1481,6 @@ class IsaacModel(Qwen3PreTrainedModel):
             )
         else:
             modality_tensor = modality_tensor.to(device=device, dtype=torch.long)
-            expected_shape = (batch_size, seq_len)
-            if modality_tensor.shape != torch.Size(expected_shape):
-                raise ValueError(
-                    f"modality_tensor must have shape (batch_size, seq_len) {expected_shape}, "
-                    f"but got {tuple(modality_tensor.shape)}"
-                )
 
         if position_ids is None:
             position_ids = cache_position.view(1, -1).expand(batch_size, -1)
