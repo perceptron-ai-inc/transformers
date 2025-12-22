@@ -2113,31 +2113,36 @@ class IsaacModel(Qwen3PreTrainedModel):
         Args:
             packed_inputs (`dict`, *optional*):
                 Plain tensor payloads extracted from a TensorStream. When provided, it replaces the TensorStream path
-                and requires `input_ids` for text tokens.
+                and requires `input_ids` for text tokens (or `text_token_ids` so `input_ids` can be rebuilt).
             modality_tensor (`torch.LongTensor`, *optional*):
                 Modality identifiers aligned with the embedded sequence, shaped `(batch_size, seq_len)` and containing
-                values from `ModalityType`. Automatically built from `tensor_stream` or `input_ids` when
-                omitted.
+                values from `ModalityType`. Automatically built from `packed_inputs` or treated as text-only when omitted.
         """
 
         modality_tensor = None
         output_attentions = kwargs.pop("output_attentions", None)
-        text_token_ids_present = packed_inputs is not None and "text_token_ids" in packed_inputs
 
+        # -------------------------------------------------------------------------
+        # Canonicalize / rebuild input_ids when packed_inputs carry text_token_ids.
+        # This is critical for generation: GenerationMixin may slice input_ids, but
+        # packed_inputs describes the multimodal layout and must stay aligned.
+        # -------------------------------------------------------------------------
+        text_token_ids_present = packed_inputs is not None and "text_token_ids" in packed_inputs
         if text_token_ids_present:
             text_token_ids = packed_inputs.get("text_token_ids")
+            modality_for_ids = packed_inputs.get("modality_tensor")
 
+            if modality_for_ids is None:
+                raise ValueError("`modality_tensor` is required when `text_token_ids` is present in packed_inputs.")
+            if text_token_ids is None:
+                raise ValueError("`text_token_ids` is required when `text_token_ids` key is present in packed_inputs.")
+
+            # Prefer packed position ids unless explicitly provided.
             if position_ids is None:
                 position_ids = packed_inputs.get("position_ids")
 
-            if input_ids is None:
-                if text_token_ids is None:
-                    raise ValueError("`text_token_ids` is required when converting from `tensor_stream`.")
-
-                modality_for_ids = packed_inputs.get("modality_tensor")
-                if modality_for_ids is None:
-                    raise ValueError("`modality_tensor` is required when converting from `tensor_stream`.")
-
+            # Rebuild canonical input_ids if missing OR if shapes don't match modality layout.
+            if input_ids is None or input_ids.shape[:2] != modality_for_ids.shape:
                 fill_value = getattr(getattr(self.config, "text_config", self.config), "pad_token_id", None)
                 if fill_value is None or fill_value < 0:
                     fill_value = 0
@@ -2145,6 +2150,8 @@ class IsaacModel(Qwen3PreTrainedModel):
                 input_ids = tensor_stream_token_view(text_token_ids, modality_for_ids, fill_value=fill_value).to(
                     dtype=torch.long
                 )
+
+                # Replace image slots with a safe token id so embed lookup is valid.
                 modality_for_ids = modality_for_ids.to(device=input_ids.device, dtype=torch.long)
                 image_mask = modality_for_ids == ModalityType.image.value
                 if image_mask.any():
@@ -2156,15 +2163,23 @@ class IsaacModel(Qwen3PreTrainedModel):
                     input_ids = input_ids.clone()
                     input_ids[image_mask] = safe_token_id
 
+        # If packed_inputs is provided without text_token_ids, we require aligned input_ids
+        # (otherwise we cannot guarantee the mm layout matches the provided ids).
+        if packed_inputs is not None and not text_token_ids_present:
+            if input_ids is None:
+                raise ValueError("`input_ids` must be provided when using `packed_inputs` without `text_token_ids`.")
+
         if packed_inputs is not None and inputs_embeds is not None and not text_token_ids_present:
             raise ValueError("`inputs_embeds` should not be provided alongside `packed_inputs`.")
 
-        # Resolve the input source (prefer packed_inputs > tensor_stream > ids > embeds).
+        # -------------------------------------------------------------------------
+        # Resolve the input source (prefer packed_inputs > ids > embeds).
+        # -------------------------------------------------------------------------
         precomputed_modality: Optional[torch.Tensor] = None
         precomputed_position_ids: Optional[torch.Tensor] = None
+
         if packed_inputs is not None:
-            if input_ids is None:
-                raise ValueError("`input_ids` must be provided when using `packed_inputs`.")
+            # At this point input_ids is guaranteed to exist (either provided or rebuilt).
             inputs_embeds, precomputed_modality = self.embed_packed_inputs(input_ids, packed_inputs)
             precomputed_position_ids = packed_inputs.get("position_ids")
             if precomputed_position_ids is not None:
@@ -2172,7 +2187,7 @@ class IsaacModel(Qwen3PreTrainedModel):
         elif input_ids is not None:
             inputs_embeds = self.text_model.embed_tokens(input_ids)
         elif inputs_embeds is None:
-            raise ValueError("You have to specify either tensor_stream, packed_inputs, input_ids or inputs_embeds")
+            raise ValueError("You have to specify either packed_inputs, input_ids or inputs_embeds")
 
         batch_size, seq_len = inputs_embeds.shape[:2]
 
@@ -2191,6 +2206,7 @@ class IsaacModel(Qwen3PreTrainedModel):
         if modality_tensor is None and precomputed_modality is not None:
             modality_tensor = precomputed_modality
 
+        # Prefer explicit position_ids, else packed position_ids (if any).
         position_arg = position_ids if position_ids is not None else precomputed_position_ids
 
         position_ids, modality_tensor, decoder_position_ids, cos, sin = self._prepare_position_and_modality(
@@ -2279,52 +2295,45 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | CausalLMOutputWithPast:
-        r"""
-        Forward pass for conditional generation supporting both standard inputs, TensorStream, and packed_inputs.
-
-        tensor_stream (`TensorStream`, *optional*):
-            Packed multimodal stream (text, vision, audio tokens) that already encodes spatial metadata. When provided,
-            the model derives embeddings, modality masks, and 3D rotary coordinates directly from the stream instead of
-            `input_ids`.
-        packed_inputs (`dict`, *optional*):
-            Plain tensors extracted from a TensorStream; requires `input_ids` for text tokens.
-        """
-
         output_attentions = kwargs.pop("output_attentions", None)
 
-        # Prefer packed_inputs when both are present.
-        if tensor_stream is not None and packed_inputs is not None:
-            tensor_stream = None
-
-        # TensorStream path: let the inner model rebuild ids/embeds from packed inputs.
+        # ---------------------------------------------------------------------
+        # Canonicalize multimodal payload: always work with packed_inputs.
+        # If tensor_stream is provided, convert it unconditionally and discard it.
+        # ---------------------------------------------------------------------
         if tensor_stream is not None:
-            input_ids = None
-
-        if packed_inputs is not None and input_ids is None and inputs_embeds is None:
-            raise ValueError("`input_ids` must be provided when using `packed_inputs`.")
-        if input_ids is None and inputs_embeds is None and tensor_stream is None and packed_inputs is None:
-            raise ValueError("Either input_ids, inputs_embeds, tensor_stream, or packed_inputs must be provided.")
-
-        # -------------------------------------------------------------------------
-        # REORDER: Convert TensorStream -> packed_inputs early (before rope logic).
-        # -------------------------------------------------------------------------
-        if tensor_stream is not None and packed_inputs is None:
+            if packed_inputs is not None:
+                raise ValueError("Provide only one of `tensor_stream` or `packed_inputs`.")
             packed_inputs = tensor_stream_to_packed_inputs(tensor_stream)
+            tensor_stream = None  # keep forward() tensorstream-agnostic from here on
 
-        # -------------------------------------------------------------------------
-        # Existing rope logic (UNCHANGED for now): still operates on tensor_stream.
-        # Next change will remove this dependency by using packed_inputs["position_ids"].
-        # -------------------------------------------------------------------------
-        if position_ids is None and packed_inputs is not None and "text_token_ids" in packed_inputs:
-            pos_3d = None if packed_inputs is None else packed_inputs.get("position_ids")
-            if pos_3d is None:
-                raise ValueError("`packed_inputs['position_ids']` is required when converting from `tensor_stream`.")
-            position_ids, self.rope_deltas = self.get_rope_index(
-                position_ids=pos_3d,
-                attention_mask=attention_mask,
-            )
+        # ---------------------------------------------------------------------
+        # Validate input source combinations.
+        # ---------------------------------------------------------------------
+        if packed_inputs is not None and inputs_embeds is not None:
+            raise ValueError("`inputs_embeds` should not be provided alongside `packed_inputs`.")
+
+        # Allow input_ids to be None only if the inner model can reconstruct it from text_token_ids.
+        if packed_inputs is not None and input_ids is None and "text_token_ids" not in packed_inputs:
+            raise ValueError("`input_ids` must be provided when using `packed_inputs` without `text_token_ids`.")
+
+        if input_ids is None and inputs_embeds is None and packed_inputs is None:
+            raise ValueError("Either input_ids, inputs_embeds, or packed_inputs must be provided.")
+
+        # ---------------------------------------------------------------------
+        # RoPE delta capture on prefill when packed position_ids are available.
+        # (Prefer position_ids presence; do NOT key off tensor_stream.)
+        # ---------------------------------------------------------------------
+        if position_ids is None and packed_inputs is not None:
+            pos_3d = packed_inputs.get("position_ids")
+            if pos_3d is not None:
+                position_ids, self.rope_deltas = self.get_rope_index(
+                    position_ids=pos_3d,
+                    attention_mask=attention_mask,
+                )
+
+        # Decode continuation: advance positions using cached rope offsets.
         elif position_ids is None and cache_position is not None and self.rope_deltas is not None:
-            # Decode continuation after TensorStream prefill: advance positions using cached rope offsets.
             if input_ids is not None:
                 base_position_ids = compute_position_ids_input_ids(input_ids)
             else:
