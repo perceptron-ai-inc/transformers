@@ -232,7 +232,9 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
 
         for shape, stacked_images in grouped_images.items():
             if stacked_images.ndim != 4:
-                raise ValueError("Expected batched channel-first image tensors.")
+                raise ValueError(
+                    f"Expected images shaped as (batch, channels, height, width); got shape {tuple(stacked_images.shape)}."
+                )
 
             batch_size, channels, original_height, original_width = stacked_images.shape
 
@@ -241,7 +243,9 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
                 channels = 3
 
             if original_height * original_width > self.MAX_PIXELS:
-                raise ValueError(f"Image (w={original_width}, h={original_height}) > MAX=`{self.MAX_PIXELS}`")
+                raise ValueError(
+                    f"Image area {original_height * original_width} (h={original_height}, w={original_width}) exceeds MAX_PIXELS={self.MAX_PIXELS}; enable resizing or provide smaller inputs."
+                )
 
             target_height, target_width = get_image_size_for_max_num_patches(
                 original_height,
@@ -261,7 +265,9 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
                 )
             else:
                 if ((original_height % patch_size) != 0) or ((original_width % patch_size) != 0):
-                    raise ValueError("Image dimensions must be divisible by patch_size when resize is disabled.")
+                    raise ValueError(
+                        f"Image dimensions (h={original_height}, w={original_width}) must be divisible by patch_size={patch_size} when resize is disabled; enable resizing or adjust the input resolution."
+                    )
                 image_batch = stacked_images
                 target_height, target_width = original_height, original_width
 
@@ -300,7 +306,7 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
 
             if (height_tokens % pixel_shuffle_scale) or (width_tokens % pixel_shuffle_scale):
                 raise ValueError(
-                    "Spatial dimensions must be divisible by pixel_shuffle_scale when pixel shuffle is enabled."
+                    f"Token grid (h={height_tokens}, w={width_tokens}) must be divisible by pixel_shuffle_scale={pixel_shuffle_scale}; adjust resize/patch parameters or disable pixel shuffle."
                 )
             virtual_height = height_tokens // pixel_shuffle_scale
             virtual_width = width_tokens // pixel_shuffle_scale
@@ -661,7 +667,9 @@ def pixel_shuffle_varlen(
     return_with_batch_dim = x.dim() == 3
     if return_with_batch_dim:
         if x.size(0) != 1:
-            raise AssertionError("Packed sequence is expected to have batch_size == 1")
+            raise ValueError(
+                f"Packed vision sequences expect a singleton batch dimension; received batch_size={x.size(0)}."
+            )
         embeddings = x.squeeze(0)  # (seq, embed)
     else:
         embeddings = x  # (seq, embed)
@@ -993,7 +1001,7 @@ class IsaacProcessor(ProcessorMixin):
         n_img = len(segs) - 1
         if n_img and (images is None or len(images) != n_img):
             raise ValueError(
-                f"Number of {self.vision_token} tokens ({n_img}) must match images ({0 if images is None else len(images)})."
+                f"Expected one image per '{self.vision_token}' token: found {n_img} token(s) but received {0 if images is None else len(images)} image(s)."
             )
 
         items: list[dict[str, Any]] = []
@@ -1111,7 +1119,9 @@ class IsaacProcessor(ProcessorMixin):
     ) -> BatchFeature:
         texts = [text] if isinstance(text, str) else text
         if len(texts) != 1:
-            raise ValueError("IsaacProcessor currently supports batch_size=1")
+            raise ValueError(
+                f"IsaacProcessor currently supports batch_size=1; received {len(texts)} text prompts. Split the batch and call the processor per sample."
+            )
 
         images_list = None
         if images is not None:
@@ -1119,7 +1129,7 @@ class IsaacProcessor(ProcessorMixin):
             n_tok = texts[0].count(self.vision_token)
             if n_tok != len(images_list):
                 raise ValueError(
-                    f"Number of {self.vision_token} tokens in text ({n_tok}) must match number of images ({len(images_list)})"
+                    f"Expected {len(images_list)} occurrences of '{self.vision_token}' (one per provided image), but found {n_tok} in the text."
                 )
 
         packed = self._pack_single(texts[0], images_list)
@@ -1539,7 +1549,9 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
         else:
             pos_3d = position_ids
             if pos_3d.ndim != 3 or pos_3d.size(-1) != 3:
-                raise ValueError("`position_ids` must have shape (batch, seq_len, 3) for MRoPE")
+                raise ValueError(
+                    f"`position_ids` must have shape (batch, seq_len, 3) for MRoPE; got shape {tuple(pos_3d.shape)}."
+                )
 
         B, L, _ = pos_3d.shape
         m_per_batch = pos_3d.amax(dim=(1, 2))
