@@ -1342,15 +1342,12 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
     def set_input_embeddings(self, value: nn.Module) -> None:
         self.model.set_input_embeddings(value)
         vocab_size = getattr(value, "num_embeddings", None)
-        if vocab_size is not None:
-            self.config.vocab_size = vocab_size
-            self.model.config.vocab_size = vocab_size
-            if hasattr(self.model, "text_model"):
-                self.model.text_model.config.vocab_size = vocab_size
-            if self.lm_head.weight.shape[0] != vocab_size:
-                self.lm_head = nn.Linear(self.config.hidden_size, vocab_size, bias=False)
-            if hasattr(self.model, "embed_tokens"):
-                self.lm_head.weight = self.model.text_model.embed_tokens.weight
+        self.config.vocab_size = vocab_size
+        self.model.config.vocab_size = vocab_size
+        self.model.text_model.config.vocab_size = vocab_size
+        if self.lm_head.weight.shape[0] != vocab_size:
+            self.lm_head = nn.Linear(self.config.hidden_size, vocab_size, bias=False)
+        self.lm_head.weight = self.model.text_model.embed_tokens.weight
 
     def get_rope_index(
         self,

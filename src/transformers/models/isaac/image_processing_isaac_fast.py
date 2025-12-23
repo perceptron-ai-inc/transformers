@@ -230,10 +230,7 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
     ) -> BatchFeature:
         grouped_images, grouped_images_index = group_images_by_shape(images, disable_grouping=disable_grouping)
 
-        grouped_outputs: dict[
-            tuple[int, ...],
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-        ] = {}
+        grouped_outputs = {}
 
         for shape, stacked_images in grouped_images.items():
             if stacked_images.ndim != 4:
