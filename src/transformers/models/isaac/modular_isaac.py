@@ -351,11 +351,11 @@ def create_document_attention_mask(
     Returns None if cu_seqlens is missing/degenerate.
     """
     if cu_seqlens is None or cu_seqlens.numel() < 2:
-        return None
+        return None  # Degenerate input: nothing to mask
 
     seq_sizes = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
     if seq_sizes.numel() == 0 or int(seq_sizes.sum()) == 0:
-        return None
+        return None  # All-empty segments produce no attention blocks
 
     seg_ids = torch.repeat_interleave(
         torch.arange(seq_sizes.numel(), device=cu_seqlens.device),
@@ -680,7 +680,8 @@ def pixel_shuffle_varlen(
     # Calculate seq_sizes from token_grids
     seq_sizes = torch.prod(token_grids, dim=-1)
 
-    # Build index map and gather in one go
+    # Build a single gather index so pixel shuffle works on the packed stream
+    # without unpacking per-image grids.
     gather_idx = create_pixel_shuffle_index_map(
         seq_sizes=seq_sizes,
         token_grids=token_grids,
@@ -718,7 +719,8 @@ class IsaacVisionTransformer(nn.Module):
         # Get embeddings from packed sequence
         hidden_states = self.embeddings(seq_patches, token_grids)
 
-        # Add a pseudo batch dimension for the encoder
+        # Add a pseudo batch dimension so we can reuse the batch-first encoder stack
+        # while still driving per-image cu_seqlens through the varlen attention path.
         hidden_states = hidden_states.unsqueeze(0)
 
         # Generate cumulative sequence lengths for variable-length attention
@@ -839,7 +841,8 @@ def get_image_size_for_max_num_patches(
     num_patches = (adjusted_height / patch_size) * (adjusted_width / patch_size)
 
     if min_num_patches is not None and num_patches < min_num_patches:
-        # Scale up
+        # Scale up via binary search to satisfy the minimum patch budget while
+        # preserving divisibility by patch_size * pixel_shuffle_scale.
         scale_min, scale_max = 1.0, 100.0
         while (scale_max - scale_min) >= eps:
             scale = (scale_min + scale_max) / 2
@@ -1072,11 +1075,14 @@ class IsaacProcessor(ProcessorMixin):
                     ids.append(torch.full((n,), fill_value, device=base_device, dtype=torch.long))
 
                     vpatches.append(it["patches"].to(base_device))  # full patches; slice later via offsets/lengths
+                    # Record per-image slice boundaries so we can drop cropped virtual tokens
+                    # after pixel shuffle without re-packing the entire vision stream.
                     grids.append(it["grid"])
                     offs.append(lo)
                     lens.append(n)
 
                     t0 += int(T)
+
             else:
                 t0 += L if it["t"] == "text" else int(it["dims"][0])
 
@@ -1187,6 +1193,8 @@ class IsaacRotaryEmbedding(qwen2_5_vl_modeling.Qwen2_5_VLRotaryEmbedding):
             pos = position_ids.clone()
             not_spatial = modality_tensor != ModalityType.image.value
             if not_spatial.any():
+                # Collapse non-vision modalities to 1D positions so rotary embedding
+                # treats them like text tokens while keeping image tokens 3D.
                 data_1d = pos[not_spatial][..., 0].unsqueeze(-1)
                 pos[not_spatial] = data_1d.expand(-1, pos.shape[-1])
 
@@ -1293,6 +1301,8 @@ class IsaacModel(Qwen3PreTrainedModel):
                 else torch.tensor(sizes, device=vision.device, dtype=torch.long)
             )
 
+            # Honor per-image crop windows (after pixel shuffle) so we only splice back
+            # the surviving virtual tokens instead of the full vision span.
             chunks = vision.split(sizes, dim=0)
             picked: list[torch.Tensor] = []
             for c, n, o, l in zip(chunks, sizes, off.tolist(), ln.tolist()):
