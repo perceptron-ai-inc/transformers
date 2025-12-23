@@ -1010,6 +1010,7 @@ class IsaacProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
     image_processor_class = ("IsaacImageProcessorFast",)
     tokenizer_class = ("Qwen2Tokenizer",)
+    pad_token_id = 151643
 
     def __init__(
         self,
@@ -1089,7 +1090,7 @@ class IsaacProcessor(ProcessorMixin):
         start = max(0, total - self.max_sequence_length)
         end = total
 
-        fill_value = 151643
+        fill_value = self.pad_token_id
         base_device: Optional[torch.device] = None
         position_ids, modality, input_ids = [], [], []
         vpatches, grids, vision_token_offsets, vision_token_lengths = [], [], [], []
