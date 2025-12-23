@@ -62,12 +62,10 @@ class ModalityType(IntEnum):
     Members:
         image: Vision tokens (e.g., patches).
         text: Textual tokens.
-        padding: Padding tokens used in sequence batching.
     """
 
     image = 0
     text = 1
-    padding = 2
 
 
 class IsaacImageProcessorFastKwargs(ImagesKwargs, total=False):
@@ -896,7 +894,6 @@ class IsaacModel(PreTrainedModel):
                 values from `ModalityType`. Automatically built from `packed_inputs` or treated as text-only when omitted.
         """
 
-        modality_tensor = None
         output_attentions = kwargs.pop("output_attentions", None)
 
         # Resolve the input source (prefer packed_inputs > ids > embeds).

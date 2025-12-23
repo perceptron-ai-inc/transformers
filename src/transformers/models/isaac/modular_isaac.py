@@ -88,12 +88,10 @@ class ModalityType(IntEnum):
     Members:
         image: Vision tokens (e.g., patches).
         text: Textual tokens.
-        padding: Padding tokens used in sequence batching.
     """
 
     image = 0
     text = 1
-    padding = 2
 
 
 class IsaacVisionConfig(Siglip2VisionConfig):

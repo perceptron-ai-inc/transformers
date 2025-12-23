@@ -68,10 +68,8 @@ class IsaacVisionConfig(PreTrainedConfig):
         self.hidden_act = hidden_act
         self.num_patches = num_patches
 
-        # Add our custom fields
         self.pixel_shuffle_scale_factor = pixel_shuffle_scale_factor
 
-        # Ensure a sensible default attention backend
         if getattr(self, "_attn_implementation", None) is None:
             self._attn_implementation = "sdpa"
 
