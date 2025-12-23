@@ -195,8 +195,6 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
         self,
         image: torch.Tensor,
         size: SizeDict,
-        interpolation: Optional[Any] = None,
-        antialias: bool = True,
         **kwargs,
     ) -> torch.Tensor:
         resize_kwargs: dict[str, Any] = {"align_corners": False}
@@ -213,10 +211,7 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
         self,
         images: list[torch.Tensor],
         do_resize: bool,
-        size: Optional[SizeDict],
         interpolation: Optional[Any],
-        do_center_crop: bool,
-        crop_size: Optional[SizeDict],
         do_rescale: Optional[bool],
         rescale_factor: Optional[float],
         do_normalize: Optional[bool],
@@ -224,8 +219,6 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
         image_std: Optional[Union[float, Sequence[float]]],
         disable_grouping: Optional[bool] = None,
         return_tensors: Optional[Union[str, TensorType]] = None,
-        do_pad: Optional[bool] = None,
-        pad_size: Optional[SizeDict] = None,
         *,
         patch_size: Optional[int] = None,
         max_num_patches: Optional[int] = None,
