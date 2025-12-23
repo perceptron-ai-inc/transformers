@@ -1360,7 +1360,6 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         packed_inputs: Optional[dict[str, torch.Tensor]] = None,
         cache_position: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        use_cache: bool = True,
         **kwargs,
     ) -> dict[str, Any]:
         model_inputs = super().prepare_inputs_for_generation(
@@ -1370,7 +1369,6 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
             inputs_embeds=inputs_embeds,
             cache_position=cache_position,
             position_ids=position_ids,
-            use_cache=use_cache,
             **kwargs,
         )
         if packed_inputs is None:
