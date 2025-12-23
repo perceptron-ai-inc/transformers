@@ -70,7 +70,13 @@ from ...utils import TensorType, auto_docstring
 # Vision preprocessing constants
 from ...utils.constants import IMAGENET_STANDARD_MEAN as VISION_MEAN
 from ...utils.constants import IMAGENET_STANDARD_STD as VISION_STD
-from ...utils.generic import OutputRecorder, TransformersKwargs, can_return_tuple, check_model_inputs
+from ...utils.generic import (
+    OutputRecorder,
+    TransformersKwargs,
+    can_return_tuple,
+    check_model_inputs,
+)
+
 from ..qwen2_5_vl import modeling_qwen2_5_vl as qwen2_5_vl_modeling
 from ..siglip2.configuration_siglip2 import Siglip2VisionConfig
 from ..siglip2.modeling_siglip2 import (
@@ -405,6 +411,7 @@ class IsaacVisionEmbeddings(Siglip2VisionEmbeddings):
         self.position_embedding_size = int(self.num_patches**0.5)
         self.position_embedding = nn.Embedding(self.num_patches, self.embed_dim)
 
+    @check_model_inputs
     def forward(self, seq_patches: torch.Tensor, spatial_shapes: torch.Tensor) -> torch.Tensor:
         # Rebatch packed variable-resolution patches to resize per-image position embeddings
         # and track lengths for varlen attention metadata.
@@ -702,6 +709,19 @@ def pixel_shuffle_varlen(
 
 
 class IsaacVisionTransformer(nn.Module):
+    """Vision tower that packs variable-resolution patches, applies varlen attention, and pixel-shuffles outputs.
+
+    Args:
+        config (IsaacVisionConfig): Vision configuration with pixel-shuffle and patching parameters.
+
+    Inputs:
+        packed_seq_patches (Tuple[Tensor, Tensor]): ``(patches, token_grids)`` where ``patches`` is a packed
+            patch sequence and ``token_grids`` holds per-image (H_tokens, W_tokens).
+
+    Returns:
+        torch.Tensor: Vision embeddings after encoder + pixel shuffle, shaped ``(seq_len, hidden_size * s^2)``.
+    """
+
     _supports_sdpa = True
 
     def __init__(self, config: IsaacVisionConfig):
@@ -752,6 +772,8 @@ class IsaacVisionTransformer(nn.Module):
 
 
 class IsaacMultiModalProjector(nn.Module):
+    """Maps vision tower outputs to the text hidden size with a SiLU MLP."""
+
     def __init__(self, config: IsaacConfig):
         super().__init__()
         self.vision_hidden_size = config.vision_config.hidden_size * (
@@ -770,7 +792,17 @@ class IsaacMultiModalProjector(nn.Module):
 
 
 class IsaacVisionEmbedding(nn.Module):
-    """Vision embedding wrapper exposing tower and projector."""
+    """Wraps the vision tower plus projection into the text hidden size.
+
+    Args:
+        config (IsaacConfig): Composite config containing both vision and text settings.
+
+    Inputs:
+        vision_tokens (Tuple[Tensor, Tensor]): Packed vision patches and token grids.
+
+    Returns:
+        torch.Tensor: Projected vision embeddings aligned to the text hidden size.
+    """
 
     _supports_sdpa = True
 
@@ -963,6 +995,20 @@ class IsaacConfig(PretrainedConfig):
 
 
 class IsaacProcessor(ProcessorMixin):
+    """Processor that pairs the Isaac image processor with the Qwen2 tokenizer.
+
+    Args:
+        image_processor: Vision preprocessor (fast) used for patch extraction.
+        tokenizer: Qwen2 tokenizer instance.
+        vision_token (str, optional): Placeholder token marking image locations. Defaults to "<image>".
+        max_sequence_length (int, optional): Maximum combined text+vision tokens kept. Defaults to 16384.
+        rescale_factor (float, optional): Image rescale factor; defaults to 1/255.
+        config (IsaacConfig | dict, optional): If provided, overrides processor defaults from the model config.
+
+    Returns:
+        BatchFeature: Contains ``input_ids`` and ``packed_inputs`` (patch tensors, grids, offsets, lengths, modality, positions).
+    """
+
     attributes = ["image_processor", "tokenizer"]
     image_processor_class = ("IsaacImageProcessorFast",)
     tokenizer_class = ("Qwen2Tokenizer",)
@@ -1208,6 +1254,7 @@ class IsaacRotaryEmbedding(qwen2_5_vl_modeling.Qwen2_5_VLRotaryEmbedding):
         return cos_combined, sin_combined
 
 
+@auto_docstring
 class IsaacModel(Qwen3PreTrainedModel):
     supports_gradient_checkpointing = True
     _can_compile_fullgraph = False
@@ -1444,6 +1491,7 @@ class IsaacModel(Qwen3PreTrainedModel):
         )
 
 
+@auto_docstring
 class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
     """Isaac multimodal model for conditional generation."""
 
@@ -1459,6 +1507,9 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.rope_deltas = None
 
+    @auto_docstring
+    @can_return_tuple
+    @check_model_inputs
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1472,6 +1523,22 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | CausalLMOutputWithPast:
+        """Run multimodal CausalLM forward, accepting packed vision/text inputs.
+
+        Args:
+            input_ids: Text token ids.
+            packed_inputs: Packed vision/text metadata and tensors from ``IsaacProcessor``.
+            attention_mask: Attention mask or mask dict; created if not provided.
+            position_ids: Optional 3D MRoPE positions; auto-derived when absent.
+            past_key_values: Cache for decoding.
+            inputs_embeds: Precomputed embeddings (bypass embedding layer).
+            labels: Target ids for computing language modeling loss.
+            use_cache: Whether to return caches.
+            cache_position: Positions for cache-aware generation.
+
+        Returns:
+            CausalLMOutputWithPast: logits, optional loss, caches, hidden states, attentions.
+        """
         output_attentions = kwargs.pop("output_attentions", None)
 
         if position_ids is None and packed_inputs is not None:
