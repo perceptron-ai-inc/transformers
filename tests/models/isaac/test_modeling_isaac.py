@@ -628,6 +628,8 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
         prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True).strip()
         processor_output = self.processor(text=prompt, images=images, return_tensors="pt")
         packed_inputs = processor_output["packed_inputs"]
+        input_ids = processor_output["input_ids"].to(self.device)
+        prompt_len = input_ids.shape[1]
         packed_inputs = {
             key: (value.to(self.device) if isinstance(value, torch.Tensor) else value)
             for key, value in packed_inputs.items()
@@ -635,6 +637,7 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
 
         with torch.no_grad():
             outputs = self.model.generate(
+                input_ids=input_ids,
                 packed_inputs=packed_inputs,
                 max_new_tokens=num_tokens or self.max_new_tokens,
                 do_sample=False,
@@ -645,7 +648,8 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
             )
 
         generated_ids = outputs.sequences
-        generated_text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        generated_tail = generated_ids[:, prompt_len:]
+        generated_text = self.tokenizer.decode(generated_tail[0], skip_special_tokens=True)
         return generated_text
 
     def test_generate_from_image_text(self):
@@ -709,13 +713,15 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
         prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True).strip()
         processor_output = self.processor(text=prompt, images=images, return_tensors="pt")
         packed_inputs = processor_output["packed_inputs"]
+        input_ids = processor_output["input_ids"]
         device = next(self.model.parameters()).device
-
+        input_ids = input_ids.to(device)
         # Move packed tensors to model device
         packed_inputs = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in packed_inputs.items()}
 
         with torch.no_grad():
             outputs = self.model.generate(
+                input_ids=input_ids,
                 packed_inputs=packed_inputs,
                 max_new_tokens=num_tokens or self.max_new_tokens,
                 do_sample=False,
@@ -786,6 +792,8 @@ class IsaacBoxPointingIntegrationTest(unittest.TestCase):
         prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True).strip()
         processor_output = self.processor(text=prompt, images=images, return_tensors="pt")
         packed_inputs = processor_output["packed_inputs"]
+        input_ids = processor_output["input_ids"].to(self.device)
+        prompt_len = input_ids.shape[1]
         packed_inputs = {
             key: (value.to(self.device) if isinstance(value, torch.Tensor) else value)
             for key, value in packed_inputs.items()
@@ -793,6 +801,7 @@ class IsaacBoxPointingIntegrationTest(unittest.TestCase):
 
         with torch.no_grad():
             outputs = self.model.generate(
+                input_ids=input_ids,
                 packed_inputs=packed_inputs,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=False,
@@ -802,7 +811,8 @@ class IsaacBoxPointingIntegrationTest(unittest.TestCase):
             )
 
         generated_ids = outputs.sequences
-        hf_generated_text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        hf_generated_tail = generated_ids[:, prompt_len:]
+        hf_generated_text = self.tokenizer.decode(hf_generated_tail[0], skip_special_tokens=True)
         points = extract_points(hf_generated_text)
         assert len(points) == 1
         first_point = points[0]

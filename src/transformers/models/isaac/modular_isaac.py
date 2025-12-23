@@ -16,9 +16,7 @@
 from __future__ import annotations
 
 import copy
-import itertools
 import math
-import re
 from collections.abc import Callable, Sequence
 from typing import Any, Optional, Union
 
@@ -64,7 +62,6 @@ from ...masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, create_masks_for_gene
 from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPast, CausalLMOutputWithPast
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
 from ...models.auto.modeling_auto import AutoModel
-from ...models.auto.tokenization_auto import AutoTokenizer
 from ...models.qwen3.configuration_qwen3 import Qwen3Config
 from ...models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3PreTrainedModel
 from ...processing_utils import ProcessorMixin, Unpack
@@ -97,33 +94,6 @@ class ModalityType(IntEnum):
     image = 0
     text = 1
     padding = 2
-
-
-def tensor_stream_token_view(
-    text_token_ids: torch.Tensor,
-    modality_tensor: torch.Tensor,
-    *,
-    fill_value: int = 0,
-) -> torch.Tensor:
-    """
-    Compose a (batch, seq_len) token tensor using text token ids and a modality map.
-    Non-text positions are filled with ``fill_value``.
-    """
-    if text_token_ids.dim() == 1:
-        text_token_ids = text_token_ids.unsqueeze(0)
-
-    B, L = modality_tensor.shape
-    if text_token_ids.size(0) == 1 and B > 1:
-        text_token_ids = text_token_ids.expand(B, -1)
-
-    text_mask = modality_tensor.eq(ModalityType.text.value)
-    # rank of each text position within its row: 0..need-1
-    rank = text_mask.cumsum(dim=1) - 1  # -1 where mask is False
-
-    out = modality_tensor.new_full((B, L), fill_value, dtype=torch.long)
-    gathered = text_token_ids.gather(1, rank.clamp_min(0))
-    out[text_mask] = gathered[text_mask]
-    return out
 
 
 class IsaacVisionConfig(Siglip2VisionConfig):
@@ -1069,8 +1039,9 @@ class IsaacProcessor(ProcessorMixin):
         start = max(0, total - self.max_sequence_length)
         end = total
 
+        fill_value = 151643
         base_device: Optional[torch.device] = None
-        pos, mod, txt = [], [], []
+        pos, mod, ids = [], [], []
         vpatches, grids, offs, lens = [], [], [], []
 
         cursor = 0
@@ -1096,7 +1067,7 @@ class IsaacProcessor(ProcessorMixin):
                     z = torch.zeros_like(t)
                     pos.append(torch.stack((t, z, z), -1))
                     mod.append(torch.full((n,), ModalityType.text.value, device=base_device, dtype=torch.long))
-                    txt.append(it["tok"].to(base_device)[lo:hi])
+                    ids.append(it["tok"].to(base_device)[lo:hi])
                     t0 += L
                 else:
                     T, H, W = it["dims"]
@@ -1107,6 +1078,7 @@ class IsaacProcessor(ProcessorMixin):
                     w = rem % W
                     pos.append(torch.stack((t, h, w), -1))
                     mod.append(torch.full((n,), ModalityType.image.value, device=base_device, dtype=torch.long))
+                    ids.append(torch.full((n,), fill_value, device=base_device, dtype=torch.long))
 
                     vpatches.append(it["patches"].to(base_device))  # full patches; slice later via offsets/lengths
                     grids.append(it["grid"])
@@ -1125,8 +1097,8 @@ class IsaacProcessor(ProcessorMixin):
         position_ids = (
             torch.cat(pos, 0).unsqueeze(0) if pos else torch.zeros((1, 0, 3), device=base_device, dtype=torch.long)
         )
-        text_token_ids = (
-            torch.cat(txt, 0).unsqueeze(0) if txt else torch.zeros((1, 0), device=base_device, dtype=torch.long)
+        input_ids = (
+            torch.cat(ids, 0).unsqueeze(0) if ids else torch.zeros((1, 0), device=base_device, dtype=torch.long)
         )
 
         if vpatches:
@@ -1138,13 +1110,13 @@ class IsaacProcessor(ProcessorMixin):
             vision_patches = vision_token_grids = vision_token_offsets = vision_token_lengths = None
 
         return {
+            "input_ids": input_ids,
             "vision_patches": vision_patches,
             "vision_token_grids": vision_token_grids,
             "vision_token_offsets": vision_token_offsets,
             "vision_token_lengths": vision_token_lengths,
             "modality_tensor": modality_tensor,
             "position_ids": position_ids,
-            "text_token_ids": text_token_ids,
         }
 
     def __call__(
@@ -1153,7 +1125,7 @@ class IsaacProcessor(ProcessorMixin):
         images: Optional[Union["Image", list["Image"]]] = None,
         return_tensors: Optional[Union[str, TensorType]] = TensorType.PYTORCH,
         **kwargs,
-    ) -> "BatchFeature":
+    ) -> BatchFeature:
         texts = [text] if isinstance(text, str) else text
         if len(texts) != 1:
             raise ValueError("IsaacProcessor currently supports batch_size=1")
@@ -1168,16 +1140,7 @@ class IsaacProcessor(ProcessorMixin):
                 )
 
         packed = self._pack_single(texts[0], images_list)
-
-        fill_value = getattr(self.tokenizer, "pad_token_id", 0)
-        if fill_value is None or fill_value < 0:
-            fill_value = 0
-
-        tokens = tensor_stream_token_view(packed["text_token_ids"], packed["modality_tensor"], fill_value=fill_value)
-        input_ids = (
-            torch.as_tensor(tokens, dtype=torch.long) if return_tensors in (TensorType.PYTORCH, "pt") else tokens
-        )
-
+        input_ids = packed.pop("input_ids")
         return BatchFeature(data={"input_ids": input_ids, "packed_inputs": packed})
 
 
@@ -1440,33 +1403,6 @@ class IsaacModel(Qwen3PreTrainedModel):
 
         modality_tensor = None
         output_attentions = kwargs.pop("output_attentions", None)
-        text_token_ids_present = packed_inputs is not None and "text_token_ids" in packed_inputs
-        if text_token_ids_present:
-            text_token_ids = packed_inputs.get("text_token_ids")
-            modality_for_ids = packed_inputs.get("modality_tensor")
-            position_ids = packed_inputs.get("position_ids")
-
-            # Rebuild canonical input_ids if missing OR if shapes don't match modality layout.
-            if input_ids is None or input_ids.shape[:2] != modality_for_ids.shape:
-                fill_value = getattr(getattr(self.config, "text_config", self.config), "pad_token_id", None)
-                if fill_value is None or fill_value < 0:
-                    fill_value = 0
-
-                input_ids = tensor_stream_token_view(text_token_ids, modality_for_ids, fill_value=fill_value).to(
-                    dtype=torch.long
-                )
-
-                # Replace image slots with a safe token id so embed lookup is valid.
-                modality_for_ids = modality_for_ids.to(device=input_ids.device, dtype=torch.long)
-                image_mask = modality_for_ids == ModalityType.image.value
-                if image_mask.any():
-                    safe_token_id = getattr(getattr(self.config, "text_config", self.config), "pad_token_id", None)
-                    if safe_token_id is None:
-                        safe_token_id = getattr(self.config, "pad_token_id", None)
-                    if safe_token_id is None or safe_token_id < 0:
-                        safe_token_id = int(self.config.vocab_size - 1)
-                    input_ids = input_ids.clone()
-                    input_ids[image_mask] = safe_token_id
 
         # Resolve the input source (prefer packed_inputs > ids > embeds).
         precomputed_modality: Optional[torch.Tensor] = None

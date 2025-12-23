@@ -709,33 +709,6 @@ class IsaacRotaryEmbedding(qwen2_5_vl_modeling.Qwen2_5_VLRotaryEmbedding):
         return cos_combined, sin_combined
 
 
-def tensor_stream_token_view(
-    text_token_ids: torch.Tensor,
-    modality_tensor: torch.Tensor,
-    *,
-    fill_value: int = 0,
-) -> torch.Tensor:
-    """
-    Compose a (batch, seq_len) token tensor using text token ids and a modality map.
-    Non-text positions are filled with ``fill_value``.
-    """
-    if text_token_ids.dim() == 1:
-        text_token_ids = text_token_ids.unsqueeze(0)
-
-    B, L = modality_tensor.shape
-    if text_token_ids.size(0) == 1 and B > 1:
-        text_token_ids = text_token_ids.expand(B, -1)
-
-    text_mask = modality_tensor.eq(ModalityType.text.value)
-    # rank of each text position within its row: 0..need-1
-    rank = text_mask.cumsum(dim=1) - 1  # -1 where mask is False
-
-    out = modality_tensor.new_full((B, L), fill_value, dtype=torch.long)
-    gathered = text_token_ids.gather(1, rank.clamp_min(0))
-    out[text_mask] = gathered[text_mask]
-    return out
-
-
 @auto_docstring
 class IsaacModel(PreTrainedModel):
     config: IsaacConfig
@@ -925,33 +898,6 @@ class IsaacModel(PreTrainedModel):
 
         modality_tensor = None
         output_attentions = kwargs.pop("output_attentions", None)
-        text_token_ids_present = packed_inputs is not None and "text_token_ids" in packed_inputs
-        if text_token_ids_present:
-            text_token_ids = packed_inputs.get("text_token_ids")
-            modality_for_ids = packed_inputs.get("modality_tensor")
-            position_ids = packed_inputs.get("position_ids")
-
-            # Rebuild canonical input_ids if missing OR if shapes don't match modality layout.
-            if input_ids is None or input_ids.shape[:2] != modality_for_ids.shape:
-                fill_value = getattr(getattr(self.config, "text_config", self.config), "pad_token_id", None)
-                if fill_value is None or fill_value < 0:
-                    fill_value = 0
-
-                input_ids = tensor_stream_token_view(text_token_ids, modality_for_ids, fill_value=fill_value).to(
-                    dtype=torch.long
-                )
-
-                # Replace image slots with a safe token id so embed lookup is valid.
-                modality_for_ids = modality_for_ids.to(device=input_ids.device, dtype=torch.long)
-                image_mask = modality_for_ids == ModalityType.image.value
-                if image_mask.any():
-                    safe_token_id = getattr(getattr(self.config, "text_config", self.config), "pad_token_id", None)
-                    if safe_token_id is None:
-                        safe_token_id = getattr(self.config, "pad_token_id", None)
-                    if safe_token_id is None or safe_token_id < 0:
-                        safe_token_id = int(self.config.vocab_size - 1)
-                    input_ids = input_ids.clone()
-                    input_ids[image_mask] = safe_token_id
 
         # Resolve the input source (prefer packed_inputs > ids > embeds).
         precomputed_modality: Optional[torch.Tensor] = None
