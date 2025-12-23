@@ -36,14 +36,12 @@ from transformers import (
     is_torch_available,
 )
 from transformers.image_utils import load_image
-from transformers.masking_utils import eager_mask, sdpa_mask
 from transformers.models.isaac.image_processing_isaac_fast import IsaacImageProcessorFast
 from transformers.models.isaac.modeling_isaac import (
     IsaacVisionAttention,
     IsaacVisionConfig,
 )
 from transformers.models.isaac.processing_isaac import IsaacProcessor
-
 from transformers.testing_utils import (
     require_flash_attn,
     require_torch,
