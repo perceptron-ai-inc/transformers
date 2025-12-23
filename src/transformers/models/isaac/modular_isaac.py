@@ -63,7 +63,7 @@ from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPast, Causal
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
 from ...models.auto.modeling_auto import AutoModel
 from ...models.qwen3.configuration_qwen3 import Qwen3Config
-from ...models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3PreTrainedModel
+from ...models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3Model, Qwen3PreTrainedModel
 from ...processing_utils import ProcessorMixin, Unpack
 from ...utils import TensorType, auto_docstring
 
@@ -1217,7 +1217,7 @@ class IsaacModel(Qwen3PreTrainedModel):
 
         text_cfg_source = config.text_config
         text_cfg = copy.deepcopy(text_cfg_source)
-        self.text_model = AutoModel.from_config(text_cfg)
+        self.text_model = Qwen3Model._from_config(text_cfg)
         self.text_model.config = config  # Ensure downstream callers observe the composed config
 
         self.rotary_emb = IsaacRotaryEmbedding(config, device=self.device)

@@ -36,8 +36,7 @@ from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPast, CausalLMOutputWithPast
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from ...models.auto.modeling_auto import AutoModel
-from ...models.qwen3.modeling_qwen3 import Qwen3PreTrainedModel
+from ...models.qwen3.modeling_qwen3 import Qwen3Model, Qwen3PreTrainedModel
 from ...processing_utils import Unpack
 from ...utils import auto_docstring
 from ...utils.generic import OutputRecorder, TransformersKwargs, can_return_tuple, check_model_inputs
@@ -727,7 +726,7 @@ class IsaacModel(PreTrainedModel):
 
         text_cfg_source = config.text_config
         text_cfg = copy.deepcopy(text_cfg_source)
-        self.text_model = AutoModel.from_config(text_cfg)
+        self.text_model = Qwen3Model._from_config(text_cfg)
         self.text_model.config = config  # Ensure downstream callers observe the composed config
 
         self.rotary_emb = IsaacRotaryEmbedding(config, device=self.device)
