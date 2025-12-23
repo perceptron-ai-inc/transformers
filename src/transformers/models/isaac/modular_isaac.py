@@ -1044,33 +1044,45 @@ class IsaacProcessor(ProcessorMixin):
 
     def _pack_single(self, text: str, images: Optional[list[Image]]) -> dict[str, Optional[torch.Tensor]]:
         # Parse by vision_token; interleave text segments and image segments.
-        segs = text.split(self.vision_token)
-        n_img = len(segs) - 1
-        if n_img and (images is None or len(images) != n_img):
+        segments = text.split(self.vision_token)
+        num_images = len(segments) - 1
+        if num_images and (images is None or len(images) != num_images):
             raise ValueError(
-                f"Expected one image per '{self.vision_token}' token: found {n_img} token(s) but received {0 if images is None else len(images)} image(s)."
+                f"Expected one image per '{self.vision_token}' token: found {num_images} token(s) but received {0 if images is None else len(images)} image(s)."
             )
 
         items: list[dict[str, Any]] = []
         total = 0
 
-        for i, s in enumerate(segs):
-            if s:
-                tok = self.tokenizer.encode(s, add_special_tokens=False, return_tensors="pt").squeeze(0).to(torch.long)
+        for index, segment in enumerate(segments):
+            if segment:
+                tok = (
+                    self.tokenizer.encode(segment, add_special_tokens=False, return_tensors="pt")
+                    .squeeze(0)
+                    .to(torch.long)
+                )
                 L = int(tok.numel())
                 items.append({"t": "text", "L": L, "tok": tok})
                 total += L
 
-            if i < n_img:
-                feat = self.image_processor(images=images[i], return_tensors=TensorType.PYTORCH)
+            if index < num_images:
+                feat = self.image_processor(images=images[index], return_tensors=TensorType.PYTORCH)
                 patches = feat["patches"][0].reshape(-1, feat["patches"].shape[-1])
 
-                v = feat["virtual_pixel_size"][0].to(torch.long).tolist()
-                r = feat["real_pixel_size"][0].to(torch.long).tolist()
-                dims = tuple((v + [1, 1, 1])[:3])  # (T,H,W) in virtual space
+                virtual_pixel_size = feat["virtual_pixel_size"][0].to(torch.long).tolist()
+                real_pixel_size = feat["real_pixel_size"][0].to(torch.long).tolist()
+                dims = tuple((virtual_pixel_size + [1, 1, 1])[:3])  # (T,H,W) in virtual space
                 L = int(dims[0] * dims[1] * dims[2])
 
-                items.append({"t": "image", "L": L, "dims": dims, "patches": patches, "grid": (int(r[1]), int(r[2]))})
+                items.append(
+                    {
+                        "t": "image",
+                        "L": L,
+                        "dims": dims,
+                        "patches": patches,
+                        "grid": (int(real_pixel_size[1]), int(real_pixel_size[2])),
+                    }
+                )
                 total += L
 
         # Tail crop window.
@@ -1079,20 +1091,20 @@ class IsaacProcessor(ProcessorMixin):
 
         fill_value = 151643
         base_device: Optional[torch.device] = None
-        pos, mod, ids = [], [], []
-        vpatches, grids, offs, lens = [], [], [], []
+        position_ids, modality, input_ids = [], [], []
+        vpatches, grids, vision_token_offsets, vision_token_lengths = [], [], [], []
 
         cursor = 0
         t0 = 0
 
-        for it in items:
-            L = int(it["L"])
+        for item in items:
+            L = int(item["L"])
             a = max(start, cursor)
             b = min(end, cursor + L)
             keep = b > a
 
             if keep and base_device is None:
-                base_device = it["patches"].device if it["t"] == "image" else it["tok"].device
+                base_device = item["patches"].device if item["t"] == "image" else item["tok"].device
 
             if keep:
                 lo = int(a - cursor)
@@ -1100,53 +1112,59 @@ class IsaacProcessor(ProcessorMixin):
                 k = torch.arange(lo, hi, device=base_device, dtype=torch.long)
                 n = hi - lo
 
-                if it["t"] == "text":
+                if item["t"] == "text":
                     t = k + t0
                     z = torch.zeros_like(t)
-                    pos.append(torch.stack((t, z, z), -1))
-                    mod.append(torch.full((n,), ModalityType.text.value, device=base_device, dtype=torch.long))
-                    ids.append(it["tok"].to(base_device)[lo:hi])
+                    position_ids.append(torch.stack((t, z, z), -1))
+                    modality.append(torch.full((n,), ModalityType.text.value, device=base_device, dtype=torch.long))
+                    input_ids.append(item["tok"].to(base_device)[lo:hi])
                     t0 += L
                 else:
-                    T, H, W = it["dims"]
+                    T, H, W = item["dims"]
                     hw = H * W
                     t = (k // hw) + t0
                     rem = k % hw
                     h = rem // W
                     w = rem % W
-                    pos.append(torch.stack((t, h, w), -1))
-                    mod.append(torch.full((n,), ModalityType.image.value, device=base_device, dtype=torch.long))
-                    ids.append(torch.full((n,), fill_value, device=base_device, dtype=torch.long))
+                    position_ids.append(torch.stack((t, h, w), -1))
+                    modality.append(torch.full((n,), ModalityType.image.value, device=base_device, dtype=torch.long))
+                    input_ids.append(torch.full((n,), fill_value, device=base_device, dtype=torch.long))
 
-                    vpatches.append(it["patches"].to(base_device))  # full patches; slice later via offsets/lengths
+                    vpatches.append(item["patches"].to(base_device))  # full patches; slice later via offsets/lengths
                     # Record per-image slice boundaries so we can drop cropped virtual tokens
                     # after pixel shuffle without re-packing the entire vision stream.
-                    grids.append(it["grid"])
-                    offs.append(lo)
-                    lens.append(n)
+                    grids.append(item["grid"])
+                    vision_token_offsets.append(lo)
+                    vision_token_lengths.append(n)
 
                     t0 += int(T)
 
             else:
-                t0 += L if it["t"] == "text" else int(it["dims"][0])
+                t0 += L if item["t"] == "text" else int(item["dims"][0])
 
             cursor += L
 
         modality_tensor = (
-            torch.cat(mod, 0).unsqueeze(0) if mod else torch.zeros((1, 0), device=base_device, dtype=torch.long)
+            torch.cat(modality, 0).unsqueeze(0)
+            if modality
+            else torch.zeros((1, 0), device=base_device, dtype=torch.long)
         )
         position_ids = (
-            torch.cat(pos, 0).unsqueeze(0) if pos else torch.zeros((1, 0, 3), device=base_device, dtype=torch.long)
+            torch.cat(position_ids, 0).unsqueeze(0)
+            if position_ids
+            else torch.zeros((1, 0, 3), device=base_device, dtype=torch.long)
         )
         input_ids = (
-            torch.cat(ids, 0).unsqueeze(0) if ids else torch.zeros((1, 0), device=base_device, dtype=torch.long)
+            torch.cat(input_ids, 0).unsqueeze(0)
+            if input_ids
+            else torch.zeros((1, 0), device=base_device, dtype=torch.long)
         )
 
         if vpatches:
             vision_patches = torch.cat(vpatches, 0)
             vision_token_grids = torch.tensor(grids, device=base_device, dtype=torch.long)
-            vision_token_offsets = torch.tensor(offs, device=base_device, dtype=torch.long)
-            vision_token_lengths = torch.tensor(lens, device=base_device, dtype=torch.long)
+            vision_token_offsets = torch.tensor(vision_token_offsets, device=base_device, dtype=torch.long)
+            vision_token_lengths = torch.tensor(vision_token_lengths, device=base_device, dtype=torch.long)
         else:
             vision_patches = vision_token_grids = vision_token_offsets = vision_token_lengths = None
 
