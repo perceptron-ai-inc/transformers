@@ -59,9 +59,8 @@ from ...image_utils import (
     PILImageResampling,
 )
 from ...masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, create_masks_for_generate, packed_sequence_mask_function
-from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPast, CausalLMOutputWithPast
+from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
-from ...models.auto.modeling_auto import AutoModel
 from ...models.qwen3.configuration_qwen3 import Qwen3Config
 from ...models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3Model, Qwen3PreTrainedModel
 from ...processing_utils import ProcessorMixin, Unpack
@@ -76,7 +75,6 @@ from ...utils.generic import (
     can_return_tuple,
     check_model_inputs,
 )
-
 from ..qwen2_5_vl import modeling_qwen2_5_vl as qwen2_5_vl_modeling
 from ..siglip2.configuration_siglip2 import Siglip2VisionConfig
 from ..siglip2.modeling_siglip2 import (
@@ -1021,7 +1019,7 @@ class IsaacProcessor(ProcessorMixin):
         vision_token: str = "<image>",
         max_sequence_length: int = 16384,
         rescale_factor: Optional[float] = None,
-        config: Optional[Union["IsaacConfig", dict]] = None,
+        config: Optional[Union[IsaacConfig, dict]] = None,
     ) -> None:
         if isinstance(config, dict):
             config = IsaacConfig(**config)
@@ -1044,7 +1042,7 @@ class IsaacProcessor(ProcessorMixin):
         self.vision_token = vision_token
         self.max_sequence_length = max_sequence_length
 
-    def _pack_single(self, text: str, images: Optional[list["Image"]]) -> dict[str, Optional["torch.Tensor"]]:
+    def _pack_single(self, text: str, images: Optional[list[Image]]) -> dict[str, Optional[torch.Tensor]]:
         # Parse by vision_token; interleave text segments and image segments.
         segs = text.split(self.vision_token)
         n_img = len(segs) - 1
@@ -1165,7 +1163,7 @@ class IsaacProcessor(ProcessorMixin):
     def __call__(
         self,
         text: Union[str, list[str]],
-        images: Optional[Union["Image", list["Image"]]] = None,
+        images: Optional[Union[Image, list[Image]]] = None,
         return_tensors: Optional[Union[str, TensorType]] = TensorType.PYTORCH,
         **kwargs,
     ) -> BatchFeature:
