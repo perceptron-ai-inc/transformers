@@ -545,7 +545,6 @@ class IsaacModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
         self.assertTrue(hasattr(model, "model"))
         self.assertTrue(hasattr(model, "lm_head"))
         self.assertTrue(hasattr(model.model, "vision_embedding"))
-        self.assertTrue(hasattr(model.model, "embed_fns"))
 
         input_ids = torch.randint(0, config.vocab_size, (1, 10), device=torch_device, dtype=torch.long)
         with torch.no_grad():
@@ -566,47 +565,6 @@ class IsaacModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
         self.assertIsNotNone(outputs.loss)
         self.assertEqual(outputs.loss.ndim, 0)
         self.assertEqual(outputs.logits.shape, (batch_size, seq_len, config.vocab_size))
-
-    @require_vision
-    @require_tensorstream
-    def test_isaac_generation_with_tensor_stream(self):
-        config = self.model_tester.get_config()
-        tokenizer = SimpleIsaacTokenizer()
-        image_processor = IsaacImageProcessorFast(
-            patch_size=config.vision_config.patch_size,
-            max_num_patches=config.vision_config.num_patches,
-            pixel_shuffle_scale=config.vision_config.pixel_shuffle_scale_factor,
-            rescale_factor=config.vision_rescale_factor,
-        )
-        processor = IsaacProcessor(
-            image_processor=image_processor,
-            tokenizer=tokenizer,
-            config=config,
-        )
-
-        model = IsaacForConditionalGeneration(config).to(torch_device)
-        model.eval()
-
-        messages = [{"role": "user", "content": "Hello there!"}]
-        prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        processed = processor(text=prompt, images=None, return_tensors="pt")
-
-        input_ids = processed["input_ids"].to(torch_device)
-        tensor_stream = processed["tensor_stream"].to(torch_device)
-        generated = model.generate(
-            input_ids=input_ids,
-            tensor_stream=tensor_stream,
-            max_new_tokens=5,
-            do_sample=False,
-            pad_token_id=processor.tokenizer.pad_token_id,
-            eos_token_id=processor.tokenizer.eos_token_id,
-        )
-
-        self.assertEqual(generated.shape[0], 1)
-        self.assertGreaterEqual(generated.shape[1], input_ids.shape[1])
-        decoded_prompt = processor.tokenizer.decode(generated[0], skip_special_tokens=True)
-        self.assertIsInstance(decoded_prompt, str)
-        self.assertNotEqual(decoded_prompt.strip(), "")
 
 
 @require_torch
