@@ -192,9 +192,6 @@ class IsaacProcessor(ProcessorMixin):
 
             cursor += L
 
-        if base_device is None:
-            base_device = torch.device("cpu")
-
         modality_tensor = (
             torch.cat(mod, 0).unsqueeze(0) if mod else torch.zeros((1, 0), device=base_device, dtype=torch.long)
         )

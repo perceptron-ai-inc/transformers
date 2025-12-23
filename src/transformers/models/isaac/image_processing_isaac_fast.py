@@ -177,7 +177,6 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
     image_std = list(VISION_STD)
     do_convert_rgb = True
     disable_grouping = False
-    size_divisor: Optional[int] = None
 
     def __init__(
         self,

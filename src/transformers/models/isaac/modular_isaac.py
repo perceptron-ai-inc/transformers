@@ -207,7 +207,6 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
     image_std = list(VISION_STD)
     do_convert_rgb = True
     disable_grouping = False
-    size_divisor: Optional[int] = None
 
     def __init__(
         self,
@@ -1119,9 +1118,6 @@ class IsaacProcessor(ProcessorMixin):
                 t0 += L if it["t"] == "text" else int(it["dims"][0])
 
             cursor += L
-
-        if base_device is None:
-            base_device = torch.device("cpu")
 
         modality_tensor = (
             torch.cat(mod, 0).unsqueeze(0) if mod else torch.zeros((1, 0), device=base_device, dtype=torch.long)
