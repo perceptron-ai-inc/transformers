@@ -951,11 +951,6 @@ class IsaacConfig(PretrainedConfig):
         return output
 
 
-# ============================================================================
-# Processor
-# ============================================================================
-
-
 class IsaacProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
     image_processor_class = ("IsaacImageProcessorFast",)
@@ -1223,13 +1218,9 @@ class IsaacModel(Qwen3PreTrainedModel):
         text_cfg_source = config.text_config
         text_cfg = copy.deepcopy(text_cfg_source)
         self.text_model = AutoModel.from_config(text_cfg)
-        # Ensure downstream callers observe the composed config
-        self.text_model.config = config
+        self.text_model.config = config  # Ensure downstream callers observe the composed config
 
         self.rotary_emb = IsaacRotaryEmbedding(config, device=self.device)
-
-        if config.vision_config is None:
-            raise ValueError("IsaacConfig should always have vision_config")
 
         self.vision_embedding = IsaacVisionEmbedding(config)
         self.vision_embedding._supports_sdpa = True
@@ -1237,7 +1228,6 @@ class IsaacModel(Qwen3PreTrainedModel):
         self.vision_rescale_factor = config.vision_rescale_factor
         self.vision_token = config.vision_token
 
-        # Initialize weights and parallel plans (including tp_plan from the text model)
         self.post_init()
 
         # Respect config-specified gradient checkpointing
