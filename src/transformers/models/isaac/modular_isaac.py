@@ -1401,7 +1401,6 @@ class IsaacModel(Qwen3PreTrainedModel):
                 values from `ModalityType`. Automatically built from `packed_inputs` or treated as text-only when omitted.
         """
 
-        modality_tensor = None
         output_attentions = kwargs.pop("output_attentions", None)
 
         # Resolve the input source (prefer packed_inputs > ids > embeds).
@@ -1431,8 +1430,7 @@ class IsaacModel(Qwen3PreTrainedModel):
         if attention_mask is None:
             attention_mask = torch.ones((batch_size, seq_len), device=inputs_embeds.device, dtype=torch.long)
 
-        if modality_tensor is None and precomputed_modality is not None:
-            modality_tensor = precomputed_modality
+        modality_tensor = precomputed_modality
 
         # Prefer explicit position_ids, else packed position_ids (if any).
         position_arg = position_ids if position_ids is not None else precomputed_position_ids
