@@ -872,18 +872,13 @@ class IsaacModel(PreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | BaseModelOutputWithPast:
-        """
-        Forward pass with MRoPE position embeddings.
-
-        Computes position embeddings once and passes them through all layers.
-
-        Args:
-            packed_inputs (`dict`, *optional*):
-                Plain tensor payloads extracted from a TensorStream. When provided, it replaces the TensorStream path
-                and requires `input_ids` for text tokens (or `text_token_ids` so `input_ids` can be rebuilt).
-            modality_tensor (`torch.LongTensor`, *optional*):
-                Modality identifiers aligned with the embedded sequence, shaped `(batch_size, seq_len)` and containing
-                values from `ModalityType`. Automatically built from `packed_inputs` or treated as text-only when omitted.
+        r"""
+        modality_tensor (`torch.LongTensor`, *optional*):
+            Modality identifiers aligned with the embedded sequence, shaped `(batch_size, seq_len)` and containing
+            values from `ModalityType`. Automatically built from `packed_inputs` or treated as text-only when omitted.
+        packed_inputs (`dict`, *optional*):
+            Plain tensor payloads extracted from a TensorStream. When provided, it replaces the TensorStream path
+            and requires `input_ids` for text tokens (or `text_token_ids` so `input_ids` can be rebuilt).
         """
 
         output_attentions = kwargs.pop("output_attentions", None)
@@ -1255,18 +1250,17 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | CausalLMOutputWithPast:
-        """Run multimodal CausalLM forward, accepting packed vision/text inputs.
-
-        Args:
-            input_ids: Text token ids.
-            packed_inputs: Packed vision/text metadata and tensors from ``IsaacProcessor``.
-            attention_mask: Attention mask or mask dict; created if not provided.
-            position_ids: Optional 3D MRoPE positions; auto-derived when absent.
-            past_key_values: Cache for decoding.
-            inputs_embeds: Precomputed embeddings (bypass embedding layer).
-            labels: Target ids for computing language modeling loss.
-            use_cache: Whether to return caches.
-            cache_position: Positions for cache-aware generation.
+        r"""
+        packed_inputs (`dict`, *optional*):
+            Packed vision/text payload from ``IsaacProcessor`` containing modality ids, MRoPE position ids, and
+            vision patch tensors/grids (with optional offsets/lengths) used to rebuild embeddings.
+        attention_mask: Attention mask or mask dict; created if not provided.
+        position_ids: Optional 3D MRoPE positions; auto-derived when absent.
+        past_key_values: Cache for decoding.
+        inputs_embeds: Precomputed embeddings (bypass embedding layer).
+        labels: Target ids for computing language modeling loss.
+        use_cache: Whether to return caches.
+        cache_position: Positions for cache-aware generation.
 
         Returns:
             CausalLMOutputWithPast: logits, optional loss, caches, hidden states, attentions.

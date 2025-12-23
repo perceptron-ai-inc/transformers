@@ -43,12 +43,12 @@ class IsaacProcessor(ProcessorMixin):
     """Processor that pairs the Isaac image processor with the Qwen2 tokenizer.
 
     Args:
-        image_processor: Vision preprocessor (fast) used for patch extraction.
-        tokenizer: Qwen2 tokenizer instance.
-        vision_token (str, optional): Placeholder token marking image locations. Defaults to "<image>".
-        max_sequence_length (int, optional): Maximum combined text+vision tokens kept. Defaults to 16384.
-        rescale_factor (float, optional): Image rescale factor; defaults to 1/255.
-        config (IsaacConfig | dict, optional): If provided, overrides processor defaults from the model config.
+            image_processor (`<fill_type>`): <fill_docstring>
+            tokenizer (`<fill_type>`): <fill_docstring>
+            vision_token (str, optional, *optional*, defaults to `"<image>"`): Placeholder token marking image locations. Defaults to "<image>".
+            max_sequence_length (int, optional, *optional*, defaults to 16384): Maximum combined text+vision tokens kept. Defaults to 16384.
+            rescale_factor (float, optional, *optional*): Image rescale factor; defaults to 1/255.
+            config (IsaacConfig | dict, optional, *optional*): If provided, overrides processor defaults from the model config.
 
     Returns:
         BatchFeature: Contains ``input_ids`` and ``packed_inputs`` (patch tensors, grids, offsets, lengths, modality, positions).

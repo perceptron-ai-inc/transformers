@@ -1555,7 +1555,9 @@ class IsaacForConditionalGeneration(Qwen3ForCausalLM, GenerationMixin):
 
         Args:
             input_ids: Text token ids.
-            packed_inputs: Packed vision/text metadata and tensors from ``IsaacProcessor``.
+            packed_inputs (`dict`, *optional*):
+                Packed vision/text payload from ``IsaacProcessor`` containing modality ids, MRoPE position ids, and
+                vision patch tensors/grids (with optional offsets/lengths) used to rebuild embeddings.
             attention_mask: Attention mask or mask dict; created if not provided.
             position_ids: Optional 3D MRoPE positions; auto-derived when absent.
             past_key_values: Cache for decoding.
