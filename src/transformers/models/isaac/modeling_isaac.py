@@ -1183,21 +1183,6 @@ class IsaacPreTrainedModel(PreTrainedModel):
     }
 
 
-def compute_position_ids_input_ids(input_ids: torch.Tensor) -> torch.Tensor:
-    r"""Create 3D positional indices for token input.
-
-    Args:
-        input_ids (`torch.Tensor`):
-            Tensor of shape `(batch_size, seq_len)` containing token ids.
-
-    Returns:
-        `torch.Tensor`: Positional indices with shape `(batch_size, seq_len, 3)` where each channel duplicates the
-        1D position so it can be consumed by the 3-axis MRoPE rotary embedding.
-    """
-    _, seq_length = input_ids.shape
-    return torch.arange(seq_length, device=input_ids.device)[None, :, None].expand(input_ids.size(0), -1, 3)
-
-
 @auto_docstring
 class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
     """Isaac multimodal model for conditional generation."""
@@ -1269,11 +1254,15 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
 
         elif position_ids is None and cache_position is not None and self.rope_deltas is not None:
             if input_ids is not None:
-                base_position_ids = compute_position_ids_input_ids(input_ids)
+                base_position_ids = torch.arange(input_ids.size(1), device=input_ids.device)[None, :, None].expand(
+                    input_ids.size(0), -1, 3
+                )
             else:
                 batch_size, seq_len = inputs_embeds.shape[:2]
                 dummy_ids = torch.zeros((batch_size, seq_len), device=inputs_embeds.device, dtype=torch.long)
-                base_position_ids = compute_position_ids_input_ids(dummy_ids)
+                base_position_ids = torch.arange(dummy_ids.size(1), device=dummy_ids.device)[None, :, None].expand(
+                    dummy_ids.size(0), -1, 3
+                )
 
             rope_delta = (cache_position[0] + self.rope_deltas).to(base_position_ids.device)
             if not isinstance(rope_delta, int):
@@ -1334,7 +1323,9 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         """
 
         if position_ids is None:
-            pos_3d = compute_position_ids_input_ids(input_ids)
+            pos_3d = torch.arange(input_ids.size(1), device=input_ids.device)[None, :, None].expand(
+                input_ids.size(0), -1, 3
+            )
         else:
             pos_3d = position_ids
             if pos_3d.ndim != 3 or pos_3d.size(-1) != 3:
