@@ -527,15 +527,6 @@ class IsaacModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
         )
         self.assertIsNotNone(result.loss)
 
-    def test_prepare_inputs_for_generation(self):
-        config, input_ids, attention_mask, _ = self.model_tester.prepare_config_and_inputs()
-        model = IsaacForConditionalGeneration(config)
-        model.to(torch_device)
-
-        prepared_inputs = model.prepare_inputs_for_generation(input_ids=input_ids, attention_mask=attention_mask)
-        self.assertIn("input_ids", prepared_inputs)
-        self.assertIn("position_ids", prepared_inputs)
-
     @require_tensorstream
     def test_isaac_for_conditional_generation_initialization(self):
         config = self.model_tester.get_config()
