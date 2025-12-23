@@ -1271,7 +1271,6 @@ class IsaacModel(Qwen3PreTrainedModel):
         - vision_token_lengths: (num_images,) surviving virtual token lengths per image (optional)
         """
         modality = packed_inputs["modality_tensor"].to(device=input_ids.device, dtype=torch.long)
-
         embeds = self.text_model.embed_tokens(input_ids)
 
         vision_patches = packed_inputs.get("vision_patches")
@@ -1284,12 +1283,10 @@ class IsaacModel(Qwen3PreTrainedModel):
         # per-image token counts AFTER pixel-shuffle
         s = int(self.config.vision_config.pixel_shuffle_scale_factor)
         sizes = token_grids.prod(-1).div(s * s, rounding_mode="floor").tolist()
-
         offsets = packed_inputs.get("vision_token_offsets")
         lengths = packed_inputs.get("vision_token_lengths")
 
         if offsets is not None or lengths is not None:
-            # defaults: offset=0, length=size
             off = (
                 offsets.to(device=vision.device, dtype=torch.long)
                 if offsets is not None
