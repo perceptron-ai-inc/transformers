@@ -824,39 +824,6 @@ class IsaacModel(PreTrainedModel):
 
         return embeds, modality
 
-    def _prepare_position_and_modality(
-        self,
-        position_ids: Optional[torch.LongTensor],
-        modality_tensor: Optional[torch.LongTensor],
-        inputs_embeds: torch.Tensor,
-        cache_position: torch.LongTensor,
-    ) -> tuple[torch.LongTensor, torch.LongTensor, torch.LongTensor, torch.Tensor, torch.Tensor]:
-        device = inputs_embeds.device
-        batch_size, seq_len = inputs_embeds.shape[:2]
-
-        if modality_tensor is None:
-            modality_tensor = torch.full(
-                (batch_size, seq_len), ModalityType.text.value, device=device, dtype=torch.long
-            )
-        else:
-            modality_tensor = modality_tensor.to(device=device, dtype=torch.long)
-
-        if position_ids is None:
-            position_ids = cache_position.view(1, -1).expand(batch_size, -1)
-
-        position_ids = position_ids.to(device=device)
-        if position_ids.ndim == 2:
-            position_ids = position_ids.unsqueeze(-1).expand(-1, -1, 3)
-        if position_ids.shape[1] != seq_len:
-            start_positions = position_ids[:, :1, 0]
-            position_ids = torch.arange(seq_len, device=device).view(1, -1) + start_positions
-            position_ids = position_ids.unsqueeze(-1).expand(-1, -1, 3)
-
-        cos, sin = self.rotary_emb(position_ids, modality_tensor, hidden_states=inputs_embeds)
-
-        decoder_position_ids = position_ids[..., 0] if position_ids.ndim == 3 else position_ids
-        return position_ids, modality_tensor, decoder_position_ids, cos, sin
-
     @auto_docstring
     @check_model_inputs
     def forward(
@@ -899,6 +866,7 @@ class IsaacModel(PreTrainedModel):
         elif input_ids is not None:
             inputs_embeds = self.text_model.embed_tokens(input_ids)
 
+        device = inputs_embeds.device
         batch_size, seq_len = inputs_embeds.shape[:2]
 
         # Ensure cache exists when requested
@@ -908,21 +876,36 @@ class IsaacModel(PreTrainedModel):
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(past_seen_tokens, past_seen_tokens + seq_len, device=inputs_embeds.device)
+            cache_position = torch.arange(past_seen_tokens, past_seen_tokens + seq_len, device=device)
 
         if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_len), device=inputs_embeds.device, dtype=torch.long)
+            attention_mask = torch.ones((batch_size, seq_len), device=device, dtype=torch.long)
 
-        position_arg = position_ids if position_ids is not None else precomputed_position_ids
-        position_ids, modality_tensor, decoder_position_ids, cos, sin = self._prepare_position_and_modality(
-            position_ids=position_arg,
-            modality_tensor=modality_tensor,
-            inputs_embeds=inputs_embeds,
-            cache_position=cache_position,
-        )
+        position_ids = position_ids if position_ids is not None else precomputed_position_ids
+        if position_ids is None:
+            position_ids = cache_position.view(1, -1).expand(batch_size, -1)
 
-        # Prepare attention mask
-        if not isinstance(attention_mask, dict):
+        if modality_tensor is None:
+            modality_tensor = torch.full(
+                (batch_size, seq_len), ModalityType.text.value, device=device, dtype=torch.long
+            )
+        else:
+            modality_tensor = modality_tensor.to(device=device, dtype=torch.long)
+
+        position_ids = position_ids.to(device=device)
+
+        if position_ids.ndim == 2:
+            position_ids = position_ids.unsqueeze(-1).expand(-1, -1, 3)
+        if position_ids.shape[1] != seq_len:
+            start_positions = position_ids[:, :1, 0]
+            position_ids = torch.arange(seq_len, device=device).view(1, -1) + start_positions
+            position_ids = position_ids.unsqueeze(-1).expand(-1, -1, 3)
+
+        cos, sin = self.rotary_emb(position_ids, modality_tensor, hidden_states=inputs_embeds)
+
+        decoder_position_ids = position_ids[..., 0] if position_ids.ndim == 3 else position_ids
+
+        if not isinstance(attention_mask, dict):  # Prepare attention mask
             attention_mask = create_masks_for_generate(
                 config=self.config,
                 input_embeds=inputs_embeds,
