@@ -1382,12 +1382,11 @@ class IsaacModel(Qwen3PreTrainedModel):
         output_attentions = kwargs.pop("output_attentions", None)
 
         # Resolve the input source (prefer packed_inputs > ids > embeds).
-        precomputed_modality: Optional[torch.Tensor] = None
+        modality_tensor: Optional[torch.Tensor] = None
         precomputed_position_ids: Optional[torch.Tensor] = None
 
         if packed_inputs is not None:
-            # At this point input_ids is guaranteed to exist (either provided or rebuilt).
-            inputs_embeds, precomputed_modality = self.embed_packed_inputs(input_ids, packed_inputs)
+            inputs_embeds, modality_tensor = self.embed_packed_inputs(input_ids, packed_inputs)
             precomputed_position_ids = packed_inputs.get("position_ids")
             if precomputed_position_ids is not None:
                 precomputed_position_ids = precomputed_position_ids.to(inputs_embeds.device)
@@ -1408,11 +1407,7 @@ class IsaacModel(Qwen3PreTrainedModel):
         if attention_mask is None:
             attention_mask = torch.ones((batch_size, seq_len), device=inputs_embeds.device, dtype=torch.long)
 
-        modality_tensor = precomputed_modality
-
-        # Prefer explicit position_ids, else packed position_ids (if any).
         position_arg = position_ids if position_ids is not None else precomputed_position_ids
-
         position_ids, modality_tensor, decoder_position_ids, cos, sin = self._prepare_position_and_modality(
             position_ids=position_arg,
             modality_tensor=modality_tensor,

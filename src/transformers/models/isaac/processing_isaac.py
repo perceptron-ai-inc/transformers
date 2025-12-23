@@ -39,11 +39,6 @@ else:
     Image = None
 
 
-# ============================================================================
-# Processor
-# ============================================================================
-
-
 class IsaacProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
     image_processor_class = ("IsaacImageProcessorFast",)

@@ -728,13 +728,9 @@ class IsaacModel(PreTrainedModel):
         text_cfg_source = config.text_config
         text_cfg = copy.deepcopy(text_cfg_source)
         self.text_model = AutoModel.from_config(text_cfg)
-        # Ensure downstream callers observe the composed config
-        self.text_model.config = config
+        self.text_model.config = config  # Ensure downstream callers observe the composed config
 
         self.rotary_emb = IsaacRotaryEmbedding(config, device=self.device)
-
-        if config.vision_config is None:
-            raise ValueError("IsaacConfig should always have vision_config")
 
         self.vision_embedding = IsaacVisionEmbedding(config)
         self.vision_embedding._supports_sdpa = True
@@ -742,7 +738,6 @@ class IsaacModel(PreTrainedModel):
         self.vision_rescale_factor = config.vision_rescale_factor
         self.vision_token = config.vision_token
 
-        # Initialize weights and parallel plans (including tp_plan from the text model)
         self.post_init()
 
         # Respect config-specified gradient checkpointing
@@ -897,12 +892,11 @@ class IsaacModel(PreTrainedModel):
         output_attentions = kwargs.pop("output_attentions", None)
 
         # Resolve the input source (prefer packed_inputs > ids > embeds).
-        precomputed_modality: Optional[torch.Tensor] = None
+        modality_tensor: Optional[torch.Tensor] = None
         precomputed_position_ids: Optional[torch.Tensor] = None
 
         if packed_inputs is not None:
-            # At this point input_ids is guaranteed to exist (either provided or rebuilt).
-            inputs_embeds, precomputed_modality = self.embed_packed_inputs(input_ids, packed_inputs)
+            inputs_embeds, modality_tensor = self.embed_packed_inputs(input_ids, packed_inputs)
             precomputed_position_ids = packed_inputs.get("position_ids")
             if precomputed_position_ids is not None:
                 precomputed_position_ids = precomputed_position_ids.to(inputs_embeds.device)
@@ -923,11 +917,7 @@ class IsaacModel(PreTrainedModel):
         if attention_mask is None:
             attention_mask = torch.ones((batch_size, seq_len), device=inputs_embeds.device, dtype=torch.long)
 
-        modality_tensor = precomputed_modality
-
-        # Prefer explicit position_ids, else packed position_ids (if any).
         position_arg = position_ids if position_ids is not None else precomputed_position_ids
-
         position_ids, modality_tensor, decoder_position_ids, cos, sin = self._prepare_position_and_modality(
             position_ids=position_arg,
             modality_tensor=modality_tensor,
