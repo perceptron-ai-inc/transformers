@@ -119,7 +119,8 @@ def get_image_size_for_max_num_patches(
     num_patches = (adjusted_height / patch_size) * (adjusted_width / patch_size)
 
     if min_num_patches is not None and num_patches < min_num_patches:
-        # Scale up
+        # Scale up via binary search to satisfy the minimum patch budget while
+        # preserving divisibility by patch_size * pixel_shuffle_scale.
         scale_min, scale_max = 1.0, 100.0
         while (scale_max - scale_min) >= eps:
             scale = (scale_min + scale_max) / 2
@@ -234,7 +235,9 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
 
         for shape, stacked_images in grouped_images.items():
             if stacked_images.ndim != 4:
-                raise ValueError("Expected batched channel-first image tensors.")
+                raise ValueError(
+                    f"Expected images shaped as (batch, channels, height, width); got shape {tuple(stacked_images.shape)}."
+                )
 
             batch_size, channels, original_height, original_width = stacked_images.shape
 
@@ -243,7 +246,9 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
                 channels = 3
 
             if original_height * original_width > self.MAX_PIXELS:
-                raise ValueError(f"Image (w={original_width}, h={original_height}) > MAX=`{self.MAX_PIXELS}`")
+                raise ValueError(
+                    f"Image area {original_height * original_width} (h={original_height}, w={original_width}) exceeds MAX_PIXELS={self.MAX_PIXELS}; enable resizing or provide smaller inputs."
+                )
 
             target_height, target_width = get_image_size_for_max_num_patches(
                 original_height,
@@ -263,7 +268,9 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
                 )
             else:
                 if ((original_height % patch_size) != 0) or ((original_width % patch_size) != 0):
-                    raise ValueError("Image dimensions must be divisible by patch_size when resize is disabled.")
+                    raise ValueError(
+                        f"Image dimensions (h={original_height}, w={original_width}) must be divisible by patch_size={patch_size} when resize is disabled; enable resizing or adjust the input resolution."
+                    )
                 image_batch = stacked_images
                 target_height, target_width = original_height, original_width
 
@@ -302,7 +309,7 @@ class IsaacImageProcessorFast(BaseImageProcessorFast):
 
             if (height_tokens % pixel_shuffle_scale) or (width_tokens % pixel_shuffle_scale):
                 raise ValueError(
-                    "Spatial dimensions must be divisible by pixel_shuffle_scale when pixel shuffle is enabled."
+                    f"Token grid (h={height_tokens}, w={width_tokens}) must be divisible by pixel_shuffle_scale={pixel_shuffle_scale}; adjust resize/patch parameters or disable pixel shuffle."
                 )
             virtual_height = height_tokens // pixel_shuffle_scale
             virtual_width = width_tokens // pixel_shuffle_scale

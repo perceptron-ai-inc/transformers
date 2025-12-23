@@ -40,6 +40,20 @@ else:
 
 
 class IsaacProcessor(ProcessorMixin):
+    """Processor that pairs the Isaac image processor with the Qwen2 tokenizer.
+
+    Args:
+        image_processor: Vision preprocessor (fast) used for patch extraction.
+        tokenizer: Qwen2 tokenizer instance.
+        vision_token (str, optional): Placeholder token marking image locations. Defaults to "<image>".
+        max_sequence_length (int, optional): Maximum combined text+vision tokens kept. Defaults to 16384.
+        rescale_factor (float, optional): Image rescale factor; defaults to 1/255.
+        config (IsaacConfig | dict, optional): If provided, overrides processor defaults from the model config.
+
+    Returns:
+        BatchFeature: Contains ``input_ids`` and ``packed_inputs`` (patch tensors, grids, offsets, lengths, modality, positions).
+    """
+
     attributes = ["image_processor", "tokenizer"]
     image_processor_class = ("IsaacImageProcessorFast",)
     tokenizer_class = ("Qwen2Tokenizer",)
@@ -52,7 +66,7 @@ class IsaacProcessor(ProcessorMixin):
         vision_token: str = "<image>",
         max_sequence_length: int = 16384,
         rescale_factor: Optional[float] = None,
-        config: Optional[Union["IsaacConfig", dict]] = None,
+        config: Optional[Union[IsaacConfig, dict]] = None,
     ) -> None:
         if isinstance(config, dict):
             config = IsaacConfig(**config)
@@ -75,36 +89,48 @@ class IsaacProcessor(ProcessorMixin):
         self.vision_token = vision_token
         self.max_sequence_length = max_sequence_length
 
-    def _pack_single(self, text: str, images: Optional[list["Image"]]) -> dict[str, Optional["torch.Tensor"]]:
+    def _pack_single(self, text: str, images: Optional[list[Image]]) -> dict[str, Optional[torch.Tensor]]:
         # Parse by vision_token; interleave text segments and image segments.
-        segs = text.split(self.vision_token)
-        n_img = len(segs) - 1
-        if n_img and (images is None or len(images) != n_img):
+        segments = text.split(self.vision_token)
+        num_images = len(segments) - 1
+        if num_images and (images is None or len(images) != num_images):
             raise ValueError(
-                f"Number of {self.vision_token} tokens ({n_img}) must match images ({0 if images is None else len(images)})."
+                f"Expected one image per '{self.vision_token}' token: found {num_images} token(s) but received {0 if images is None else len(images)} image(s)."
             )
 
         items: list[dict[str, Any]] = []
         total = 0
 
-        for i, s in enumerate(segs):
-            if s:
-                tok = self.tokenizer.encode(s, add_special_tokens=False, return_tensors="pt").squeeze(0).to(torch.long)
-                L = int(tok.numel())
-                items.append({"t": "text", "L": L, "tok": tok})
-                total += L
+        for index, segment in enumerate(segments):
+            if segment:
+                tok = (
+                    self.tokenizer.encode(segment, add_special_tokens=False, return_tensors="pt")
+                    .squeeze(0)
+                    .to(torch.long)
+                )
+                segment_length = int(tok.numel())
+                items.append({"type": "text", "segment_length": segment_length, "tok": tok})
+                total += segment_length
 
-            if i < n_img:
-                feat = self.image_processor(images=images[i], return_tensors=TensorType.PYTORCH)
+            if index < num_images:
+                feat = self.image_processor(images=images[index], return_tensors=TensorType.PYTORCH)
                 patches = feat["patches"][0].reshape(-1, feat["patches"].shape[-1])
 
-                v = feat["virtual_pixel_size"][0].to(torch.long).tolist()
-                r = feat["real_pixel_size"][0].to(torch.long).tolist()
-                dims = tuple((v + [1, 1, 1])[:3])  # (T,H,W) in virtual space
-                L = int(dims[0] * dims[1] * dims[2])
+                virtual_pixel_size = feat["virtual_pixel_size"][0].to(torch.long).tolist()
+                real_pixel_size = feat["real_pixel_size"][0].to(torch.long).tolist()
+                dims = tuple((virtual_pixel_size + [1, 1, 1])[:3])  # (T,H,W) in virtual space
+                segment_length = int(dims[0] * dims[1] * dims[2])
 
-                items.append({"t": "image", "L": L, "dims": dims, "patches": patches, "grid": (int(r[1]), int(r[2]))})
-                total += L
+                items.append(
+                    {
+                        "type": "image",
+                        "segment_length": segment_length,
+                        "dims": dims,
+                        "patches": patches,
+                        "grid": (int(real_pixel_size[1]), int(real_pixel_size[2])),
+                    }
+                )
+                total += segment_length
 
         # Tail crop window.
         start = max(0, total - self.max_sequence_length)
@@ -112,71 +138,92 @@ class IsaacProcessor(ProcessorMixin):
 
         fill_value = 151643
         base_device: Optional[torch.device] = None
-        pos, mod, ids = [], [], []
-        vpatches, grids, offs, lens = [], [], [], []
+        position_ids, modality, input_ids = [], [], []
+        vpatches, grids, vision_token_offsets, vision_token_lengths = [], [], [], []
 
-        cursor = 0
-        t0 = 0
+        global_offset = 0
+        position_offset = 0
 
-        for it in items:
-            L = int(it["L"])
-            a = max(start, cursor)
-            b = min(end, cursor + L)
-            keep = b > a
+        for item in items:
+            segment_length = int(item["segment_length"])
+            current_window_start = max(start, global_offset)
+            current_window_end = min(end, global_offset + segment_length)
+            has_overlap = current_window_end > current_window_start
 
-            if keep and base_device is None:
-                base_device = it["patches"].device if it["t"] == "image" else it["tok"].device
+            if has_overlap and base_device is None:
+                base_device = item["patches"].device if item["type"] == "image" else item["tok"].device
 
-            if keep:
-                lo = int(a - cursor)
-                hi = int(b - cursor)
-                k = torch.arange(lo, hi, device=base_device, dtype=torch.long)
-                n = hi - lo
+            if has_overlap:
+                segment_local_start = int(current_window_start - global_offset)
+                segment_local_end = int(current_window_end - global_offset)
+                segment_local_indices = torch.arange(
+                    segment_local_start, segment_local_end, device=base_device, dtype=torch.long
+                )
+                segment_kept_length = segment_local_end - segment_local_start
 
-                if it["t"] == "text":
-                    t = k + t0
-                    z = torch.zeros_like(t)
-                    pos.append(torch.stack((t, z, z), -1))
-                    mod.append(torch.full((n,), ModalityType.text.value, device=base_device, dtype=torch.long))
-                    ids.append(it["tok"].to(base_device)[lo:hi])
-                    t0 += L
+                if item["type"] == "text":
+                    slice_index = segment_local_indices + position_offset
+                    zero_axis_pad = torch.zeros_like(slice_index)
+                    position_ids.append(torch.stack((slice_index, zero_axis_pad, zero_axis_pad), -1))
+                    modality.append(
+                        torch.full(
+                            (segment_kept_length,), ModalityType.text.value, device=base_device, dtype=torch.long
+                        )
+                    )
+                    input_ids.append(item["tok"].to(base_device)[segment_local_start:segment_local_end])
+                    position_offset += segment_length
                 else:
-                    T, H, W = it["dims"]
-                    hw = H * W
-                    t = (k // hw) + t0
-                    rem = k % hw
-                    h = rem // W
-                    w = rem % W
-                    pos.append(torch.stack((t, h, w), -1))
-                    mod.append(torch.full((n,), ModalityType.image.value, device=base_device, dtype=torch.long))
-                    ids.append(torch.full((n,), fill_value, device=base_device, dtype=torch.long))
+                    num_pos_slices, grid_height_tokens, grid_width_tokens = item["dims"]
+                    hw = grid_height_tokens * grid_width_tokens
+                    slice_index = (segment_local_indices // hw) + position_offset
+                    rem = segment_local_indices % hw
+                    row_index = rem // grid_width_tokens
+                    col_index = rem % grid_width_tokens
+                    position_ids.append(torch.stack((slice_index, row_index, col_index), -1))
+                    modality.append(
+                        torch.full(
+                            (segment_kept_length,), ModalityType.image.value, device=base_device, dtype=torch.long
+                        )
+                    )
+                    input_ids.append(
+                        torch.full((segment_kept_length,), fill_value, device=base_device, dtype=torch.long)
+                    )
 
-                    vpatches.append(it["patches"].to(base_device))  # full patches; slice later via offsets/lengths
-                    grids.append(it["grid"])
-                    offs.append(lo)
-                    lens.append(n)
+                    vpatches.append(item["patches"].to(base_device))  # full patches; slice later via offsets/lengths
+                    # Record per-image slice boundaries so we can drop cropped virtual tokens
+                    # after pixel shuffle without re-packing the entire vision stream.
+                    grids.append(item["grid"])
+                    vision_token_offsets.append(segment_local_start)
+                    vision_token_lengths.append(segment_kept_length)
 
-                    t0 += int(T)
+                    position_offset += int(num_pos_slices)
+
             else:
-                t0 += L if it["t"] == "text" else int(it["dims"][0])
+                position_offset += segment_length if item["type"] == "text" else int(item["dims"][0])
 
-            cursor += L
+            global_offset += segment_length
 
         modality_tensor = (
-            torch.cat(mod, 0).unsqueeze(0) if mod else torch.zeros((1, 0), device=base_device, dtype=torch.long)
+            torch.cat(modality, 0).unsqueeze(0)
+            if modality
+            else torch.zeros((1, 0), device=base_device, dtype=torch.long)
         )
         position_ids = (
-            torch.cat(pos, 0).unsqueeze(0) if pos else torch.zeros((1, 0, 3), device=base_device, dtype=torch.long)
+            torch.cat(position_ids, 0).unsqueeze(0)
+            if position_ids
+            else torch.zeros((1, 0, 3), device=base_device, dtype=torch.long)
         )
         input_ids = (
-            torch.cat(ids, 0).unsqueeze(0) if ids else torch.zeros((1, 0), device=base_device, dtype=torch.long)
+            torch.cat(input_ids, 0).unsqueeze(0)
+            if input_ids
+            else torch.zeros((1, 0), device=base_device, dtype=torch.long)
         )
 
         if vpatches:
             vision_patches = torch.cat(vpatches, 0)
             vision_token_grids = torch.tensor(grids, device=base_device, dtype=torch.long)
-            vision_token_offsets = torch.tensor(offs, device=base_device, dtype=torch.long)
-            vision_token_lengths = torch.tensor(lens, device=base_device, dtype=torch.long)
+            vision_token_offsets = torch.tensor(vision_token_offsets, device=base_device, dtype=torch.long)
+            vision_token_lengths = torch.tensor(vision_token_lengths, device=base_device, dtype=torch.long)
         else:
             vision_patches = vision_token_grids = vision_token_offsets = vision_token_lengths = None
 
@@ -193,13 +240,15 @@ class IsaacProcessor(ProcessorMixin):
     def __call__(
         self,
         text: Union[str, list[str]],
-        images: Optional[Union["Image", list["Image"]]] = None,
+        images: Optional[Union[Image, list[Image]]] = None,
         return_tensors: Optional[Union[str, TensorType]] = TensorType.PYTORCH,
         **kwargs,
     ) -> BatchFeature:
         texts = [text] if isinstance(text, str) else text
         if len(texts) != 1:
-            raise ValueError("IsaacProcessor currently supports batch_size=1")
+            raise ValueError(
+                f"IsaacProcessor currently supports batch_size=1; received {len(texts)} text prompts. Split the batch and call the processor per sample."
+            )
 
         images_list = None
         if images is not None:
@@ -207,7 +256,7 @@ class IsaacProcessor(ProcessorMixin):
             n_tok = texts[0].count(self.vision_token)
             if n_tok != len(images_list):
                 raise ValueError(
-                    f"Number of {self.vision_token} tokens in text ({n_tok}) must match number of images ({len(images_list)})"
+                    f"Expected {len(images_list)} occurrences of '{self.vision_token}' (one per provided image), but found {n_tok} in the text."
                 )
 
         packed = self._pack_single(texts[0], images_list)

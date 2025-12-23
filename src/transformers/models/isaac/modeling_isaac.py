@@ -156,6 +156,7 @@ class IsaacVisionEmbeddings(nn.Module):
 
         return resulted_positional_embeddings
 
+    @check_model_inputs
     def forward(self, seq_patches: torch.Tensor, spatial_shapes: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -419,11 +420,11 @@ def create_document_attention_mask(
     Returns None if cu_seqlens is missing/degenerate.
     """
     if cu_seqlens is None or cu_seqlens.numel() < 2:
-        return None
+        return None  # Degenerate input: nothing to mask
 
     seq_sizes = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
     if seq_sizes.numel() == 0 or int(seq_sizes.sum()) == 0:
-        return None
+        return None  # All-empty segments produce no attention blocks
 
     seg_ids = torch.repeat_interleave(
         torch.arange(seq_sizes.numel(), device=cu_seqlens.device),
@@ -528,7 +529,9 @@ def pixel_shuffle_varlen(
     return_with_batch_dim = x.dim() == 3
     if return_with_batch_dim:
         if x.size(0) != 1:
-            raise AssertionError("Packed sequence is expected to have batch_size == 1")
+            raise ValueError(
+                f"Packed vision sequences expect a singleton batch dimension; received batch_size={x.size(0)}."
+            )
         embeddings = x.squeeze(0)  # (seq, embed)
     else:
         embeddings = x  # (seq, embed)
@@ -539,7 +542,8 @@ def pixel_shuffle_varlen(
     # Calculate seq_sizes from token_grids
     seq_sizes = torch.prod(token_grids, dim=-1)
 
-    # Build index map and gather in one go
+    # Build a single gather index so pixel shuffle works on the packed stream
+    # without unpacking per-image grids.
     gather_idx = create_pixel_shuffle_index_map(
         seq_sizes=seq_sizes,
         token_grids=token_grids,
@@ -560,6 +564,19 @@ def pixel_shuffle_varlen(
 
 
 class IsaacVisionTransformer(nn.Module):
+    """Vision tower that packs variable-resolution patches, applies varlen attention, and pixel-shuffles outputs.
+
+    Args:
+        config (IsaacVisionConfig): Vision configuration with pixel-shuffle and patching parameters.
+
+    Inputs:
+        packed_seq_patches (Tuple[Tensor, Tensor]): ``(patches, token_grids)`` where ``patches`` is a packed
+            patch sequence and ``token_grids`` holds per-image (H_tokens, W_tokens).
+
+    Returns:
+        torch.Tensor: Vision embeddings after encoder + pixel shuffle, shaped ``(seq_len, hidden_size * s^2)``.
+    """
+
     _supports_sdpa = True
 
     def __init__(self, config: IsaacVisionConfig):
@@ -577,7 +594,8 @@ class IsaacVisionTransformer(nn.Module):
         # Get embeddings from packed sequence
         hidden_states = self.embeddings(seq_patches, token_grids)
 
-        # Add a pseudo batch dimension for the encoder
+        # Add a pseudo batch dimension so we can reuse the batch-first encoder stack
+        # while still driving per-image cu_seqlens through the varlen attention path.
         hidden_states = hidden_states.unsqueeze(0)
 
         # Generate cumulative sequence lengths for variable-length attention
@@ -609,6 +627,8 @@ class IsaacVisionTransformer(nn.Module):
 
 
 class IsaacMultiModalProjector(nn.Module):
+    """Maps vision tower outputs to the text hidden size with a SiLU MLP."""
+
     def __init__(self, config: IsaacConfig):
         super().__init__()
         self.vision_hidden_size = config.vision_config.hidden_size * (
@@ -627,7 +647,17 @@ class IsaacMultiModalProjector(nn.Module):
 
 
 class IsaacVisionEmbedding(nn.Module):
-    """Vision embedding wrapper exposing tower and projector."""
+    """Wraps the vision tower plus projection into the text hidden size.
+
+    Args:
+        config (IsaacConfig): Composite config containing both vision and text settings.
+
+    Inputs:
+        vision_tokens (Tuple[Tensor, Tensor]): Packed vision patches and token grids.
+
+    Returns:
+        torch.Tensor: Projected vision embeddings aligned to the text hidden size.
+    """
 
     _supports_sdpa = True
 
@@ -693,6 +723,8 @@ class IsaacRotaryEmbedding(qwen2_5_vl_modeling.Qwen2_5_VLRotaryEmbedding):
             pos = position_ids.clone()
             not_spatial = modality_tensor != ModalityType.image.value
             if not_spatial.any():
+                # Collapse non-vision modalities to 1D positions so rotary embedding
+                # treats them like text tokens while keeping image tokens 3D.
                 data_1d = pos[not_spatial][..., 0].unsqueeze(-1)
                 pos[not_spatial] = data_1d.expand(-1, pos.shape[-1])
 
@@ -807,6 +839,8 @@ class IsaacModel(PreTrainedModel):
                 else torch.tensor(sizes, device=vision.device, dtype=torch.long)
             )
 
+            # Honor per-image crop windows (after pixel shuffle) so we only splice back
+            # the surviving virtual tokens instead of the full vision span.
             chunks = vision.split(sizes, dim=0)
             picked: list[torch.Tensor] = []
             for c, n, o, l in zip(chunks, sizes, off.tolist(), ln.tolist()):
@@ -1205,8 +1239,9 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @can_return_tuple
     @auto_docstring
+    @can_return_tuple
+    @check_model_inputs
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1220,28 +1255,22 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | CausalLMOutputWithPast:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+        """Run multimodal CausalLM forward, accepting packed vision/text inputs.
 
-        Example:
+        Args:
+            input_ids: Text token ids.
+            packed_inputs: Packed vision/text metadata and tensors from ``IsaacProcessor``.
+            attention_mask: Attention mask or mask dict; created if not provided.
+            position_ids: Optional 3D MRoPE positions; auto-derived when absent.
+            past_key_values: Cache for decoding.
+            inputs_embeds: Precomputed embeddings (bypass embedding layer).
+            labels: Target ids for computing language modeling loss.
+            use_cache: Whether to return caches.
+            cache_position: Positions for cache-aware generation.
 
-        ```python
-        >>> from transformers import AutoTokenizer, IsaacForConditionalGeneration
-
-        >>> model = IsaacForConditionalGeneration.from_pretrained("Qwen/Isaac-8B")
-        >>> tokenizer = AutoTokenizer.from_pretrained("Qwen/Isaac-8B")
-
-        >>> prompt = "Hey, are you conscious? Can you talk to me?"
-        >>> inputs = tokenizer(prompt, return_tensors="pt")
-
-        >>> # Generate
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
-        ```"""
+        Returns:
+            CausalLMOutputWithPast: logits, optional loss, caches, hidden states, attentions.
+        """
         output_attentions = kwargs.pop("output_attentions", None)
 
         if position_ids is None and packed_inputs is not None:
@@ -1329,7 +1358,9 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         else:
             pos_3d = position_ids
             if pos_3d.ndim != 3 or pos_3d.size(-1) != 3:
-                raise ValueError("`position_ids` must have shape (batch, seq_len, 3) for MRoPE")
+                raise ValueError(
+                    f"`position_ids` must have shape (batch, seq_len, 3) for MRoPE; got shape {tuple(pos_3d.shape)}."
+                )
 
         B, L, _ = pos_3d.shape
         m_per_batch = pos_3d.amax(dim=(1, 2))

@@ -1061,9 +1061,9 @@ class IsaacProcessor(ProcessorMixin):
                     .squeeze(0)
                     .to(torch.long)
                 )
-                L = int(tok.numel())
-                items.append({"t": "text", "L": L, "tok": tok})
-                total += L
+                segment_length = int(tok.numel())
+                items.append({"type": "text", "segment_length": segment_length, "tok": tok})
+                total += segment_length
 
             if index < num_images:
                 feat = self.image_processor(images=images[index], return_tensors=TensorType.PYTORCH)
@@ -1072,18 +1072,18 @@ class IsaacProcessor(ProcessorMixin):
                 virtual_pixel_size = feat["virtual_pixel_size"][0].to(torch.long).tolist()
                 real_pixel_size = feat["real_pixel_size"][0].to(torch.long).tolist()
                 dims = tuple((virtual_pixel_size + [1, 1, 1])[:3])  # (T,H,W) in virtual space
-                L = int(dims[0] * dims[1] * dims[2])
+                segment_length = int(dims[0] * dims[1] * dims[2])
 
                 items.append(
                     {
-                        "t": "image",
-                        "L": L,
+                        "type": "image",
+                        "segment_length": segment_length,
                         "dims": dims,
                         "patches": patches,
                         "grid": (int(real_pixel_size[1]), int(real_pixel_size[2])),
                     }
                 )
-                total += L
+                total += segment_length
 
         # Tail crop window.
         start = max(0, total - self.max_sequence_length)
@@ -1094,55 +1094,67 @@ class IsaacProcessor(ProcessorMixin):
         position_ids, modality, input_ids = [], [], []
         vpatches, grids, vision_token_offsets, vision_token_lengths = [], [], [], []
 
-        cursor = 0
-        t0 = 0
+        global_offset = 0
+        position_offset = 0
 
         for item in items:
-            L = int(item["L"])
-            a = max(start, cursor)
-            b = min(end, cursor + L)
-            keep = b > a
+            segment_length = int(item["segment_length"])
+            current_window_start = max(start, global_offset)
+            current_window_end = min(end, global_offset + segment_length)
+            has_overlap = current_window_end > current_window_start
 
-            if keep and base_device is None:
-                base_device = item["patches"].device if item["t"] == "image" else item["tok"].device
+            if has_overlap and base_device is None:
+                base_device = item["patches"].device if item["type"] == "image" else item["tok"].device
 
-            if keep:
-                lo = int(a - cursor)
-                hi = int(b - cursor)
-                k = torch.arange(lo, hi, device=base_device, dtype=torch.long)
-                n = hi - lo
+            if has_overlap:
+                segment_local_start = int(current_window_start - global_offset)
+                segment_local_end = int(current_window_end - global_offset)
+                segment_local_indices = torch.arange(
+                    segment_local_start, segment_local_end, device=base_device, dtype=torch.long
+                )
+                segment_kept_length = segment_local_end - segment_local_start
 
-                if item["t"] == "text":
-                    t = k + t0
-                    z = torch.zeros_like(t)
-                    position_ids.append(torch.stack((t, z, z), -1))
-                    modality.append(torch.full((n,), ModalityType.text.value, device=base_device, dtype=torch.long))
-                    input_ids.append(item["tok"].to(base_device)[lo:hi])
-                    t0 += L
+                if item["type"] == "text":
+                    slice_index = segment_local_indices + position_offset
+                    zero_axis_pad = torch.zeros_like(slice_index)
+                    position_ids.append(torch.stack((slice_index, zero_axis_pad, zero_axis_pad), -1))
+                    modality.append(
+                        torch.full(
+                            (segment_kept_length,), ModalityType.text.value, device=base_device, dtype=torch.long
+                        )
+                    )
+                    input_ids.append(item["tok"].to(base_device)[segment_local_start:segment_local_end])
+                    position_offset += segment_length
                 else:
-                    T, H, W = item["dims"]
-                    hw = H * W
-                    t = (k // hw) + t0
-                    rem = k % hw
-                    h = rem // W
-                    w = rem % W
-                    position_ids.append(torch.stack((t, h, w), -1))
-                    modality.append(torch.full((n,), ModalityType.image.value, device=base_device, dtype=torch.long))
-                    input_ids.append(torch.full((n,), fill_value, device=base_device, dtype=torch.long))
+                    num_pos_slices, grid_height_tokens, grid_width_tokens = item["dims"]
+                    hw = grid_height_tokens * grid_width_tokens
+                    slice_index = (segment_local_indices // hw) + position_offset
+                    rem = segment_local_indices % hw
+                    row_index = rem // grid_width_tokens
+                    col_index = rem % grid_width_tokens
+                    position_ids.append(torch.stack((slice_index, row_index, col_index), -1))
+                    modality.append(
+                        torch.full(
+                            (segment_kept_length,), ModalityType.image.value, device=base_device, dtype=torch.long
+                        )
+                    )
+                    input_ids.append(
+                        torch.full((segment_kept_length,), fill_value, device=base_device, dtype=torch.long)
+                    )
 
                     vpatches.append(item["patches"].to(base_device))  # full patches; slice later via offsets/lengths
                     # Record per-image slice boundaries so we can drop cropped virtual tokens
                     # after pixel shuffle without re-packing the entire vision stream.
                     grids.append(item["grid"])
-                    vision_token_offsets.append(lo)
-                    vision_token_lengths.append(n)
+                    vision_token_offsets.append(segment_local_start)
+                    vision_token_lengths.append(segment_kept_length)
 
-                    t0 += int(T)
+                    position_offset += int(num_pos_slices)
 
             else:
-                t0 += L if item["t"] == "text" else int(item["dims"][0])
+                position_offset += segment_length if item["type"] == "text" else int(item["dims"][0])
 
-            cursor += L
+            global_offset += segment_length
 
         modality_tensor = (
             torch.cat(modality, 0).unsqueeze(0)
