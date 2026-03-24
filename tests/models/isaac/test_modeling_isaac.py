@@ -439,7 +439,6 @@ class IsaacModelTester:
                 (self.batch_size, 1, num_image_patches), device=torch_device, dtype=torch.long
             ),
             "image_token_grids": torch.tensor([[[2, 2]]] * self.batch_size, device=torch_device, dtype=torch.long),
-            "image_attention_mask": torch.ones((self.batch_size, 1), device=torch_device, dtype=torch.long),
         }
         if labels is not None:
             inputs_dict["labels"] = labels
@@ -534,7 +533,6 @@ class IsaacModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
             dtype=torch.long,
         )
         image_patch_attention_mask = torch.ones((2, 2, 4), device=torch_device, dtype=torch.long)
-        image_attention_mask = torch.tensor([[1, 1], [1, 0]], device=torch_device, dtype=torch.long)
         image_token_offsets = torch.tensor([[1, 0], [2, 0]], device=torch_device, dtype=torch.long)
         image_token_lengths = torch.tensor([[2, 1], [1, 0]], device=torch_device, dtype=torch.long)
 
@@ -543,7 +541,6 @@ class IsaacModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
                 pixel_values=pixel_values,
                 image_token_grids=image_token_grids,
                 image_patch_attention_mask=image_patch_attention_mask,
-                image_attention_mask=image_attention_mask,
                 image_token_offsets=image_token_offsets,
                 image_token_lengths=image_token_lengths,
                 return_dict=True,
