@@ -26,17 +26,8 @@ from ... import initialization as init
 from ...configuration_utils import PretrainedConfig
 from ...feature_extraction_utils import BatchFeature
 from ...generation.utils import GenerationMixin
-from ...image_processing_utils_fast import (
-    ImagesKwargs,
-    SizeDict,
-    group_images_by_shape,
-    reorder_images,
-)
-from ...image_utils import (
-    ImageInput,
-    PILImageResampling,
-    make_nested_list_of_images,
-)
+from ...image_transforms import group_images_by_shape, reorder_images
+from ...image_utils import ImageInput, PILImageResampling, SizeDict, make_nested_list_of_images
 from ...masking_utils import create_bidirectional_mask
 from ...modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
 from ...modeling_utils import PreTrainedModel
@@ -45,7 +36,7 @@ from ...models.qwen3.modeling_qwen3 import (
     Qwen3ForCausalLM,
     Qwen3PreTrainedModel,
 )
-from ...processing_utils import ProcessingKwargs, ProcessorMixin, Unpack
+from ...processing_utils import ImagesKwargs, ProcessingKwargs, ProcessorMixin, Unpack
 from ...utils import TensorType, auto_docstring, torch_compilable_check
 from ...utils.constants import IMAGENET_STANDARD_MEAN as VISION_MEAN
 from ...utils.constants import IMAGENET_STANDARD_STD as VISION_STD
