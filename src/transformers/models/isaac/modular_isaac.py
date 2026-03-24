@@ -301,6 +301,9 @@ class IsaacImageProcessor(TorchvisionBackend):
         size: SizeDict,
         **kwargs,
     ) -> torch.Tensor:
+        if image.dtype == torch.uint8:
+            image = F.interpolate(image.float(), size=(size.height, size.width), mode="bilinear", align_corners=False)
+            return image.clamp(0, 255).round().to(torch.uint8)
         return F.interpolate(image, size=(size.height, size.width), mode="bilinear", align_corners=False)
 
     def pad(
