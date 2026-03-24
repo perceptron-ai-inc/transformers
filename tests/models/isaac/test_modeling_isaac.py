@@ -244,7 +244,7 @@ def to_model_multimodal_inputs(processor_output, device):
     keys = (
         "mm_token_type_ids",
         "vision_patches",
-        "vision_patch_attention_mask",
+        "image_patch_attention_mask",
         "vision_token_grids",
         "vision_token_offsets",
         "vision_token_lengths",
@@ -435,7 +435,7 @@ class IsaacModelTester:
             "pixel_values": torch.randn(
                 (self.batch_size, 1, num_image_patches, patch_dim), device=torch_device, dtype=torch.float32
             ),
-            "vision_patch_attention_mask": torch.ones(
+            "image_patch_attention_mask": torch.ones(
                 (self.batch_size, 1, num_image_patches), device=torch_device, dtype=torch.long
             ),
             "image_token_grids": torch.tensor([[[2, 2]]] * self.batch_size, device=torch_device, dtype=torch.long),
@@ -533,7 +533,7 @@ class IsaacModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
             device=torch_device,
             dtype=torch.long,
         )
-        vision_patch_attention_mask = torch.ones((2, 2, 4), device=torch_device, dtype=torch.long)
+        image_patch_attention_mask = torch.ones((2, 2, 4), device=torch_device, dtype=torch.long)
         image_attention_mask = torch.tensor([[1, 1], [1, 0]], device=torch_device, dtype=torch.long)
         image_token_offsets = torch.tensor([[1, 0], [2, 0]], device=torch_device, dtype=torch.long)
         image_token_lengths = torch.tensor([[2, 1], [1, 0]], device=torch_device, dtype=torch.long)
@@ -542,7 +542,7 @@ class IsaacModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
             outputs = model.get_image_features(
                 pixel_values=pixel_values,
                 image_token_grids=image_token_grids,
-                image_patch_attention_mask=vision_patch_attention_mask,
+                image_patch_attention_mask=image_patch_attention_mask,
                 image_attention_mask=image_attention_mask,
                 image_token_offsets=image_token_offsets,
                 image_token_lengths=image_token_lengths,
