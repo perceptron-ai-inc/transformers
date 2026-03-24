@@ -230,7 +230,6 @@ def create_isaac_processor(
     processor_params = {
         "vision_token": isaac_config.vision_token,
         "max_sequence_length": isaac_config.max_sequence_length,
-        "rescale_factor": isaac_config.vision_rescale_factor,
     }
 
     return IsaacProcessor(
