@@ -153,7 +153,3 @@ Set `expected="point"` to extract point annotations, or leave `expected=None` to
 ## IsaacImageProcessor
 
 [[autodoc]] IsaacImageProcessor
-
-## IsaacImageProcessorFast
-
-[[autodoc]] IsaacImageProcessorFast

@@ -37,7 +37,7 @@ if is_vision_available():
     from PIL import Image
 
 if is_torchvision_available():
-    from transformers.models.isaac.image_processing_isaac_fast import IsaacImageProcessorFast
+    from transformers.models.isaac.image_processing_isaac import IsaacImageProcessor
 
 
 def _make_dummy_image(size=(32, 32), color=(255, 0, 0)):
@@ -122,7 +122,7 @@ class IsaacImageProcessingTester:
 @require_vision
 class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
     image_processing_class = None
-    fast_image_processing_class = IsaacImageProcessorFast if is_torchvision_available() else None
+    fast_image_processing_class = IsaacImageProcessor if is_torchvision_available() else None
     test_slow_image_processor = False
 
     def setUp(self):
