@@ -25,8 +25,9 @@ from typing import Any
 
 from ... import TorchvisionBackend
 from ...feature_extraction_utils import BatchFeature
-from ...image_processing_utils_fast import ImagesKwargs, SizeDict, group_images_by_shape, reorder_images
-from ...image_utils import ImageInput, PILImageResampling, make_nested_list_of_images
+from ...image_transforms import group_images_by_shape, reorder_images
+from ...image_utils import ImageInput, PILImageResampling, SizeDict, make_nested_list_of_images
+from ...processing_utils import ImagesKwargs
 from ...utils import TensorType, auto_docstring
 from ...utils.constants import IMAGENET_STANDARD_MEAN as VISION_MEAN
 from ...utils.constants import IMAGENET_STANDARD_STD as VISION_STD

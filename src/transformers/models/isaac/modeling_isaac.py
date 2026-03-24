@@ -1170,7 +1170,7 @@ class IsaacModel(PreTrainedModel):
                 Padded per-image patch vectors with shape `(batch_size, max_images, max_patches, patch_dim)`.
             image_token_grids (`torch.Tensor`):
                 Per-image token grids shaped `(batch_size, max_images, 2)` with `(height, width)` entries.
-            image_patch_attention_mask (`torch.Tensor`, *optional*):
+            vision_patch_attention_mask (`torch.Tensor`, *optional*):
                 Mask for valid patch rows in `pixel_values`, shaped `(batch_size, max_images, max_patches)`.
             image_token_offsets (`torch.Tensor`, *optional*):
                 Start offsets inside each per-image embedding sequence, shaped `(batch_size, max_images)`.
@@ -1411,7 +1411,6 @@ class IsaacModel(PreTrainedModel):
         mm_token_type_ids: torch.LongTensor | None = None,
         vision_patches: torch.Tensor | None = None,
         vision_patch_attention_mask: torch.Tensor | None = None,
-        image_patch_attention_mask: torch.Tensor | None = None,
         vision_token_grids: torch.LongTensor | None = None,
         image_token_grids: torch.LongTensor | None = None,
         vision_token_offsets: torch.LongTensor | None = None,
@@ -1433,8 +1432,6 @@ class IsaacModel(PreTrainedModel):
                 Padded per-image patch vectors of shape `(batch_size, max_images, max_patches, patch_dim)`.
             vision_patch_attention_mask (`torch.LongTensor`, *optional*):
                 Mask for valid patch entries in `vision_patches`, shaped `(batch_size, max_images, max_patches)`.
-            image_patch_attention_mask (`torch.LongTensor`, *optional*):
-                Alias for `vision_patch_attention_mask`.
             vision_token_grids (`torch.LongTensor`, *optional*):
                 Per-image patch grids `(h, w)` with shape `(batch_size, max_images, 2)`.
             image_token_grids (`torch.LongTensor`, *optional*):
@@ -1542,7 +1539,6 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         vision_patches: torch.Tensor | None = None,
         pixel_values: torch.Tensor | None = None,
         vision_patch_attention_mask: torch.Tensor | None = None,
-        image_patch_attention_mask: torch.Tensor | None = None,
         vision_token_grids: torch.LongTensor | None = None,
         image_token_grids: torch.LongTensor | None = None,
         vision_token_offsets: torch.LongTensor | None = None,
@@ -1566,8 +1562,6 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
             Alias for `vision_patches` accepted by generic image-feature and generation helpers.
         vision_patch_attention_mask (`torch.LongTensor`, *optional*):
             Mask for valid patch entries in `vision_patches`, shaped `(batch_size, max_images, max_patches)`.
-        image_patch_attention_mask (`torch.LongTensor`, *optional*):
-            Alias for `vision_patch_attention_mask`.
         vision_token_grids (`torch.LongTensor`, *optional*):
             Per-image patch grids `(h, w)` with shape `(batch_size, max_images, 2)`.
         image_token_grids (`torch.LongTensor`, *optional*):
@@ -1620,7 +1614,6 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         vision_patches: torch.Tensor | None = None,
         pixel_values: torch.Tensor | None = None,
         vision_patch_attention_mask: torch.Tensor | None = None,
-        image_patch_attention_mask: torch.Tensor | None = None,
         vision_token_grids: torch.LongTensor | None = None,
         image_token_grids: torch.LongTensor | None = None,
         vision_token_offsets: torch.LongTensor | None = None,
@@ -1632,9 +1625,6 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         **kwargs,
     ) -> dict[str, Any]:
         if vision_patches is None:
-            vision_patch_attention_mask = (
-                image_patch_attention_mask if vision_patch_attention_mask is None else vision_patch_attention_mask
-            )
             vision_token_grids = image_token_grids if vision_token_grids is None else vision_token_grids
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
