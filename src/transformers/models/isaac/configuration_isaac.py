@@ -23,7 +23,6 @@ from huggingface_hub.dataclasses import strict
 
 from ...configuration_utils import PreTrainedConfig, PretrainedConfig
 from ...modeling_rope_utils import RopeParameters
-from ...utils import auto_docstring
 
 
 @auto_docstring(checkpoint="PerceptronAI/Isaac-0.1-Base")
