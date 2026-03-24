@@ -185,7 +185,7 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
         torch.testing.assert_close(eager_encoding["vision_token_grids"], compiled_encoding["vision_token_grids"])
 
     def test_image_processor_properties(self):
-        for image_processing_class in self.image_processor_list:
+        for image_processing_class in self.image_processing_classes.values():
             image_processor = image_processing_class(**self.image_processor_dict)
             self.assertTrue(hasattr(image_processor, "do_resize"))
             self.assertTrue(hasattr(image_processor, "do_rescale"))
@@ -200,7 +200,7 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
             self.assertTrue(hasattr(image_processor, "do_convert_rgb"))
 
     def test_call_pil(self):
-        for image_processing_class in self.image_processor_list:
+        for image_processing_class in self.image_processing_classes.values():
             image_processor = image_processing_class(**self.image_processor_dict)
             image_inputs = self.image_processor_tester.prepare_image_inputs(equal_resolution=False)
 
@@ -224,7 +224,7 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
             )
 
     def test_call_numpy(self):
-        for image_processing_class in self.image_processor_list:
+        for image_processing_class in self.image_processing_classes.values():
             image_processor = image_processing_class(**self.image_processor_dict)
             image_inputs = self.image_processor_tester.prepare_image_inputs(equal_resolution=False, numpify=True)
 
@@ -248,7 +248,7 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
             )
 
     def test_call_pytorch(self):
-        for image_processing_class in self.image_processor_list:
+        for image_processing_class in self.image_processing_classes.values():
             image_processor = image_processing_class(**self.image_processor_dict)
             image_inputs = self.image_processor_tester.prepare_image_inputs(equal_resolution=False, torchify=True)
 
@@ -276,7 +276,7 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
         pass
 
     def test_nested_multi_image_batch_preserves_grids_and_padding(self):
-        for image_processing_class in self.image_processor_list:
+        for image_processing_class in self.image_processing_classes.values():
             image_processor = image_processing_class(
                 **{
                     **self.image_processor_dict,
@@ -322,7 +322,7 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
             torch.testing.assert_close(encoding["vision_patch_attention_mask"].sum(dim=-1), expected_patch_counts)
 
     def test_all_empty_images_returns_zero_sized_tensors(self):
-        for image_processing_class in self.image_processor_list:
+        for image_processing_class in self.image_processing_classes.values():
             image_processor = image_processing_class(**self.image_processor_dict)
             encoding = image_processor([[], []], return_tensors="pt")
 
@@ -337,7 +337,7 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
             self.assertEqual(encoding["vision_token_grids"].dtype, torch.long)
 
     def test_do_resize_false_requires_patch_divisibility(self):
-        for image_processing_class in self.image_processor_list:
+        for image_processing_class in self.image_processing_classes.values():
             image_processor = image_processing_class(
                 **{
                     **self.image_processor_dict,
@@ -350,7 +350,7 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
                 image_processor([[_make_dummy_image(size=(31, 32))]], return_tensors="pt")
 
     def test_pixel_shuffle_scale_requires_divisible_token_grid(self):
-        for image_processing_class in self.image_processor_list:
+        for image_processing_class in self.image_processing_classes.values():
             image_processor = image_processing_class(
                 **{
                     **self.image_processor_dict,
@@ -364,7 +364,7 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
                 image_processor([[_make_dummy_image(size=(32, 16))]], return_tensors="pt")
 
     def test_cast_dtype_device(self):
-        for image_processing_class in self.image_processor_list:
+        for image_processing_class in self.image_processing_classes.values():
             image_processor = image_processing_class(**self.image_processor_dict)
             image_inputs = self.image_processor_tester.prepare_image_inputs(equal_resolution=False, torchify=True)
 
