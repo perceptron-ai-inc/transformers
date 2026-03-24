@@ -38,7 +38,7 @@ from transformers import (
 )
 from transformers.image_utils import load_image
 from transformers.masking_utils import create_bidirectional_mask
-from transformers.models.isaac.image_processing_isaac_fast import IsaacImageProcessor
+from transformers.models.isaac.image_processing_isaac import IsaacImageProcessor
 from transformers.models.isaac.modeling_isaac import (
     IsaacVisionAttention,
     IsaacVisionConfig,
@@ -1082,7 +1082,7 @@ class IsaacBoxPointingIntegrationTest(unittest.TestCase):
         self.checkpoint = _reference_checkpoint_or_skip()
         self.hf_config = IsaacConfig.from_pretrained(self.checkpoint, revision=MODEL_REVISION)
         self.tokenizer = Qwen2Tokenizer.from_pretrained(
-            self.checkpoint, trust_remote_code=True, use_fast=False, revision=MODEL_REVISION
+            self.checkpoint, trust_remote_code=False, use_fast=False, revision=MODEL_REVISION
         )
         self.processor = create_isaac_processor(self.tokenizer, self.hf_config)
         self.hf_config.vision_config._attn_implementation = "flash_attention_2"
