@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import copy
 import math
 import re
 from collections.abc import Sequence
@@ -892,7 +891,7 @@ class IsaacProcessor(ProcessorMixin):
             tokenizer_init_kwargs=self.tokenizer.init_kwargs,
             **kwargs,
         )
-        text_kwargs = copy.deepcopy(output_kwargs["text_kwargs"])
+        text_kwargs = output_kwargs["text_kwargs"]
         truncation = text_kwargs.pop("truncation", None)
         max_length = text_kwargs.pop("max_length", None)
         padding = text_kwargs.pop("padding", True)

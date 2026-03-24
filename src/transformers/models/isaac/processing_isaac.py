@@ -18,8 +18,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-import copy
 import re
 
 from ...feature_extraction_utils import BatchFeature
@@ -196,7 +194,7 @@ class IsaacProcessor(ProcessorMixin):
             tokenizer_init_kwargs=self.tokenizer.init_kwargs,
             **kwargs,
         )
-        text_kwargs = copy.deepcopy(output_kwargs["text_kwargs"])
+        text_kwargs = output_kwargs["text_kwargs"]
         truncation = text_kwargs.pop("truncation", None)
         max_length = text_kwargs.pop("max_length", None)
         padding = text_kwargs.pop("padding", True)
