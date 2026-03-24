@@ -820,7 +820,6 @@ class IsaacProcessor(ProcessorMixin):
         chat_template: str | dict[str, str] | None = None,
         vision_token: str = "<image>",
         max_sequence_length: int = 16384,
-        rescale_factor: float | None = None,
     ):
         """
         Args:
@@ -830,8 +829,6 @@ class IsaacProcessor(ProcessorMixin):
                 Placeholder token used inside text prompts to mark image positions.
             max_sequence_length (`int`, *optional*, defaults to 16384):
                 Maximum packed multimodal sequence length produced by the processor.
-            rescale_factor (`float`, *optional*):
-                Deprecated compatibility argument accepted for backward compatibility.
         """
         if chat_template is None:
             chat_template = getattr(tokenizer, "chat_template", None)
