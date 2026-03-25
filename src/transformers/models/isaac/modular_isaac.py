@@ -956,15 +956,11 @@ class IsaacProcessor(ProcessorMixin):
 
         kept_input_ids_per_sample: list[list[int] | None] = [None] * len(texts)
         overflow_input_ids_per_sample: list[list[list[int]]] = [[] for _ in texts]
-        grouped_image_token_counts = [0] * len(texts)
-        grouped_row_counts = [0] * len(texts)
 
         for row_input_ids, sample_idx in zip(
             tokenized_text_inputs["input_ids"], tokenized_text_inputs["overflow_to_sample_mapping"], strict=True
         ):
             sample_idx = int(sample_idx)
-            grouped_row_counts[sample_idx] += 1
-            grouped_image_token_counts[sample_idx] += row_input_ids.count(self.image_token_id)
             if kept_input_ids_per_sample[sample_idx] is None:
                 kept_input_ids_per_sample[sample_idx] = row_input_ids
             else:
