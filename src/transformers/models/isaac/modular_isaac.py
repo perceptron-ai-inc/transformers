@@ -955,21 +955,15 @@ class IsaacProcessor(ProcessorMixin):
             sample_input = torch.tensor(sample_input_ids_list, dtype=torch.long)
             image_positions = sample_input.eq(self.image_pad_token_id).nonzero(as_tuple=False).flatten()
             image_spans = image_positions.split(expected_image_lengths) if expected_image_lengths else ()
-            image_bounds = []
-
-            for image_idx, (segment_length, image_span) in enumerate(
-                zip(expected_image_lengths, image_spans, strict=True)
-            ):
-                image_start = int(image_span[0].item())
-                image_end = int(image_span[-1].item()) + 1
-                image_bounds.append((image_start, image_end))
             total = int(sample_input.shape[0])
             start = max(0, total - effective_max_length)
             sample_input_ids.append(sample_input[start:])
 
-            for image_idx, (image_start, image_end) in enumerate(image_bounds):
+            for image_idx, (_, image_span) in enumerate(zip(expected_image_lengths, image_spans, strict=True)):
+                image_start = int(image_span[0].item())
+                image_end = int(image_span[-1].item()) + 1
                 kept_start = max(start, image_start)
-                kept_end = min(total, image_end)
+                kept_end = image_end
                 if kept_end > kept_start:
                     vision_token_offsets[batch_idx, image_idx] = kept_start - image_start
                     vision_token_lengths[batch_idx, image_idx] = kept_end - kept_start
