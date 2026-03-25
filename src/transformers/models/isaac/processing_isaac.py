@@ -142,9 +142,6 @@ class IsaacProcessor(ProcessorMixin):
         if chat_template is None:
             chat_template = getattr(tokenizer, "chat_template", None)
 
-        if not getattr(tokenizer, "is_fast", False):
-            raise ValueError("IsaacProcessor requires a fast tokenizer to reconstruct left-truncated image spans.")
-
         self.image_processor = image_processor
         super().__init__(image_processor, tokenizer, chat_template=chat_template)
         self.text_pad_token_id = self.pad_token_id = tokenizer.pad_token_id
@@ -254,30 +251,20 @@ class IsaacProcessor(ProcessorMixin):
         if max_length is not None and (truncation or padding == "max_length"):
             effective_max_length = max_length
 
-        original_truncation_side = self.tokenizer.truncation_side
-        original_padding_side = self.tokenizer.padding_side
         self.tokenizer.truncation_side = "left"
         self.tokenizer.padding_side = padding_side
-        try:
-            tokenized_text_inputs = self.tokenizer(
-                expanded_texts,
-                truncation=True,
-                max_length=effective_max_length,
-                padding=padding,
-                pad_to_multiple_of=pad_to_multiple_of,
-                return_attention_mask=return_attention_mask,
-                return_overflowing_tokens=True,
-                stride=0,
-                return_tensors=None,
-                **text_kwargs,
-            )
-        finally:
-            self.tokenizer.truncation_side = original_truncation_side
-            self.tokenizer.padding_side = original_padding_side
-
-        overflow_to_sample_mapping = tokenized_text_inputs.get("overflow_to_sample_mapping")
-        if overflow_to_sample_mapping is None:
-            raise ValueError("IsaacProcessor requires overflow-to-sample mappings from a fast tokenizer.")
+        tokenized_text_inputs = self.tokenizer(
+            expanded_texts,
+            truncation=True,
+            max_length=effective_max_length,
+            padding=padding,
+            pad_to_multiple_of=pad_to_multiple_of,
+            return_attention_mask=return_attention_mask,
+            return_overflowing_tokens=True,
+            stride=0,
+            return_tensors=None,
+            **text_kwargs,
+        )
 
         kept_input_ids_per_sample: list[list[int] | None] = [None] * len(texts)
         overflow_input_ids_per_sample: list[list[list[int]]] = [[] for _ in texts]
@@ -285,7 +272,7 @@ class IsaacProcessor(ProcessorMixin):
         grouped_row_counts = [0] * len(texts)
 
         for row_input_ids, sample_idx in zip(
-            tokenized_text_inputs["input_ids"], overflow_to_sample_mapping, strict=True
+            tokenized_text_inputs["input_ids"], tokenized_text_inputs["overflow_to_sample_mapping"], strict=True
         ):
             sample_idx = int(sample_idx)
             grouped_row_counts[sample_idx] += 1
@@ -296,16 +283,6 @@ class IsaacProcessor(ProcessorMixin):
                 overflow_input_ids_per_sample[sample_idx].append(row_input_ids)
 
         for batch_idx, expected_image_lengths in enumerate(expected_image_lengths_per_sample):
-            kept_input_ids_list = kept_input_ids_per_sample[batch_idx]
-            if kept_input_ids_list is None or grouped_row_counts[batch_idx] == 0:
-                raise ValueError(f"Failed to recover tokenized rows for Isaac sample {batch_idx}.")
-
-            expected_image_token_count = sum(expected_image_lengths)
-            if grouped_image_token_counts[batch_idx] != expected_image_token_count:
-                raise ValueError(
-                    f"Isaac image-token accounting mismatch for sample {batch_idx}: expected {expected_image_token_count}, got {grouped_image_token_counts[batch_idx]}."
-                )
-
             dropped_image_tokens = sum(
                 overflow_input_ids.count(self.image_token_id)
                 for overflow_input_ids in overflow_input_ids_per_sample[batch_idx]
