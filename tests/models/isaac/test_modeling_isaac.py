@@ -612,7 +612,7 @@ class IsaacPixelShufflePaddedTest(unittest.TestCase):
         token_grids = torch.tensor([[4, 4], [2, 4]], device=torch_device, dtype=torch.long)
         expected_hidden, expected_mask, expected_lengths = _pixel_shuffle_reference(x, token_grids, scale_factor=2)
 
-        hidden = pixel_shuffle_padded(x=x, token_grids=token_grids, scale_factor=2)
+        hidden = pixel_shuffle_padded(hidden_states=x, token_grids=token_grids, scale_factor=2)
 
         torch.testing.assert_close(hidden, expected_hidden)
 
@@ -621,13 +621,13 @@ class IsaacPixelShufflePaddedTest(unittest.TestCase):
         token_grids = torch.tensor([[3, 5]], device=torch_device, dtype=torch.long)
 
         with pytest.raises(ValueError, match="divisible"):
-            pixel_shuffle_padded(x=x, token_grids=token_grids, scale_factor=2)
+            pixel_shuffle_padded(hidden_states=x, token_grids=token_grids, scale_factor=2)
 
     def test_pixel_shuffle_padded_zero_grid(self):
         x = torch.randn(1, 4, 8, device=torch_device)
         token_grids = torch.tensor([[0, 0]], device=torch_device, dtype=torch.long)
 
-        hidden = pixel_shuffle_padded(x=x, token_grids=token_grids, scale_factor=2)
+        hidden = pixel_shuffle_padded(hidden_states=x, token_grids=token_grids, scale_factor=2)
 
         self.assertEqual(hidden.shape, (1, 0, 32))
 
