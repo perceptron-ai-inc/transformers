@@ -766,9 +766,6 @@ class IsaacConfig(PretrainedConfig):
         Rescale factor applied by the image processor before normalization.
     max_sequence_length (`int`, *optional*, defaults to 16384):
         Maximum multimodal sequence length produced by the processor and expected by the model.
-    vision_token (`str`, *optional*, defaults to `"<image>"`):
-        Placeholder string inserted into text prompts to mark image positions.
-
     Example:
 
     ```python
@@ -786,7 +783,6 @@ class IsaacConfig(PretrainedConfig):
     text_config: IsaacTextConfig | dict | None = None
     vision_rescale_factor: float = 1 / 255
     max_sequence_length: int = 16384
-    vision_token: str = "<image>"
 
     def __post_init__(self, **kwargs):
         for key in ("use_cache", "rope_theta", "max_position_embeddings"):
@@ -822,15 +818,12 @@ class IsaacProcessor(ProcessorMixin):
         image_processor,
         tokenizer,
         chat_template: str | dict[str, str] | None = None,
-        vision_token: str = "<image>",
         max_sequence_length: int = 16384,
     ):
         """
         Args:
             chat_template (`str` or `dict[str, str]`, *optional*):
                 Chat template override forwarded to [`~processing_utils.ProcessorMixin`].
-            vision_token (`str`, *optional*, defaults to `"<image>"`):
-                Placeholder token used inside text prompts to mark image positions.
             max_sequence_length (`int`, *optional*, defaults to 16384):
                 Maximum packed multimodal sequence length produced by the processor.
         """
@@ -840,11 +833,9 @@ class IsaacProcessor(ProcessorMixin):
         self.image_processor = image_processor
         super().__init__(image_processor, tokenizer, chat_template=chat_template)
         self.text_pad_token_id = self.pad_token_id = tokenizer.pad_token_id
-        self.image_pad_token_id = tokenizer.image_pad_token_id
-        self.image_token = tokenizer.image_pad_token
-        self.image_token_id = self.image_pad_token_id
+        self.image_token = tokenizer.image_token
+        self.image_token_id = tokenizer.image_token_id
 
-        self.vision_token = vision_token
         self.max_sequence_length = max_sequence_length
 
     def post_process_generation(
@@ -900,7 +891,7 @@ class IsaacProcessor(ProcessorMixin):
             fetched_images = self.image_processor.fetch_images(images)
             batched_images = make_nested_list_of_images(fetched_images)
             if len(batched_images) != len(texts):
-                num_images_in_text = [text_value.count(self.vision_token) for text_value in texts]
+                num_images_in_text = [text_value.count(self.image_token) for text_value in texts]
                 num_images_in_images = [len(sample_images) for sample_images in batched_images]
                 add_message = ""
                 if sum(num_images_in_text) == sum(num_images_in_images):
@@ -924,7 +915,7 @@ class IsaacProcessor(ProcessorMixin):
         expected_image_lengths_per_sample = []
 
         for batch_idx, (text_value, sample_images) in enumerate(pairs):
-            segments = text_value.split(self.vision_token)
+            segments = text_value.split(self.image_token)
             num_images = len(segments) - 1
             num_provided_images = len(sample_images)
             if num_images != num_provided_images:
@@ -953,7 +944,7 @@ class IsaacProcessor(ProcessorMixin):
             zip(expected_image_lengths_per_sample, tokenized_text_inputs["input_ids"], strict=True)
         ):
             sample_input = torch.tensor(sample_input_ids_list, dtype=torch.long)
-            image_positions = sample_input.eq(self.image_pad_token_id).nonzero(as_tuple=False).flatten()
+            image_positions = sample_input.eq(self.image_token_id).nonzero(as_tuple=False).flatten()
             image_spans = image_positions.split(expected_image_lengths) if expected_image_lengths else ()
             total = int(sample_input.shape[0])
             start = max(0, total - effective_max_length)
@@ -984,7 +975,7 @@ class IsaacProcessor(ProcessorMixin):
         attention_mask = padded_text_inputs.get("attention_mask")
         attention_mask = input_ids.ne(self.pad_token_id).to(dtype=torch.long)
 
-        mm_token_type_ids = input_ids.eq(self.image_pad_token_id).to(dtype=torch.long)
+        mm_token_type_ids = input_ids.eq(self.image_token_id).to(dtype=torch.long)
         vision_image_attention_mask = vision_token_lengths.gt(0).to(dtype=torch.long)
 
         vision_patches = image_inputs["vision_patches"]
@@ -1064,7 +1055,6 @@ class IsaacModel(Qwen3PreTrainedModel):
         self.multimodal_projector = IsaacMultiModalProjector(config)
         self.max_sequence_length = config.max_sequence_length
         self.vision_rescale_factor = config.vision_rescale_factor
-        self.vision_token = config.vision_token
         self.rope_deltas = None
 
         self.post_init()

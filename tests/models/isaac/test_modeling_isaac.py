@@ -78,7 +78,7 @@ RED_DOT_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAUAAAAFCAYAAACNbyblAAAAHElEQVQI12P4//8/w
 
 
 def document_to_messages(
-    document: list[dict], vision_token: str = "<image>"
+    document: list[dict], image_token: str = "<image>"
 ) -> tuple[list[dict[str, str]], list[Image]]:
     """
     Convert a Document to messages format compatible with chat templates.
@@ -86,7 +86,7 @@ def document_to_messages(
 
     Args:
         document: list of dicts containing Text and/or Image content
-        vision_token: Token to use for image placeholder
+        image_token: Token to use for image placeholder
 
     Returns:
         Tuple of (messages, images) where messages is a list of dicts with 'role' and 'content'
@@ -113,7 +113,7 @@ def document_to_messages(
                 messages.append(
                     {
                         "role": item.get("role", "user"),
-                        "content": vision_token,
+                        "content": image_token,
                     }
                 )
 
@@ -204,7 +204,6 @@ def create_isaac_processor(
 ):
     """Helper to construct IsaacProcessor without requiring an IsaacConfig instance."""
     params = {
-        "vision_token": isaac_config.vision_token,
         "max_sequence_length": isaac_config.max_sequence_length,
         "vision_patch_size": isaac_config.vision_patch_size,
         "vision_max_num_patches": isaac_config.vision_max_num_patches,
@@ -228,7 +227,6 @@ def create_isaac_processor(
             image_std=params["image_std"],
         )
     processor_params = {
-        "vision_token": isaac_config.vision_token,
         "max_sequence_length": isaac_config.max_sequence_length,
     }
 
@@ -303,9 +301,11 @@ class SimpleIsaacTokenizer(PythonBackend):
             eos_token="<eos>",
             pad_token="<pad>",
             unk_token="<unk>",
-            extra_special_tokens=["<image>"],
+            extra_special_tokens={"image_token": "<image>"},
             model_max_length=512,
         )
+        self.image_token = "<image>"
+        self.image_token_id = self._vocab[self.image_token]
         self.chat_template = (
             "{% for message in messages %}"
             "{{ message['role'] }}: {{ message['content'] | trim }}\n"
@@ -986,10 +986,10 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
         # Input-level sanity
         assert len(prompts) == len(images_list) == 3
         for i, (p, imgs) in enumerate(zip(prompts, images_list)):
-            expected_tokens = p.count(self.hf_config.vision_token)
+            expected_tokens = p.count(self.processor.image_token)
             num_imgs = len(imgs)
             assert expected_tokens == num_imgs, (
-                f"sample {i} vision token/image mismatch: {expected_tokens} vs {num_imgs}"
+                f"sample {i} image token/image mismatch: {expected_tokens} vs {num_imgs}"
             )
 
         pad_id = self.tokenizer.pad_token_id
@@ -1107,7 +1107,7 @@ class IsaacBoxPointingIntegrationTest(unittest.TestCase):
                 "role": "user",
             },
         ]
-        messages, images = document_to_messages(document, vision_token=self.hf_config.vision_token)
+        messages, images = document_to_messages(document, image_token=self.processor.image_token)
         prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True).strip()
         processor_output = self.processor(text=prompt, images=images, return_tensors="pt")
         input_ids = processor_output["input_ids"].to(self.device)
@@ -1157,7 +1157,7 @@ class IsaacBoxPointingIntegrationTest(unittest.TestCase):
                 "role": "user",
             },
         ]
-        messages, images = document_to_messages(document, vision_token=self.hf_config.vision_token)
+        messages, images = document_to_messages(document, image_token=self.processor.image_token)
         prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True).strip()
         processor_output = self.processor(text=prompt, images=images, return_tensors="pt")
         input_ids = processor_output["input_ids"].to(self.device)
