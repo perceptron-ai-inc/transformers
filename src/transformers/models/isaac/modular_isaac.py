@@ -986,8 +986,7 @@ class IsaacProcessor(ProcessorMixin):
         )
         input_ids = padded_text_inputs["input_ids"]
         attention_mask = padded_text_inputs.get("attention_mask")
-        if attention_mask is None:
-            attention_mask = input_ids.ne(self.pad_token_id).to(dtype=torch.long)
+        attention_mask = input_ids.ne(self.pad_token_id).to(dtype=torch.long)
 
         mm_token_type_ids = input_ids.eq(self.image_pad_token_id).to(dtype=torch.long)
         vision_image_attention_mask = vision_token_lengths.gt(0).to(dtype=torch.long)
