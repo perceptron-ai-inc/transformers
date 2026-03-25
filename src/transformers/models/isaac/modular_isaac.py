@@ -965,6 +965,8 @@ class IsaacProcessor(ProcessorMixin):
                 kept_start = max(start, image_start)
                 kept_end = image_end
                 if kept_end > kept_start:
+                    # Record which suffix of this image's placeholder span survives left truncation.
+                    # The model still encodes the full image and uses this window for both feature gathering and vision RoPE.
                     vision_token_offsets[batch_idx, image_idx] = kept_start - image_start
                     vision_token_lengths[batch_idx, image_idx] = kept_end - kept_start
 
