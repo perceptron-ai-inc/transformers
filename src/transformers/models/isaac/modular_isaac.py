@@ -187,7 +187,7 @@ def clean_text_and_extract_points(
 
 
 @auto_docstring(checkpoint="PerceptronAI/Isaac-0.1-Base")
-@strict(accept_kwargs=True)
+@strict
 class IsaacVisionConfig(Siglip2VisionConfig):
     r"""
     num_patches (`int`, *optional*, defaults to 256):
@@ -205,7 +205,7 @@ class IsaacVisionConfig(Siglip2VisionConfig):
 
 
 @auto_docstring(checkpoint="PerceptronAI/Isaac-0.1-Base")
-@strict(accept_kwargs=True)
+@strict
 class IsaacTextConfig(Qwen3Config):
     r"""
     Example:
@@ -754,7 +754,7 @@ def get_image_size_for_max_num_patches(
 
 
 @auto_docstring(checkpoint="PerceptronAI/Isaac-0.1-Base")
-@strict(accept_kwargs=True)
+@strict
 class IsaacConfig(PretrainedConfig):
     r"""
     vision_config (`IsaacVisionConfig` or `dict`, *optional*):
