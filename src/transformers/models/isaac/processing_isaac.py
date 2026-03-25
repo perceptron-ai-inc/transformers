@@ -138,7 +138,7 @@ class IsaacProcessor(ProcessorMixin):
             chat_template (`str` or `dict[str, str]`, *optional*):
                 Chat template override forwarded to [`~processing_utils.ProcessorMixin`].
             vision_token (`str`, *optional*, defaults to `"<image>"`):
-                Placeholder token used inside text prompts to mark image positions.
+                Prompt-facing image placeholder accepted as an alias for the tokenizer image token.
             max_sequence_length (`int`, *optional*, defaults to 16384):
                 Maximum packed multimodal sequence length produced by the processor.
         """
@@ -148,12 +148,22 @@ class IsaacProcessor(ProcessorMixin):
         self.image_processor = image_processor
         super().__init__(image_processor, tokenizer, chat_template=chat_template)
         self.text_pad_token_id = self.pad_token_id = tokenizer.pad_token_id
-        self.image_pad_token_id = tokenizer.image_pad_token_id
-        self.image_token = tokenizer.image_pad_token
-        self.image_token_id = self.image_pad_token_id
-
         self.vision_token = vision_token
+        self.image_token = getattr(tokenizer, "image_token", None) or getattr(tokenizer, "image_pad_token", None)
+        if self.image_token is None:
+            self.image_token = vision_token
+        self.image_token_id = getattr(tokenizer, "image_token_id", None) or getattr(
+            tokenizer, "image_pad_token_id", None
+        )
+        if self.image_token_id is None:
+            self.image_token_id = tokenizer.convert_tokens_to_ids(self.image_token)
+
         self.max_sequence_length = max_sequence_length
+
+    def _normalize_image_tokens(self, text: str) -> str:
+        if self.vision_token == self.image_token:
+            return text
+        return text.replace(self.vision_token, self.image_token)
 
     def post_process_generation(
         self,
@@ -202,23 +212,24 @@ class IsaacProcessor(ProcessorMixin):
         text_kwargs.setdefault("add_special_tokens", False)
 
         texts = [text] if isinstance(text, str) else text
+        normalized_texts = [self._normalize_image_tokens(text_value) for text_value in texts]
         if images is None:
-            batched_images = [[] for _ in texts]
+            batched_images = [[] for _ in normalized_texts]
         else:
             fetched_images = self.image_processor.fetch_images(images)
             batched_images = make_nested_list_of_images(fetched_images)
-            if len(batched_images) != len(texts):
-                num_images_in_text = [text_value.count(self.vision_token) for text_value in texts]
+            if len(batched_images) != len(normalized_texts):
+                num_images_in_text = [text_value.count(self.image_token) for text_value in normalized_texts]
                 num_images_in_images = [len(sample_images) for sample_images in batched_images]
                 add_message = ""
                 if sum(num_images_in_text) == sum(num_images_in_images):
                     add_message = " Make sure to pass your images as a nested list, where each sub-list holds images for one text sample."
 
                 raise ValueError(
-                    f"Received inconsistently sized batches of images ({len(batched_images)}) and text ({len(texts)}).{add_message}"
+                    f"Received inconsistently sized batches of images ({len(batched_images)}) and text ({len(normalized_texts)}).{add_message}"
                 )
 
-        pairs = list(zip(texts, batched_images, strict=True))
+        pairs = list(zip(normalized_texts, batched_images, strict=True))
         image_inputs = self.image_processor(images=batched_images, return_tensors=TensorType.PYTORCH)
         vision_token_grids = image_inputs["vision_token_grids"]
         vision_segment_lengths = (vision_token_grids[..., 0] // self.image_processor.pixel_shuffle_scale) * (
@@ -232,7 +243,7 @@ class IsaacProcessor(ProcessorMixin):
         expected_image_lengths_per_sample = []
 
         for batch_idx, (text_value, sample_images) in enumerate(pairs):
-            segments = text_value.split(self.vision_token)
+            segments = text_value.split(self.image_token)
             num_images = len(segments) - 1
             num_provided_images = len(sample_images)
             if num_images != num_provided_images:
@@ -261,24 +272,20 @@ class IsaacProcessor(ProcessorMixin):
             zip(expected_image_lengths_per_sample, tokenized_text_inputs["input_ids"], strict=True)
         ):
             sample_input = torch.tensor(sample_input_ids_list, dtype=torch.long)
-            image_positions = sample_input.eq(self.image_pad_token_id).nonzero(as_tuple=False).flatten()
+            image_positions = sample_input.eq(self.image_token_id).nonzero(as_tuple=False).flatten()
             image_spans = image_positions.split(expected_image_lengths) if expected_image_lengths else ()
-            image_bounds = []
-
-            for image_idx, (segment_length, image_span) in enumerate(
-                zip(expected_image_lengths, image_spans, strict=True)
-            ):
-                image_start = int(image_span[0].item())
-                image_end = int(image_span[-1].item()) + 1
-                image_bounds.append((image_start, image_end))
             total = int(sample_input.shape[0])
             start = max(0, total - effective_max_length)
             sample_input_ids.append(sample_input[start:])
 
-            for image_idx, (image_start, image_end) in enumerate(image_bounds):
+            for image_idx, (_, image_span) in enumerate(zip(expected_image_lengths, image_spans, strict=True)):
+                image_start = int(image_span[0].item())
+                image_end = int(image_span[-1].item()) + 1
                 kept_start = max(start, image_start)
-                kept_end = min(total, image_end)
+                kept_end = image_end
                 if kept_end > kept_start:
+                    # Record which suffix of this image's placeholder span survives left truncation.
+                    # The model still encodes the full image and uses this window for both feature gathering and vision RoPE.
                     vision_token_offsets[batch_idx, image_idx] = kept_start - image_start
                     vision_token_lengths[batch_idx, image_idx] = kept_end - kept_start
 
@@ -294,10 +301,9 @@ class IsaacProcessor(ProcessorMixin):
         )
         input_ids = padded_text_inputs["input_ids"]
         attention_mask = padded_text_inputs.get("attention_mask")
-        if attention_mask is None:
-            attention_mask = input_ids.ne(self.pad_token_id).to(dtype=torch.long)
+        attention_mask = input_ids.ne(self.pad_token_id).to(dtype=torch.long)
 
-        mm_token_type_ids = input_ids.eq(self.image_pad_token_id).to(dtype=torch.long)
+        mm_token_type_ids = input_ids.eq(self.image_token_id).to(dtype=torch.long)
         vision_image_attention_mask = vision_token_lengths.gt(0).to(dtype=torch.long)
 
         vision_patches = image_inputs["vision_patches"]

@@ -361,7 +361,7 @@ class IsaacVisionEncoder(nn.Module):
 
 
 def pixel_shuffle_padded(
-    x: torch.Tensor,
+    hidden_states: torch.Tensor,
     token_grids: torch.Tensor,
     scale_factor: int = 1,
 ) -> torch.Tensor:
@@ -379,10 +379,10 @@ def pixel_shuffle_padded(
         `torch.Tensor`: Pixel-shuffled embeddings of shape
         `(num_images, max_tokens, hidden_size * scale_factor**2)`.
     """
-    num_images, max_patches, embed_dim = x.shape
+    num_images, max_patches, embed_dim = hidden_states.shape
     output_dim = embed_dim * scale_factor * scale_factor
 
-    token_grids = token_grids.to(device=x.device, dtype=torch.long)
+    token_grids = token_grids.to(device=hidden_states.device, dtype=torch.long)
     heights = token_grids[:, 0]
     widths = token_grids[:, 1]
     full_lengths = heights * widths
@@ -397,9 +397,11 @@ def pixel_shuffle_padded(
 
     output_lengths = (heights // scale_factor) * (widths // scale_factor)
     max_output_tokens = output_lengths.max()
-    shuffled_4d = x.new_zeros((num_images, max_output_tokens, scale_factor * scale_factor, embed_dim))
+    shuffled_4d = hidden_states.new_zeros((num_images, max_output_tokens, scale_factor * scale_factor, embed_dim))
 
-    token_positions = torch.arange(max_patches, device=x.device, dtype=torch.long).unsqueeze(0).expand(num_images, -1)
+    token_positions = (
+        torch.arange(max_patches, device=hidden_states.device, dtype=torch.long).unsqueeze(0).expand(num_images, -1)
+    )
     valid_token_mask = token_positions < full_lengths.unsqueeze(1)
 
     safe_widths = torch.where(widths > 0, widths, torch.ones_like(widths))
@@ -411,10 +413,12 @@ def pixel_shuffle_padded(
     output_index = output_index + col_index.div(scale_factor, rounding_mode="floor")
     sub_index = row_index.remainder(scale_factor) * scale_factor + col_index.remainder(scale_factor)
 
-    batch_index = torch.arange(num_images, device=x.device, dtype=torch.long).unsqueeze(1).expand_as(token_positions)
-    shuffled_4d[batch_index[valid_token_mask], output_index[valid_token_mask], sub_index[valid_token_mask]] = x[
-        valid_token_mask
-    ]
+    batch_index = (
+        torch.arange(num_images, device=hidden_states.device, dtype=torch.long).unsqueeze(1).expand_as(token_positions)
+    )
+    shuffled_4d[batch_index[valid_token_mask], output_index[valid_token_mask], sub_index[valid_token_mask]] = (
+        hidden_states[valid_token_mask]
+    )
 
     shuffled = shuffled_4d.view(num_images, max_output_tokens, output_dim)
     return shuffled
@@ -488,7 +492,7 @@ class IsaacVisionTransformer(PreTrainedModel):
         hidden_states = self.post_layernorm(encoder_outputs.last_hidden_state)
 
         hidden_states = pixel_shuffle_padded(
-            x=hidden_states,
+            hidden_states=hidden_states,
             token_grids=vision_token_grids,
             scale_factor=self.pixel_shuffle_scale_factor,
         )
@@ -1147,7 +1151,6 @@ class IsaacModel(PreTrainedModel):
         self.multimodal_projector = IsaacMultiModalProjector(config)
         self.max_sequence_length = config.max_sequence_length
         self.vision_rescale_factor = config.vision_rescale_factor
-        self.vision_token = config.vision_token
         self.rope_deltas = None
 
         self.post_init()

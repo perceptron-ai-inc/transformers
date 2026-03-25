@@ -27,7 +27,7 @@ from ...utils import auto_docstring
 
 
 @auto_docstring(checkpoint="PerceptronAI/Isaac-0.1-Base")
-@strict(accept_kwargs=True)
+@strict
 class IsaacVisionConfig(PreTrainedConfig):
     r"""
     num_patches (`int`, *optional*, defaults to 256):
@@ -57,7 +57,7 @@ class IsaacVisionConfig(PreTrainedConfig):
 
 
 @auto_docstring(checkpoint="PerceptronAI/Isaac-0.1-Base")
-@strict(accept_kwargs=True)
+@strict
 class IsaacTextConfig(PreTrainedConfig):
     r"""
     Example:
@@ -134,7 +134,7 @@ class IsaacTextConfig(PreTrainedConfig):
 
 
 @auto_docstring(checkpoint="PerceptronAI/Isaac-0.1-Base")
-@strict(accept_kwargs=True)
+@strict
 class IsaacConfig(PretrainedConfig):
     r"""
     vision_config (`IsaacVisionConfig` or `dict`, *optional*):
@@ -147,8 +147,7 @@ class IsaacConfig(PretrainedConfig):
     max_sequence_length (`int`, *optional*, defaults to 16384):
         Maximum multimodal sequence length produced by the processor and expected by the model.
     vision_token (`str`, *optional*, defaults to `"<image>"`):
-        Placeholder string inserted into text prompts to mark image positions.
-
+        Prompt-facing image placeholder accepted by the processor and normalized to the tokenizer image token.
     Example:
 
     ```python
