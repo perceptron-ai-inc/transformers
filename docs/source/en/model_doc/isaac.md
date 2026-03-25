@@ -37,7 +37,7 @@ weights before using them in commercial settings.
 
 ## Usage
 
-Isaac uses explicit image placeholders in the rendered prompt. Every occurrence of `processor.vision_token` (usually
+Isaac uses explicit image placeholders in the rendered prompt. Every occurrence of `processor.image_token` (usually
 `<image>`) must have a matching image in the `images` argument.
 
 ```py
@@ -57,7 +57,7 @@ model = IsaacForConditionalGeneration.from_pretrained(
 images = [Image.open("chart.png"), Image.open("panel.jpg")]
 messages = [
     {"role": "user", "content": "Compare the two figures and explain what changed."},
-    {"role": "user", "content": f"{processor.vision_token}{processor.vision_token}"},
+    {"role": "user", "content": f"{processor.image_token}{processor.image_token}"},
 ]
 
 prompt = processor.apply_chat_template(
