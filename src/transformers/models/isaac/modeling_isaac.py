@@ -19,6 +19,7 @@
 # limitations under the License.
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, NamedTuple, Optional
 
 from ... import initialization as init
@@ -29,15 +30,9 @@ from ...integrations import use_kernel_forward_from_hub, use_kernel_func_from_hu
 from ...masking_utils import create_bidirectional_mask, create_causal_mask
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_layers import GradientCheckpointingLayer
-from ...modeling_outputs import (
-    BaseModelOutput,
-    BaseModelOutputWithPast,
-    BaseModelOutputWithPooling,
-    CausalLMOutputWithPast,
-)
+from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPast, BaseModelOutputWithPooling, ModelOutput
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from ...models.qwen3.modeling_qwen3 import Qwen3PreTrainedModel
 from ...processing_utils import Unpack
 from ...utils import auto_docstring, torch_compilable_check
 from ...utils.generic import TransformersKwargs, can_return_tuple, maybe_autocast, merge_with_config_defaults
@@ -169,7 +164,7 @@ class IsaacVisionEmbeddings(nn.Module):
     def forward(
         self,
         pixel_values: torch.Tensor,
-        spatial_shapes: torch.Tensor,
+        image_grid_thw: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
@@ -185,13 +180,16 @@ class IsaacVisionEmbeddings(nn.Module):
 
         resized_positional_embeddings = self.resize_positional_embeddings(
             self.position_embedding,
-            spatial_shapes,
+            image_grid_thw[:, 1:],
             max_length=pixel_values.shape[1],
+        )
+        resized_positional_embeddings = resized_positional_embeddings.to(
+            device=patch_embeds.device, dtype=patch_embeds.dtype
         )
         embeddings = patch_embeds + resized_positional_embeddings
 
         if attention_mask is not None:
-            embeddings = embeddings * attention_mask.unsqueeze(-1).to(dtype=embeddings.dtype)
+            embeddings = embeddings * attention_mask.unsqueeze(-1).to(device=embeddings.device, dtype=embeddings.dtype)
 
         return embeddings
 
@@ -460,26 +458,28 @@ class IsaacVisionTransformer(PreTrainedModel):
     @capture_outputs(tie_last_hidden_states=False)
     def forward(
         self,
-        vision_patches: torch.Tensor,
-        vision_token_grids: torch.Tensor,
-        image_patch_attention_mask: torch.Tensor,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPooling:
         """
         Inputs:
-            vision_patches (`torch.Tensor`):
+            pixel_values (`torch.Tensor`):
                 Patches shaped `(num_images, max_patches, patch_dim)`.
-            vision_token_grids (`torch.Tensor`):
-                Token grids shaped `(num_images, 2)` with per-image `(H_tokens, W_tokens)`.
-            image_patch_attention_mask (`torch.Tensor`):
-                Patch mask shaped `(num_images, max_patches)`.
+            image_grid_thw (`torch.Tensor`):
+                Grid tensor shaped `(num_images, 3)` with per-image `(T=1, H_tokens, W_tokens)`.
 
         Returns:
             `BaseModelOutputWithPooling` with pixel-shuffled embeddings in `last_hidden_state`.
         """
+        vision_token_grids = image_grid_thw[:, 1:].to(dtype=torch.long)
+        full_lengths = vision_token_grids[:, 0] * vision_token_grids[:, 1]
+        token_positions = torch.arange(pixel_values.shape[1], device=pixel_values.device, dtype=torch.long)
+        image_patch_attention_mask = token_positions.unsqueeze(0) < full_lengths.unsqueeze(1)
+        image_patch_attention_mask = image_patch_attention_mask.to(dtype=torch.long)
         hidden_states = self.embeddings(
-            vision_patches,
-            vision_token_grids,
+            pixel_values,
+            image_grid_thw,
             attention_mask=image_patch_attention_mask,
         )
 
@@ -987,167 +987,24 @@ class IsaacTextModel(IsaacPreTrainedModel):
         return hidden_states
 
 
-@use_kernel_forward_from_hub("RMSNorm")
-class IsaacRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
-        """
-        IsaacRMSNorm is equivalent to T5LayerNorm
-        """
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
-
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-
-
-@use_kernelized_func(apply_rotary_pos_emb)
-class IsaacAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
-
-    def __init__(self, config: IsaacConfig, layer_idx: int):
-        super().__init__()
-        self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
-        self.config = config
-        self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scaling = self.head_dim**-0.5
-        self.attention_dropout = config.attention_dropout
-        self.is_causal = True
-
-        self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
-        )
-        self.q_norm = IsaacRMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
-        self.k_norm = IsaacRMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
-        self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: torch.Tensor | None,
-        past_key_values: Cache | None = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        if past_key_values is not None:
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
-
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
-            **kwargs,
-        )
-
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
-
-
-class IsaacDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: IsaacConfig, layer_idx: int):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-
-        self.self_attn = IsaacAttention(config=config, layer_idx=layer_idx)
-
-        self.mlp = IsaacMLP(config)
-        self.input_layernorm = IsaacRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = IsaacRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        use_cache: bool | None = False,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        # Self Attention
-        hidden_states, _ = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
-        hidden_states = residual + hidden_states
-
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
-
-
 @auto_docstring
-class IsaacModel(PreTrainedModel):
-    config: IsaacConfig
+class IsaacModel(IsaacPreTrainedModel):
     base_model_prefix = "model"
+    # Reference: fix gemma3 grad acc #37208
+    accepts_loss_kwargs = False
+    config: IsaacConfig
+    _no_split_modules = ["IsaacTextDecoderLayer", "IsaacVisionEncoderLayer"]
+    input_modalities = ("image", "text")
     supports_gradient_checkpointing = True
-    _no_split_modules = ["IsaacDecoderLayer"]
-    _skip_keys_device_placement = ["past_key_values"]
-    _supports_flash_attn = True
-    _supports_sdpa = True
-    _supports_flex_attn = False
     _can_compile_fullgraph = False
-    _supports_attention_backend = True
-    _can_record_outputs = {
-        "hidden_states": IsaacDecoderLayer,
-        "attentions": IsaacAttention,
-    }
+    _supports_flex_attn = False
     _tied_weights_keys = {}
-    _input_embed_layer = "text_model.embed_tokens"
+    _input_embed_layer = "language_model.embed_tokens"
 
     def __init__(self, config: IsaacConfig):
-        Qwen3PreTrainedModel.__init__(self, config)
-        self.text_model = IsaacTextModel._from_config(config.text_config)
-
-        self.vision_tower = IsaacVisionTransformer(config.vision_config)
+        super().__init__(config)
+        self.language_model = IsaacTextModel._from_config(config.text_config)
+        self.visual = IsaacVisionTransformer(config.vision_config)
         self.multimodal_projector = IsaacMultiModalProjector(config)
         self.max_sequence_length = config.max_sequence_length
         self.vision_rescale_factor = config.vision_rescale_factor
@@ -1155,84 +1012,253 @@ class IsaacModel(PreTrainedModel):
 
         self.post_init()
 
+    def get_input_embeddings(self):
+        return self.language_model.get_input_embeddings()
+
+    def set_input_embeddings(self, value):
+        self.language_model.set_input_embeddings(value)
+
+    def get_vision_position_ids(
+        self,
+        start_position: int,
+        grid_thw: torch.LongTensor,
+        image_metadata: torch.LongTensor,
+    ) -> torch.LongTensor:
+        """
+        Compute 3D positional indices for vision tokens derived from a single image or video input.
+
+        The positions are generated from the input grid defined by temporal (T), height (H), and
+        width (W) dimensions. Temporal and spatial dimensions can be downscaled according to the
+        merge sizes used in the vision backbone. The resulting positions are offset by `start_position`.
+
+        Args:
+            start_position (`int`):
+                Offset added to all computed positional indices.
+            grid_thw (`Sequence[int]` or `torch.Tensor` of shape `(3,)`):
+                The (T, H, W) grid representing the feature layout of the current image or video after patch embedding.
+            temp_merge_size (`int`, *optional*):
+                Factor by which the temporal dimension is reduced in the backbone. The temporal grid size is divided
+                by this value. Defaults to 1.
+            spatial_merge_size (`int`, *optional*):
+                Factor by which the spatial dimensions (H and W) are reduced in the backbone. Both H and W are divided
+                by this value. Defaults to 1.
+            time_interval (`int`, *optional*):
+                Spacing factor applied between consecutive temporal position indices.Defaults to 1.
+            device (`str` or `torch.device`, *optional*):
+                Device on which the resulting tensor is allocated. If `None`, uses the current default device.
+
+        Returns:
+            torch.LongTensor of shape (3, sequence_length):
+                Positional indices for temporal, height, and width dimensions,
+                flattened into sequence form and offset by `start_position`.
+        """
+        pixel_shuffle_scale = self.config.vision_config.pixel_shuffle_scale_factor
+        height = grid_thw[1].div(pixel_shuffle_scale, rounding_mode="floor").item()
+        width = grid_thw[2].div(pixel_shuffle_scale, rounding_mode="floor").item()
+        token_positions = torch.arange(height * width, device=grid_thw.device, dtype=torch.long)
+        vision_position_ids = torch.stack(
+            (
+                torch.full((token_positions.shape[0],), start_position, device=grid_thw.device, dtype=torch.long),
+                token_positions.div(width, rounding_mode="floor"),
+                token_positions.remainder(width),
+            ),
+            dim=0,
+        )
+        token_offset = int(image_metadata[1].item())
+        token_length = int(image_metadata[2].item())
+        return vision_position_ids[:, token_offset : token_offset + token_length]
+
+    def get_rope_index(
+        self,
+        input_ids: torch.LongTensor | None,
+        mm_token_type_ids: torch.Tensor,
+        image_grid_thw: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        image_metadata: torch.Tensor | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Difference from Qwen2VL/Qwen2.5VL's get_rope_index:
+        - Since Qwen3.5 use timestamps to seperate videos, like <t1> <vision_start> <frame1> <vision_end> <t2> <vision_start> <frame2> <vision_end>, the video_grid_thw should also be split too.
+
+        Args:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide
+                it.
+            mm_token_type_ids (`torch.IntTensor` of shape `(batch_size, sequence_length)`):
+                Token type ids matching each modality to a different value in the input sequence, i.e. text (0), image (1), video (2).
+            image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+                The temporal, height and width of feature shape of each image in LLM.
+            video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+                The temporal, height and width of feature shape of each video in LLM.
+            attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
+
+                - 1 for tokens that are **not masked**,
+                - 0 for tokens that are **masked**.
+
+        Returns:
+            position_ids (`torch.LongTensor` of shape `(3, batch_size, sequence_length)`)
+            mrope_position_deltas (`torch.Tensor` of shape `(batch_size)`)
+        """
+        if image_grid_thw is None or image_metadata is None:
+            raise ValueError("Isaac multimodal RoPE requires both `image_grid_thw` and `image_metadata`.")
+
+        if attention_mask is None:
+            if input_ids is None:
+                attention_mask = mm_token_type_ids.new_ones(mm_token_type_ids.shape, dtype=torch.long)
+            else:
+                attention_mask = input_ids.new_ones(input_ids.shape, dtype=torch.long)
+
+        if input_ids is None:
+            batch_size, seq_len = attention_mask.shape
+            position_dtype = torch.long
+        else:
+            batch_size, seq_len = input_ids.shape
+            position_dtype = input_ids.dtype
+
+        device = attention_mask.device
+        mm_token_type_ids = mm_token_type_ids.to(dtype=torch.long)
+        image_grid_thw = image_grid_thw.to(dtype=torch.long)
+        image_metadata = image_metadata.to(dtype=torch.long)
+        attention_mask = attention_mask.to(dtype=torch.long)
+
+        position_ids = torch.zeros((3, batch_size, seq_len), device=device, dtype=position_dtype)
+        rope_deltas = torch.zeros((batch_size, 1), device=device, dtype=torch.long)
+
+        for batch_idx in range(batch_size):
+            sample_attention_mask = attention_mask[batch_idx].bool()
+            sample_token_types = mm_token_type_ids[batch_idx][sample_attention_mask]
+            sample_image_mask = image_metadata[:, 0] == batch_idx
+            sample_grids = image_grid_thw[sample_image_mask]
+            sample_metadata = image_metadata[sample_image_mask]
+
+            current_pos = 0
+            image_idx = 0
+            seq_pos = 0
+            llm_pos_ids_list = []
+
+            while seq_pos < sample_token_types.shape[0]:
+                modality_type = int(sample_token_types[seq_pos].item())
+                if modality_type == 0:
+                    group_end = seq_pos + 1
+                    while group_end < sample_token_types.shape[0] and sample_token_types[group_end] == 0:
+                        group_end += 1
+                    group_length = group_end - seq_pos
+                    llm_pos_ids_list.append(
+                        torch.arange(group_length, device=device, dtype=torch.long).view(1, -1).expand(3, -1)
+                        + current_pos
+                    )
+                    current_pos += group_length
+                    seq_pos = group_end
+                else:
+                    while image_idx < sample_metadata.shape[0] and sample_metadata[image_idx, 2].item() == 0:
+                        image_idx += 1
+                    torch_compilable_check(
+                        image_idx < sample_metadata.shape[0],
+                        "Isaac multimodal sequence has more visible image tokens than packed image metadata rows.",
+                    )
+                    token_length = int(sample_metadata[image_idx, 2].item())
+                    torch_compilable_check(
+                        token_length <= sample_token_types.shape[0] - seq_pos,
+                        "Isaac image metadata length exceeds the remaining multimodal placeholder span.",
+                    )
+                    llm_pos_ids_list.append(
+                        self.get_vision_position_ids(current_pos, sample_grids[image_idx], sample_metadata[image_idx])
+                    )
+                    current_pos += 1
+                    seq_pos += token_length
+                    image_idx += 1
+
+            llm_positions = (
+                torch.cat(llm_pos_ids_list, dim=1)
+                if llm_pos_ids_list
+                else torch.zeros((3, 0), device=device, dtype=torch.long)
+            )
+            position_ids[:, batch_idx, sample_attention_mask] = llm_positions
+            rope_deltas[batch_idx, 0] = (
+                llm_positions.max() + 1 - sample_token_types.shape[0] if llm_positions.numel() > 0 else 0
+            )
+
+        return position_ids, rope_deltas
+
+    @can_return_tuple
+    @auto_docstring
+    def get_video_features(
+        self,
+        pixel_values_videos: torch.FloatTensor,
+        video_grid_thw: torch.LongTensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple | BaseModelOutputWithPooling:
+        r"""
+        pixel_values_videos (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+            The tensors corresponding to the input videos.
+        video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+            The temporal, height and width of feature shape of each video in LLM.
+        """
+        raise ValueError("Isaac is image-only and does not support `pixel_values_videos` or `video_grid_thw`.")
+
     @can_return_tuple
     @auto_docstring
     def get_image_features(
         self,
         pixel_values: torch.Tensor,
-        image_token_grids: torch.Tensor,
-        image_patch_attention_mask: torch.Tensor | None = None,
-        image_token_offsets: torch.Tensor | None = None,
-        image_token_lengths: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor,
+        image_metadata: torch.Tensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | BaseModelOutputWithPooling:
         """
         Args:
             pixel_values (`torch.Tensor`):
-                Padded per-image patch vectors with shape `(batch_size, max_images, max_patches, patch_dim)`.
-            image_token_grids (`torch.Tensor`):
-                Per-image token grids shaped `(batch_size, max_images, 2)` with `(height, width)` entries.
-            image_patch_attention_mask (`torch.Tensor`, *optional*):
-                Mask for valid patch rows in `pixel_values`, shaped `(batch_size, max_images, max_patches)`.
-            image_token_offsets (`torch.Tensor`, *optional*):
-                Start offsets inside each per-image embedding sequence, shaped `(batch_size, max_images)`.
-            image_token_lengths (`torch.Tensor`, *optional*):
-                Number of image tokens to gather per image for placeholder scattering, shaped `(batch_size, max_images)`.
+                Packed per-image patch vectors with shape `(num_images, max_patches, patch_dim)`.
+            image_grid_thw (`torch.Tensor`):
+                Per-image grids shaped `(num_images, 3)` with `(T=1, H, W)` entries.
+            image_metadata (`torch.Tensor`, *optional*):
+                Packed per-image metadata `(sample_idx, offset, length)` shaped `(num_images, 3)`.
         """
-        image_token_grids = image_token_grids.to(dtype=torch.long)
-        patch_attention_mask = image_patch_attention_mask.to(dtype=torch.long)
-        if image_token_lengths is not None:
-            image_attention_mask = image_token_lengths > 0
-        else:
-            image_attention_mask = image_token_grids.any(dim=-1)
+        if pixel_values.shape[0] == 0:
+            hidden_size = self.config.get_text_config().hidden_size
+            return BaseModelOutputWithPooling(
+                last_hidden_state=pixel_values.new_zeros((0, 0, hidden_size)),
+                pooler_output=(),
+                hidden_states=None,
+                attentions=None,
+            )
 
-        torch_compilable_check(
-            image_attention_mask.any(),
-            "IsaacModel.get_image_features expects at least one active image slot; text-only inputs should skip this method.",
-        )
-
-        batch_size, max_images = pixel_values.shape[:2]
-        hidden_size = self.config.get_text_config().hidden_size
-
-        vision_outputs = self.vision_tower(
-            vision_patches=pixel_values[image_attention_mask],
-            vision_token_grids=image_token_grids[image_attention_mask],
-            image_patch_attention_mask=patch_attention_mask[image_attention_mask],
+        image_grid_thw = image_grid_thw.to(dtype=torch.long)
+        vision_outputs: BaseModelOutputWithPooling = self.visual(
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
             return_dict=True,
             **kwargs,
         )
-        flat_projected_features = self.multimodal_projector(vision_outputs.last_hidden_state)
-        max_tokens = flat_projected_features.shape[1]
-        projected_features = flat_projected_features.new_zeros((batch_size, max_images, max_tokens, hidden_size))
-        projected_features[image_attention_mask] = flat_projected_features
-        feature_device = flat_projected_features.device
-        offsets = (
-            image_token_offsets.to(dtype=torch.long)
-            if image_token_offsets is not None
-            else torch.zeros((batch_size, max_images), device=feature_device, dtype=torch.long)
+        projected_features = self.multimodal_projector(vision_outputs.last_hidden_state)
+
+        pixel_shuffle_scale = self.config.vision_config.pixel_shuffle_scale_factor
+        full_lengths = image_grid_thw[:, 1].div(pixel_shuffle_scale, rounding_mode="floor") * image_grid_thw[:, 2].div(
+            pixel_shuffle_scale, rounding_mode="floor"
         )
-        lengths = (
-            image_token_lengths.to(dtype=torch.long)
-            if image_token_lengths is not None
-            else torch.full((batch_size, max_images), max_tokens, device=feature_device, dtype=torch.long)
+        if image_metadata is None:
+            offsets = torch.zeros_like(full_lengths)
+            lengths = full_lengths
+        else:
+            torch_compilable_check(
+                image_metadata.shape[0] == projected_features.shape[0],
+                "IsaacModel.get_image_features expects one metadata row per packed image.",
+            )
+            offsets = image_metadata[:, 1].to(device=projected_features.device, dtype=torch.long)
+            lengths = image_metadata[:, 2].to(device=projected_features.device, dtype=torch.long)
+
+        image_features = tuple(
+            projected_features[image_idx, offset : offset + length]
+            for image_idx, (offset, length) in enumerate(zip(offsets.tolist(), lengths.tolist(), strict=True))
         )
-        flat_offsets = offsets[image_attention_mask]
-        flat_lengths = lengths[image_attention_mask]
-        token_positions = torch.arange(flat_lengths.max(), device=feature_device, dtype=torch.long)
-        gather_positions = flat_offsets[:, None] + token_positions[None, :]
-        gather_mask = token_positions[None, :] < flat_lengths[:, None]
-        image_features = flat_projected_features[
-            torch.arange(flat_projected_features.shape[0], device=feature_device, dtype=torch.long)[:, None],
-            gather_positions,
-        ][gather_mask]
-        hidden_states = vision_outputs.hidden_states
-        attentions = vision_outputs.attentions
 
         return BaseModelOutputWithPooling(
             last_hidden_state=projected_features,
             pooler_output=image_features,
-            hidden_states=hidden_states,
-            attentions=attentions,
+            hidden_states=vision_outputs.hidden_states,
+            attentions=vision_outputs.attentions,
         )
 
     def get_placeholder_mask(
@@ -1241,6 +1267,10 @@ class IsaacModel(PreTrainedModel):
         inputs_embeds: torch.FloatTensor,
         image_features: torch.FloatTensor,
     ) -> torch.BoolTensor:
+        """
+        Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
+        equal to the length of multimodal features. If the lengths are different, an error is raised.
+        """
         image_token_mask = mm_token_type_ids.to(dtype=torch.long) == 1
         n_image_tokens = image_token_mask.sum()
         image_token_mask = image_token_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
@@ -1250,119 +1280,32 @@ class IsaacModel(PreTrainedModel):
         )
         return image_token_mask
 
-    def get_vision_position_ids(
-        self,
-        start_position: int,
-        grid_hw: torch.LongTensor,
-        token_offset: int,
-        token_length: int,
-    ) -> torch.LongTensor:
-        height, width = grid_hw[0].item(), grid_hw[1].item()
-        token_positions = torch.arange(height * width, device=grid_hw.device, dtype=torch.long)
-        vision_position_ids = torch.stack(
-            (
-                torch.full((token_positions.shape[0],), start_position, device=grid_hw.device, dtype=torch.long),
-                token_positions.div(width, rounding_mode="floor"),
-                token_positions.remainder(width),
-            ),
-            dim=0,
-        )
-        return vision_position_ids[:, token_offset : token_offset + token_length]
-
-    def get_rope_index(
-        self,
-        mm_token_type_ids: torch.Tensor,
-        image_token_grids: torch.Tensor,
-        image_token_offsets: torch.Tensor,
-        image_token_lengths: torch.Tensor,
-        attention_mask: torch.Tensor,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Prepare multimodal RoPE positions for the current prefill sequence.
-
-        Unlike vanilla 1D RoPE, Isaac builds 3-axis indices for text and vision tokens.
-        If callers do not supply positions, we synthesize text-style positions from
-        `attention_mask`. The returned `rope_deltas` capture any custom offset between
-        the attended sequence length and Isaac's multimodal positions so decode steps can
-        keep counting forward from the cached prefix."""
-
-        device = attention_mask.device
-        batch_size, seq_len = attention_mask.shape
-        mm_token_type_ids = mm_token_type_ids.to(dtype=torch.long)
-        image_token_grids = image_token_grids.to(dtype=torch.long)
-        image_token_offsets = image_token_offsets.to(dtype=torch.long)
-        image_token_lengths = image_token_lengths.to(dtype=torch.long)
-        attention_mask = attention_mask.to(dtype=torch.long)
-        image_attention_mask = image_token_lengths > 0
-
-        position_ids = torch.zeros((3, batch_size, seq_len), device=device, dtype=torch.long)
-        rope_deltas = torch.zeros((batch_size, 1), device=device, dtype=torch.long)
-        pixel_shuffle_scale = self.config.vision_config.pixel_shuffle_scale_factor
-
-        for batch_idx in range(batch_size):
-            sample_attention_mask = attention_mask[batch_idx].bool()
-            sample_token_types = mm_token_type_ids[batch_idx][sample_attention_mask]
-            sample_grids = image_token_grids[batch_idx][image_attention_mask[batch_idx]]
-            sample_offsets = image_token_offsets[batch_idx][image_attention_mask[batch_idx]]
-            sample_lengths = image_token_lengths[batch_idx][image_attention_mask[batch_idx]]
-
-            current_pos = 0
-            image_idx = 0
-            seq_pos = 0
-            llm_pos_ids_list = []
-
-            while seq_pos < sample_token_types.shape[0]:
-                modality_type = int(sample_token_types[seq_pos].item())
-                group_end = seq_pos + 1
-                while group_end < sample_token_types.shape[0] and sample_token_types[group_end] == modality_type:
-                    group_end += 1
-
-                group_length = group_end - seq_pos
-                if modality_type == 0:
-                    llm_pos_ids_list.append(
-                        torch.arange(group_length, device=device, dtype=torch.long).view(1, -1).expand(3, -1)
-                        + current_pos
-                    )
-                    current_pos += group_length
-                else:
-                    grid_hw = sample_grids[image_idx].div(pixel_shuffle_scale, rounding_mode="floor")
-                    token_offset = int(sample_offsets[image_idx].item())
-                    token_length = int(sample_lengths[image_idx].item())
-                    llm_pos_ids_list.append(
-                        self.get_vision_position_ids(current_pos, grid_hw, token_offset, token_length)
-                    )
-                    current_pos += 1
-                    image_idx += 1
-
-                seq_pos = group_end
-
-            llm_positions = torch.cat(llm_pos_ids_list, dim=1)
-            position_ids[:, batch_idx, sample_attention_mask] = llm_positions
-            rope_deltas[batch_idx, 0] = llm_positions.max() + 1 - sample_token_types.shape[0]
-
-        return position_ids, rope_deltas
-
     def compute_3d_position_ids(
         self,
         input_ids: torch.Tensor,
         inputs_embeds: torch.Tensor,
         attention_mask: torch.Tensor | None,
         mm_token_type_ids: torch.Tensor | None = None,
-        image_token_grids: torch.Tensor | None = None,
-        image_token_offsets: torch.Tensor | None = None,
-        image_token_lengths: torch.Tensor | None = None,
-        past_key_values: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        image_metadata: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
     ) -> torch.Tensor:
         past_seen_tokens = 0 if past_key_values is None else past_key_values.get_seq_length()
 
-        if image_token_lengths is not None and image_token_lengths.gt(0).any() and past_seen_tokens == 0:
+        has_multimodal = image_grid_thw is not None and image_metadata is not None and image_grid_thw.shape[0] > 0
+        if has_multimodal and mm_token_type_ids is None and input_ids is not None:
+            raise ValueError(
+                "Multimodal data was passed (via `image_grid_thw`) but `mm_token_type_ids` is missing. "
+                "Please pass `mm_token_type_ids` so Isaac can build multimodal RoPE positions."
+            )
+
+        if has_multimodal and past_seen_tokens == 0:
             position_ids, rope_deltas = self.get_rope_index(
+                input_ids=input_ids,
                 mm_token_type_ids=mm_token_type_ids,
-                image_token_grids=image_token_grids,
-                image_token_offsets=image_token_offsets,
-                image_token_lengths=image_token_lengths,
+                image_grid_thw=image_grid_thw,
+                image_metadata=image_metadata,
                 attention_mask=attention_mask,
-                inputs_embeds=inputs_embeds,
             )
             self.rope_deltas = rope_deltas
             return position_ids
@@ -1406,15 +1349,12 @@ class IsaacModel(PreTrainedModel):
         self,
         input_ids: torch.LongTensor | None = None,
         mm_token_type_ids: torch.LongTensor | None = None,
-        vision_patches: torch.Tensor | None = None,
-        image_patch_attention_mask: torch.Tensor | None = None,
-        vision_token_grids: torch.LongTensor | None = None,
-        image_token_grids: torch.LongTensor | None = None,
-        vision_token_offsets: torch.LongTensor | None = None,
-        vision_token_lengths: torch.LongTensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.LongTensor | None = None,
+        image_metadata: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: list[torch.FloatTensor] | None = None,
+        past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
         **kwargs: Unpack[TransformersKwargs],
@@ -1422,95 +1362,148 @@ class IsaacModel(PreTrainedModel):
         """
         Args:
             mm_token_type_ids (`torch.LongTensor`, *optional*):
-                Multimodal token type ids aligned with the embedded sequence, shaped `(batch_size, seq_len)`. Isaac
-                follows the standard convention `0 -> text`, `1 -> image`. Treated as text-only when omitted.
-            vision_patches (`torch.FloatTensor`, *optional*):
-                Padded per-image patch vectors of shape `(batch_size, max_images, max_patches, patch_dim)`.
-            image_patch_attention_mask (`torch.LongTensor`, *optional*):
-                Mask for valid patch entries in `vision_patches`, shaped `(batch_size, max_images, max_patches)`.
-            vision_token_grids (`torch.LongTensor`, *optional*):
-                Per-image patch grids `(h, w)` with shape `(batch_size, max_images, 2)`.
-            image_token_grids (`torch.LongTensor`, *optional*):
-                Alias for `vision_token_grids`.
-            vision_token_offsets (`torch.LongTensor`, *optional*):
-                Start offsets inside the per-image vision embedding sequence, shape `(batch_size, max_images)`.
-            vision_token_lengths (`torch.LongTensor`, *optional*):
-                Number of vision tokens to consume per image, shape `(batch_size, max_images)`.
+                Multimodal token type ids aligned with the token sequence, using `0 -> text` and `1 -> image`.
+            pixel_values (`torch.FloatTensor`, *optional*):
+                Packed per-image patch vectors shaped `(num_images, max_patches, patch_dim)`.
+            image_grid_thw (`torch.LongTensor`, *optional*):
+                Packed per-image grids shaped `(num_images, 3)` with `(T=1, H, W)` entries.
+            image_metadata (`torch.LongTensor`, *optional*):
+                Internal packed metadata per image shaped `(num_images, 3)` with `(sample_idx, offset, length)`.
         """
-        created_inputs_embeds = inputs_embeds is None
-        if created_inputs_embeds:
-            inputs_embeds = self.text_model.embed_tokens(input_ids)
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("You must specify exactly one of `input_ids` or `inputs_embeds`.")
 
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+
+        batch_size, seq_len = inputs_embeds.shape[:2]
         if mm_token_type_ids is None:
-            batch_size, seq_len = inputs_embeds.shape[:2]
             mm_token_type_ids = torch.full((batch_size, seq_len), 0, device=inputs_embeds.device, dtype=torch.long)
         else:
-            mm_token_type_ids = mm_token_type_ids.to(dtype=torch.long)
+            mm_token_type_ids = mm_token_type_ids.to(device=inputs_embeds.device, dtype=torch.long)
+            if mm_token_type_ids.shape[1] < seq_len:
+                padding = mm_token_type_ids.new_zeros((batch_size, seq_len - mm_token_type_ids.shape[1]))
+                mm_token_type_ids = torch.cat([mm_token_type_ids, padding], dim=1)
+            elif mm_token_type_ids.shape[1] > seq_len:
+                mm_token_type_ids = mm_token_type_ids[:, -seq_len:]
 
-        image_token_mask = mm_token_type_ids == 1
-        if created_inputs_embeds and torch.any(image_token_mask):
+        if image_metadata is not None and image_metadata.numel() > 0:
+            image_metadata = image_metadata.to(device=inputs_embeds.device, dtype=torch.long)
+            unique_sample_ids = torch.unique(image_metadata[:, 0], sorted=True)
+            expected_sample_ids = torch.arange(
+                unique_sample_ids.shape[0], device=image_metadata.device, dtype=torch.long
+            )
+            if not torch.equal(unique_sample_ids, expected_sample_ids):
+                normalized_image_metadata = image_metadata.clone()
+                for local_idx, sample_idx in enumerate(unique_sample_ids.tolist()):
+                    normalized_image_metadata[image_metadata[:, 0] == sample_idx, 0] = local_idx
+                image_metadata = normalized_image_metadata
+
+        image_mask = None
+        if pixel_values is not None and image_grid_thw is not None and image_grid_thw.shape[0] > 0:
             image_outputs = self.get_image_features(
-                pixel_values=vision_patches,
-                image_token_grids=vision_token_grids,
-                image_patch_attention_mask=image_patch_attention_mask,
-                image_token_offsets=vision_token_offsets,
-                image_token_lengths=vision_token_lengths,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                image_metadata=image_metadata,
                 return_dict=True,
             )
-            image_features = image_outputs.pooler_output.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
-            scatter_mask = self.get_placeholder_mask(
-                mm_token_type_ids=mm_token_type_ids,
-                inputs_embeds=inputs_embeds,
-                image_features=image_features,
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(scatter_mask, image_features)
+            image_embeds = image_outputs.pooler_output
+            if len(image_embeds) > 0:
+                image_embeds = torch.cat(image_embeds, dim=0).to(
+                    device=inputs_embeds.device, dtype=inputs_embeds.dtype
+                )
+                image_mask = self.get_placeholder_mask(
+                    mm_token_type_ids=mm_token_type_ids,
+                    inputs_embeds=inputs_embeds,
+                    image_features=image_embeds,
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         if isinstance(attention_mask, dict):
             attention_mask = attention_mask["full_attention"]
 
-        past_seen_tokens = 0 if past_key_values is None else past_key_values.get_seq_length()
-        computed_position_ids = self.compute_3d_position_ids(
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            mm_token_type_ids=mm_token_type_ids,
-            image_token_grids=vision_token_grids,
-            image_token_offsets=vision_token_offsets,
-            image_token_lengths=vision_token_lengths,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-        )
-        if computed_position_ids is not None:
-            position_ids = computed_position_ids
-        elif past_seen_tokens > 0:
-            position_ids = None
-        elif position_ids is not None and past_seen_tokens == 0:
-            position_ids = position_ids.to(device=inputs_embeds.device)
-            if position_ids.ndim == 2:
-                position_ids = position_ids.view(1, position_ids.shape[0], -1).expand(3, -1, -1)
+        if position_ids is None:
+            position_ids = self.compute_3d_position_ids(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                mm_token_type_ids=mm_token_type_ids,
+                image_grid_thw=image_grid_thw,
+                image_metadata=image_metadata,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+            )
 
-        text_model_outputs = self.text_model(
+        outputs = self.language_model(
+            input_ids=None,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
+            visual_pos_masks=image_mask[..., 0] if image_mask is not None else None,
+            deepstack_visual_embeds=None,
             use_cache=use_cache,
             **kwargs,
         )
 
-        return BaseModelOutputWithPast(
-            last_hidden_state=text_model_outputs.last_hidden_state,
-            past_key_values=text_model_outputs.past_key_values,
-            hidden_states=text_model_outputs.hidden_states,
-            attentions=text_model_outputs.attentions,
+        outputs_with_rope = BaseModelOutputWithPast(
+            last_hidden_state=outputs.last_hidden_state,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
         )
+        outputs_with_rope["rope_deltas"] = self.rope_deltas
+        return outputs_with_rope
+
+
+@dataclass
+@auto_docstring
+class BaseModelOutputWithDeepstackFeatures(BaseModelOutputWithPooling):
+    r"""
+    deepstack_features (`List[torch.FloatTensor]`, *optional*):
+        List of hidden-states (feature maps) from deepstack layers.
+    """
+
+    deepstack_features: list[torch.FloatTensor] | None = None
+
+
+@dataclass
+@auto_docstring(
+    custom_intro="""
+    Base class for Isaac causal language model (or autoregressive) outputs.
+    """
+)
+class IsaacCausalLMOutputWithPast(ModelOutput):
+    r"""
+    loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+        Language modeling loss (for next-token prediction).
+    logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+        Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+    past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+        It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
+
+        Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
+        `past_key_values` input) to speed up sequential decoding.
+    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+        The rope index difference between sequence length and multimodal rope.
+    """
+
+    loss: torch.FloatTensor | None = None
+    logits: torch.FloatTensor | None = None
+    past_key_values: Cache | None = None
+    hidden_states: tuple[torch.FloatTensor] | None = None
+    attentions: tuple[torch.FloatTensor] | None = None
+    rope_deltas: torch.LongTensor | None = None
 
 
 @auto_docstring
 class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = {"lm_head.weight": "model.text_model.embed_tokens.weight"}
-    _tp_plan = {"lm_head": "colwise_gather_output"}
-    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
+    # Reference: fix gemma3 grad acc #37208
+    accepts_loss_kwargs = False
+    config: IsaacConfig
     config_class = IsaacConfig
+    input_modalities = ("image", "text")
+    _no_split_modules = ["IsaacTextDecoderLayer", "IsaacVisionEncoderLayer"]
     _can_compile_fullgraph = False
 
     def __init__(self, config: IsaacConfig):
@@ -1518,122 +1511,195 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         self.model = IsaacModel(config)
         self.vocab_size = config.get_text_config().vocab_size
         self.lm_head = nn.Linear(config.get_text_config().hidden_size, config.get_text_config().vocab_size, bias=False)
-
-        # Initialize weights and apply final processing
         self.post_init()
 
+    def get_input_embeddings(self):
+        return self.model.get_input_embeddings()
+
+    def set_input_embeddings(self, value):
+        self.model.set_input_embeddings(value)
+
     @auto_docstring
+    def get_video_features(
+        self,
+        pixel_values_videos: torch.FloatTensor,
+        video_grid_thw: torch.LongTensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple | BaseModelOutputWithDeepstackFeatures:
+        r"""
+        pixel_values_videos (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+            The tensors corresponding to the input videos.
+        video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+            The temporal, height and width of feature shape of each video in LLM.
+        """
+        return self.model.get_video_features(
+            pixel_values_videos=pixel_values_videos, video_grid_thw=video_grid_thw, **kwargs
+        )
+
+    @auto_docstring
+    def get_image_features(
+        self,
+        pixel_values: torch.FloatTensor,
+        image_grid_thw: torch.LongTensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple | BaseModelOutputWithDeepstackFeatures:
+        r"""
+        pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+            The tensors corresponding to the input images.
+        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+            The temporal, height and width of feature shape of each image in LLM.
+        """
+        return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
+
     @can_return_tuple
     def forward(
         self,
-        input_ids: torch.LongTensor | None = None,
-        mm_token_type_ids: torch.LongTensor | None = None,
-        vision_patches: torch.Tensor | None = None,
-        pixel_values: torch.Tensor | None = None,
-        image_patch_attention_mask: torch.Tensor | None = None,
-        vision_token_grids: torch.LongTensor | None = None,
-        image_token_grids: torch.LongTensor | None = None,
-        vision_token_offsets: torch.LongTensor | None = None,
-        vision_token_lengths: torch.LongTensor | None = None,
+        input_ids: torch.LongTensor = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: list[torch.FloatTensor] | None = None,
+        past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
-        use_cache: bool | None = None,
+        pixel_values: torch.Tensor | None = None,
+        pixel_values_videos: torch.FloatTensor | None = None,
+        image_grid_thw: torch.LongTensor | None = None,
+        video_grid_thw: torch.LongTensor | None = None,
+        mm_token_type_ids: torch.IntTensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple | CausalLMOutputWithPast:
+    ) -> tuple | IsaacCausalLMOutputWithPast:
         r"""
-        mm_token_type_ids (`torch.LongTensor`, *optional*):
-            Multimodal token type ids aligned with the token sequence, shaped `(batch_size, seq_len)`, using
-            `0 -> text` and `1 -> image`.
-        vision_patches (`torch.FloatTensor`, *optional*):
-            Padded per-image patch vectors of shape `(batch_size, max_images, max_patches, patch_dim)`.
-        pixel_values (`torch.FloatTensor`, *optional*):
-            Alias for `vision_patches` accepted by generic image-feature and generation helpers.
-        image_patch_attention_mask (`torch.LongTensor`, *optional*):
-            Mask for valid patch entries in `vision_patches`, shaped `(batch_size, max_images, max_patches)`.
-        vision_token_grids (`torch.LongTensor`, *optional*):
-            Per-image patch grids `(h, w)` with shape `(batch_size, max_images, 2)`.
-        image_token_grids (`torch.LongTensor`, *optional*):
-            Alias for `vision_token_grids`.
-        vision_token_offsets (`torch.LongTensor`, *optional*):
-            Start offsets inside the per-image vision embedding sequence, shape `(batch_size, max_images)`.
-        vision_token_lengths (`torch.LongTensor`, *optional*):
-            Number of vision tokens to consume per image, shape `(batch_size, max_images)`.
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+            The temporal, height and width of feature shape of each image in LLM.
+        video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+            The temporal, height and width of feature shape of each video in LLM.
+
+        Example:
+
+        ```python
+        >>> from transformers import AutoProcessor, IsaacForConditionalGeneration
+
+        >>> model = IsaacForConditionalGeneration.from_pretrained("Qwen/Qwen3-VL-8B-Instruct")
+        >>> processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct")
+
+        >>> messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "image": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/pipeline-cat-chonk.jpeg",
+                    },
+                    {"type": "text", "text": "Describe the image."},
+                ],
+            }
+        ]
+
+        >>> inputs = processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt"
+        )
+
+        >>> # Generate
+        >>> generated_ids = model.generate(**inputs, max_new_tokens=1024)
+        >>> generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
+        >>> output_text = processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        >>> print(output_text)
+        ```
         """
+
         outputs = self.model(
             input_ids=input_ids,
-            mm_token_type_ids=mm_token_type_ids,
-            vision_patches=vision_patches,
-            image_patch_attention_mask=image_patch_attention_mask,
-            vision_token_grids=vision_token_grids,
-            vision_token_offsets=vision_token_offsets,
-            vision_token_lengths=vision_token_lengths,
-            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
             position_ids=position_ids,
+            attention_mask=attention_mask,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
+            mm_token_type_ids=mm_token_type_ids,
             **kwargs,
         )
+
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
+
+        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=logits.shape[-1])
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
 
-        return CausalLMOutputWithPast(
+        return IsaacCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            rope_deltas=outputs.rope_deltas,
         )
 
     def prepare_inputs_for_generation(
         self,
-        input_ids: torch.LongTensor,
-        past_key_values: list[torch.FloatTensor] | None = None,
+        input_ids,
+        past_key_values=None,
         attention_mask: torch.Tensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         mm_token_type_ids: torch.LongTensor | None = None,
-        vision_patches: torch.Tensor | None = None,
         pixel_values: torch.Tensor | None = None,
-        image_patch_attention_mask: torch.Tensor | None = None,
-        vision_token_grids: torch.LongTensor | None = None,
-        image_token_grids: torch.LongTensor | None = None,
-        vision_token_offsets: torch.LongTensor | None = None,
-        vision_token_lengths: torch.LongTensor | None = None,
+        image_grid_thw: torch.LongTensor | None = None,
+        image_metadata: torch.LongTensor | None = None,
         position_ids: torch.LongTensor | None = None,
         is_first_iteration=False,
         use_cache=True,
         **kwargs,
     ) -> dict[str, Any]:
-        if vision_patches is None:
-            vision_token_grids = image_token_grids if vision_token_grids is None else vision_token_grids
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
             is_first_iteration=is_first_iteration,
             use_cache=use_cache,
             **kwargs,
         )
+        is_prefill = is_first_iteration or not use_cache
         multimodal_inputs = {
             "mm_token_type_ids": mm_token_type_ids,
-            "vision_patches": vision_patches,
-            "image_patch_attention_mask": image_patch_attention_mask,
-            "vision_token_grids": vision_token_grids,
-            "vision_token_offsets": vision_token_offsets,
-            "vision_token_lengths": vision_token_lengths,
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "image_metadata": image_metadata,
         }
-        is_prefill = is_first_iteration or not use_cache
         for key, value in multimodal_inputs.items():
             model_inputs[key] = value if is_prefill else None
+        if model_inputs["mm_token_type_ids"] is not None:
+            sequence_length = None
+            if model_inputs.get("input_ids") is not None:
+                sequence_length = model_inputs["input_ids"].shape[1]
+            elif model_inputs.get("inputs_embeds") is not None:
+                sequence_length = model_inputs["inputs_embeds"].shape[1]
 
+            if sequence_length is not None:
+                current_length = model_inputs["mm_token_type_ids"].shape[1]
+                if current_length < sequence_length:
+                    padding = model_inputs["mm_token_type_ids"].new_zeros(
+                        (model_inputs["mm_token_type_ids"].shape[0], sequence_length - current_length)
+                    )
+                    model_inputs["mm_token_type_ids"] = torch.cat([model_inputs["mm_token_type_ids"], padding], dim=1)
+                elif current_length > sequence_length:
+                    model_inputs["mm_token_type_ids"] = model_inputs["mm_token_type_ids"][:, -sequence_length:]
         return model_inputs
 
     def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
@@ -1648,18 +1714,15 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         if "input_ids" in model_kwargs and model_kwargs["input_ids"].shape[1] > 0:
             inputs_tensor = model_kwargs["input_ids"]
 
+        is_input_ids = len(inputs_tensor.shape) == 2 and inputs_tensor.dtype in [torch.int, torch.long]
         if (
-            model_kwargs.get("vision_token_lengths") is not None
-            and len(inputs_tensor.shape) == 2
-            and inputs_tensor.dtype in [torch.int, torch.long]
+            is_input_ids
+            and model_kwargs.get("mm_token_type_ids") is not None
+            and model_kwargs.get("image_grid_thw") is not None
+            and model_kwargs.get("image_metadata") is not None
         ):
-            vision_positions, rope_deltas = self.model.get_rope_index(
-                mm_token_type_ids=model_kwargs["mm_token_type_ids"],
-                image_token_grids=model_kwargs["vision_token_grids"],
-                image_token_offsets=model_kwargs["vision_token_offsets"],
-                image_token_lengths=model_kwargs["vision_token_lengths"],
-                attention_mask=model_kwargs.get("attention_mask"),
-            )
+            model_kwargs = {k: v for k, v in model_kwargs.items() if k != "input_ids"}
+            vision_positions, rope_deltas = self.model.get_rope_index(inputs_tensor, **model_kwargs)
             self.model.rope_deltas = rope_deltas
         else:
             vision_positions = text_positions.unsqueeze(0).expand(3, -1, -1)
@@ -1669,6 +1732,57 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
 
         return torch.cat([text_positions[None, ...], vision_positions], dim=0)
 
+    def _get_image_nums_and_video_nums(
+        self,
+        input_ids: torch.LongTensor | None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get the number of images and videos for each sample to calculate the separation length of the sample tensor.
+        These parameters are not passed through the processor to avoid unpredictable impacts from interface modifications.
+
+        Args:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                Indices of input sequence tokens in the vocabulary.
+
+        Returns:
+            image_nums (`torch.LongTensor` of shape `(batch_size, num_images_sample)`)
+            video_nums (`torch.LongTensor` of shape `(batch_size, num_videos_sample)`)
+        """
+        image_token_id = self.config.image_token_id
+        video_token_id = self.config.video_token_id
+        vision_start_token_id = self.config.vision_start_token_id
+
+        if inputs_embeds is not None:
+            vision_start_mask = (
+                inputs_embeds
+                == self.get_input_embeddings()(
+                    torch.tensor(vision_start_token_id, dtype=torch.long, device=inputs_embeds.device)
+                )
+            )[..., 0]
+            image_mask = (
+                inputs_embeds
+                == self.get_input_embeddings()(
+                    torch.tensor(image_token_id, dtype=torch.long, device=inputs_embeds.device)
+                )
+            )[..., 0]
+            video_mask = (
+                inputs_embeds
+                == self.get_input_embeddings()(
+                    torch.tensor(video_token_id, dtype=torch.long, device=inputs_embeds.device)
+                )
+            )[..., 0]
+        else:
+            vision_start_mask = input_ids == vision_start_token_id
+            image_mask = input_ids == image_token_id
+            video_mask = input_ids == video_token_id
+
+        vision_first_mask = torch.roll(vision_start_mask, shifts=1, dims=1)
+        image_nums = torch.sum(vision_first_mask & image_mask, dim=1)
+        video_nums = torch.sum(vision_first_mask & video_mask, dim=1)
+
+        return image_nums, video_nums
+
     def _expand_inputs_for_generation(
         self,
         expand_size: int = 1,
@@ -1677,12 +1791,56 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         **model_kwargs,
     ) -> tuple[torch.LongTensor, dict[str, Any]]:
         position_ids = model_kwargs.pop("position_ids", None)
-        input_ids, model_kwargs = super()._expand_inputs_for_generation(
-            expand_size=expand_size,
-            is_encoder_decoder=is_encoder_decoder,
-            input_ids=input_ids,
-            **model_kwargs,
-        )
+        if expand_size == 1:
+            if position_ids is not None:
+                model_kwargs["position_ids"] = position_ids
+            return input_ids, model_kwargs
+
+        visual_keys = ["pixel_values", "image_grid_thw", "image_metadata"]
+
+        def _empty_like(tensor):
+            return tensor.new_empty((0, *tensor.shape[1:]))
+
+        def _repeat_sample_slices(tensor, lengths):
+            samples = torch.split(tensor, lengths)
+            repeated = []
+            for sample in samples:
+                repeated.extend(sample.clone() for _ in range(expand_size))
+            return torch.cat(repeated, dim=0) if repeated else _empty_like(tensor)
+
+        if model_kwargs.get("image_metadata") is not None:
+            image_metadata = model_kwargs["image_metadata"]
+            batch_size = input_ids.shape[0] if input_ids is not None else model_kwargs["inputs_embeds"].shape[0]
+            sample_ids = image_metadata[:, 0] if image_metadata.numel() > 0 else image_metadata.new_zeros((0,))
+            image_nums = torch.bincount(sample_ids, minlength=batch_size)
+            lengths = image_nums.tolist()
+
+            if model_kwargs.get("pixel_values") is not None:
+                model_kwargs["pixel_values"] = _repeat_sample_slices(model_kwargs["pixel_values"], lengths)
+            if model_kwargs.get("image_grid_thw") is not None:
+                model_kwargs["image_grid_thw"] = _repeat_sample_slices(model_kwargs["image_grid_thw"], lengths)
+
+            expanded_metadata = []
+            for sample_idx, sample in enumerate(torch.split(image_metadata, lengths)):
+                for repeat_idx in range(expand_size):
+                    if sample.shape[0] == 0:
+                        continue
+                    repeated_sample = sample.clone()
+                    repeated_sample[:, 0] = sample_idx * expand_size + repeat_idx
+                    expanded_metadata.append(repeated_sample)
+            model_kwargs["image_metadata"] = (
+                torch.cat(expanded_metadata, dim=0) if expanded_metadata else image_metadata.new_empty((0, 3))
+            )
+
+        if input_ids is not None:
+            input_ids = input_ids.repeat_interleave(expand_size, dim=0)
+
+        for key, value in list(model_kwargs.items()):
+            if key == "position_ids" and value is not None and value.ndim == 3:
+                model_kwargs[key] = value.repeat_interleave(expand_size, dim=1)
+            elif value is not None and isinstance(value, torch.Tensor) and key not in visual_keys:
+                model_kwargs[key] = value.repeat_interleave(expand_size, dim=0)
+
         if position_ids is not None:
             dim = 1 if position_ids.ndim == 3 else 0
             model_kwargs["position_ids"] = position_ids.repeat_interleave(expand_size, dim=dim)
