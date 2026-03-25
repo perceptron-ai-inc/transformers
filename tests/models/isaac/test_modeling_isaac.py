@@ -75,10 +75,11 @@ MODEL_REVISION = os.environ.get("ISAAC_TEST_MODEL_REVISION", "refs/pr/5") or Non
 
 LOCAL_CHECKPOINT = os.environ.get("ISAAC_TEST_MODEL_PATH")
 RED_DOT_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAUAAAAFCAYAAACNbyblAAAAHElEQVQI12P4//8/w38GIAXDIBKE0DHxgljNBAAO9TXL0Y4OHwAAAABJRU5ErkJggg=="
+ISAAC_IMAGE_TOKEN = "<|image_pad|>"
 
 
 def document_to_messages(
-    document: list[dict], image_token: str = "<image>"
+    document: list[dict], image_token: str = ISAAC_IMAGE_TOKEN
 ) -> tuple[list[dict[str, str]], list[Image]]:
     """
     Convert a Document to messages format compatible with chat templates.
@@ -293,7 +294,7 @@ class SimpleIsaacTokenizer(PythonBackend):
             "<bos>": 1,
             "<eos>": 2,
             "<unk>": 3,
-            "<image>": 4,
+            ISAAC_IMAGE_TOKEN: 4,
         }
         self._ids_to_tokens = {idx: tok for tok, idx in self._vocab.items()}
         super().__init__(
@@ -301,11 +302,11 @@ class SimpleIsaacTokenizer(PythonBackend):
             eos_token="<eos>",
             pad_token="<pad>",
             unk_token="<unk>",
-            extra_special_tokens={"image_token": "<image>"},
+            extra_special_tokens={"image_pad_token": ISAAC_IMAGE_TOKEN},
             model_max_length=512,
         )
-        self.image_token = "<image>"
-        self.image_token_id = self._vocab[self.image_token]
+        self.image_pad_token = ISAAC_IMAGE_TOKEN
+        self.image_pad_token_id = self._vocab[self.image_pad_token]
         self.chat_template = (
             "{% for message in messages %}"
             "{{ message['role'] }}: {{ message['content'] | trim }}\n"
@@ -810,7 +811,7 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
 
         messages = [
             {"role": "user", "content": "Describe this image:"},
-            {"role": "user", "content": "<image>"},
+            {"role": "user", "content": ISAAC_IMAGE_TOKEN},
         ]
         generated_text = self._generate_from_messages(messages, [image])
         expected_fragment = "The image is a close-up photograph of a red cross symbol."
@@ -897,7 +898,7 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
 
         messages = [
             {"role": "user", "content": "Describe this image:"},
-            {"role": "user", "content": "<image>"},
+            {"role": "user", "content": ISAAC_IMAGE_TOKEN},
         ]
         prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True).strip()
         processor_output = self.processor(text=prompt, images=images, return_tensors="pt")
@@ -961,7 +962,7 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
         # Image + text
         messages_image_text = [
             {"role": "user", "content": "Describe this image:"},
-            {"role": "user", "content": "<image>"},
+            {"role": "user", "content": ISAAC_IMAGE_TOKEN},
         ]
         single_image_text = self._generate_from_messages(messages_image_text, [red_image])
         assert single_image_text, "Image-text single generation is empty"
