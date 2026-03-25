@@ -146,8 +146,6 @@ class IsaacConfig(PretrainedConfig):
         Rescale factor applied by the image processor before normalization.
     max_sequence_length (`int`, *optional*, defaults to 16384):
         Maximum multimodal sequence length produced by the processor and expected by the model.
-    vision_token (`str`, *optional*, defaults to `"<image>"`):
-        Prompt-facing image placeholder accepted by the processor and normalized to the tokenizer image token.
     Example:
 
     ```python
@@ -165,7 +163,6 @@ class IsaacConfig(PretrainedConfig):
     text_config: IsaacTextConfig | dict | None = None
     vision_rescale_factor: float = 1 / 255
     max_sequence_length: int = 16384
-    vision_token: str = "<image>"
 
     def __post_init__(self, **kwargs):
         for key in ("use_cache", "rope_theta", "max_position_embeddings"):

@@ -130,40 +130,30 @@ class IsaacProcessor(ProcessorMixin):
         image_processor,
         tokenizer,
         chat_template: str | dict[str, str] | None = None,
-        vision_token: str = "<image>",
         max_sequence_length: int = 16384,
     ):
         """
         Args:
             chat_template (`str` or `dict[str, str]`, *optional*):
                 Chat template override forwarded to [`~processing_utils.ProcessorMixin`].
-            vision_token (`str`, *optional*, defaults to `"<image>"`):
-                Prompt-facing image placeholder accepted as an alias for the tokenizer image token.
             max_sequence_length (`int`, *optional*, defaults to 16384):
                 Maximum packed multimodal sequence length produced by the processor.
         """
         if chat_template is None:
             chat_template = getattr(tokenizer, "chat_template", None)
 
+        if not getattr(tokenizer, "is_fast", False):
+            raise ValueError("IsaacProcessor requires a fast tokenizer to reconstruct left-truncated image spans.")
+
         self.image_processor = image_processor
         super().__init__(image_processor, tokenizer, chat_template=chat_template)
         self.text_pad_token_id = self.pad_token_id = tokenizer.pad_token_id
-        self.vision_token = vision_token
-        self.image_token = getattr(tokenizer, "image_token", None) or getattr(tokenizer, "image_pad_token", None)
-        if self.image_token is None:
-            self.image_token = vision_token
-        self.image_token_id = getattr(tokenizer, "image_token_id", None) or getattr(
-            tokenizer, "image_pad_token_id", None
+        self.image_token = getattr(tokenizer, "image_pad_token", None) or getattr(tokenizer, "image_token", None)
+        self.image_token_id = getattr(tokenizer, "image_pad_token_id", None) or getattr(
+            tokenizer, "image_token_id", None
         )
-        if self.image_token_id is None:
-            self.image_token_id = tokenizer.convert_tokens_to_ids(self.image_token)
 
         self.max_sequence_length = max_sequence_length
-
-    def _normalize_image_tokens(self, text: str) -> str:
-        if self.vision_token == self.image_token:
-            return text
-        return text.replace(self.vision_token, self.image_token)
 
     def post_process_generation(
         self,
@@ -209,27 +199,27 @@ class IsaacProcessor(ProcessorMixin):
         return_attention_mask = text_kwargs.pop("return_attention_mask", True)
         pad_to_multiple_of = text_kwargs.pop("pad_to_multiple_of", None)
         text_kwargs.pop("return_tensors", None)
+        text_kwargs.pop("return_overflowing_tokens", None)
         text_kwargs.setdefault("add_special_tokens", False)
 
         texts = [text] if isinstance(text, str) else text
-        normalized_texts = [self._normalize_image_tokens(text_value) for text_value in texts]
         if images is None:
-            batched_images = [[] for _ in normalized_texts]
+            batched_images = [[] for _ in texts]
         else:
             fetched_images = self.image_processor.fetch_images(images)
             batched_images = make_nested_list_of_images(fetched_images)
-            if len(batched_images) != len(normalized_texts):
-                num_images_in_text = [text_value.count(self.image_token) for text_value in normalized_texts]
+            if len(batched_images) != len(texts):
+                num_images_in_text = [text_value.count(self.image_token) for text_value in texts]
                 num_images_in_images = [len(sample_images) for sample_images in batched_images]
                 add_message = ""
                 if sum(num_images_in_text) == sum(num_images_in_images):
                     add_message = " Make sure to pass your images as a nested list, where each sub-list holds images for one text sample."
 
                 raise ValueError(
-                    f"Received inconsistently sized batches of images ({len(batched_images)}) and text ({len(normalized_texts)}).{add_message}"
+                    f"Received inconsistently sized batches of images ({len(batched_images)}) and text ({len(texts)}).{add_message}"
                 )
 
-        pairs = list(zip(normalized_texts, batched_images, strict=True))
+        pairs = list(zip(texts, batched_images, strict=True))
         image_inputs = self.image_processor(images=batched_images, return_tensors=TensorType.PYTORCH)
         vision_token_grids = image_inputs["vision_token_grids"]
         vision_segment_lengths = (vision_token_grids[..., 0] // self.image_processor.pixel_shuffle_scale) * (
@@ -238,7 +228,6 @@ class IsaacProcessor(ProcessorMixin):
         vision_token_offsets = torch.zeros_like(vision_segment_lengths)
         vision_token_lengths = torch.zeros_like(vision_segment_lengths)
 
-        sample_input_ids: list[torch.Tensor] = []
         expanded_texts = []
         expected_image_lengths_per_sample = []
 
@@ -261,46 +250,85 @@ class IsaacProcessor(ProcessorMixin):
                 expanded_text += (self.image_token * segment_length) + segments[image_idx + 1]
             expanded_texts.append(expanded_text)
 
-        tokenized_text_inputs = self.tokenizer(expanded_texts, return_tensors=None, **text_kwargs)
-        self._check_special_mm_tokens(expanded_texts, tokenized_text_inputs, modalities=["image"])
-
         effective_max_length = self.max_sequence_length
-        if truncation and max_length is not None:
+        if max_length is not None and (truncation or padding == "max_length"):
             effective_max_length = max_length
 
-        for batch_idx, (expected_image_lengths, sample_input_ids_list) in enumerate(
-            zip(expected_image_lengths_per_sample, tokenized_text_inputs["input_ids"], strict=True)
+        original_truncation_side = self.tokenizer.truncation_side
+        original_padding_side = self.tokenizer.padding_side
+        self.tokenizer.truncation_side = "left"
+        self.tokenizer.padding_side = padding_side
+        try:
+            tokenized_text_inputs = self.tokenizer(
+                expanded_texts,
+                truncation=True,
+                max_length=effective_max_length,
+                padding=padding,
+                pad_to_multiple_of=pad_to_multiple_of,
+                return_attention_mask=return_attention_mask,
+                return_overflowing_tokens=True,
+                stride=0,
+                return_tensors=None,
+                **text_kwargs,
+            )
+        finally:
+            self.tokenizer.truncation_side = original_truncation_side
+            self.tokenizer.padding_side = original_padding_side
+
+        overflow_to_sample_mapping = tokenized_text_inputs.get("overflow_to_sample_mapping")
+        if overflow_to_sample_mapping is None:
+            raise ValueError("IsaacProcessor requires overflow-to-sample mappings from a fast tokenizer.")
+
+        kept_input_ids_per_sample: list[list[int] | None] = [None] * len(texts)
+        overflow_input_ids_per_sample: list[list[list[int]]] = [[] for _ in texts]
+        grouped_image_token_counts = [0] * len(texts)
+        grouped_row_counts = [0] * len(texts)
+
+        for row_input_ids, sample_idx in zip(
+            tokenized_text_inputs["input_ids"], overflow_to_sample_mapping, strict=True
         ):
-            sample_input = torch.tensor(sample_input_ids_list, dtype=torch.long)
-            image_positions = sample_input.eq(self.image_token_id).nonzero(as_tuple=False).flatten()
-            image_spans = image_positions.split(expected_image_lengths) if expected_image_lengths else ()
-            total = int(sample_input.shape[0])
-            start = max(0, total - effective_max_length)
-            sample_input_ids.append(sample_input[start:])
+            sample_idx = int(sample_idx)
+            grouped_row_counts[sample_idx] += 1
+            grouped_image_token_counts[sample_idx] += row_input_ids.count(self.image_token_id)
+            if kept_input_ids_per_sample[sample_idx] is None:
+                kept_input_ids_per_sample[sample_idx] = row_input_ids
+            else:
+                overflow_input_ids_per_sample[sample_idx].append(row_input_ids)
 
-            for image_idx, (_, image_span) in enumerate(zip(expected_image_lengths, image_spans, strict=True)):
-                image_start = int(image_span[0].item())
-                image_end = int(image_span[-1].item()) + 1
-                kept_start = max(start, image_start)
-                kept_end = image_end
-                if kept_end > kept_start:
-                    # Record which suffix of this image's placeholder span survives left truncation.
-                    # The model still encodes the full image and uses this window for both feature gathering and vision RoPE.
-                    vision_token_offsets[batch_idx, image_idx] = kept_start - image_start
-                    vision_token_lengths[batch_idx, image_idx] = kept_end - kept_start
+        for batch_idx, expected_image_lengths in enumerate(expected_image_lengths_per_sample):
+            kept_input_ids_list = kept_input_ids_per_sample[batch_idx]
+            if kept_input_ids_list is None or grouped_row_counts[batch_idx] == 0:
+                raise ValueError(f"Failed to recover tokenized rows for Isaac sample {batch_idx}.")
 
-        # Pad only after Isaac-specific truncation so image span offsets and lengths stay aligned.
-        padded_text_inputs = self.tokenizer.pad(
-            {"input_ids": [sample_input.tolist() for sample_input in sample_input_ids]},
-            padding=padding,
-            max_length=max_length if padding == "max_length" else None,
-            pad_to_multiple_of=pad_to_multiple_of,
-            padding_side=padding_side,
-            return_attention_mask=return_attention_mask,
-            return_tensors=TensorType.PYTORCH,
-        )
-        input_ids = padded_text_inputs["input_ids"]
-        attention_mask = padded_text_inputs.get("attention_mask")
+            expected_image_token_count = sum(expected_image_lengths)
+            if grouped_image_token_counts[batch_idx] != expected_image_token_count:
+                raise ValueError(
+                    f"Isaac image-token accounting mismatch for sample {batch_idx}: expected {expected_image_token_count}, got {grouped_image_token_counts[batch_idx]}."
+                )
+
+            dropped_image_tokens = sum(
+                overflow_input_ids.count(self.image_token_id)
+                for overflow_input_ids in overflow_input_ids_per_sample[batch_idx]
+            )
+
+            remaining_dropped = dropped_image_tokens
+            for image_idx, expected_length in enumerate(expected_image_lengths):
+                if remaining_dropped <= 0:
+                    offset = 0
+                    length = expected_length
+                elif remaining_dropped < expected_length:
+                    offset = remaining_dropped
+                    length = expected_length - offset
+                    remaining_dropped = 0
+                else:
+                    offset = 0
+                    length = 0
+                    remaining_dropped -= expected_length
+
+                vision_token_offsets[batch_idx, image_idx] = offset
+                vision_token_lengths[batch_idx, image_idx] = length
+
+        input_ids = torch.tensor(kept_input_ids_per_sample, dtype=torch.long)
         attention_mask = input_ids.ne(self.pad_token_id).to(dtype=torch.long)
 
         mm_token_type_ids = input_ids.eq(self.image_token_id).to(dtype=torch.long)
