@@ -109,6 +109,12 @@ def _build_checkpoint_conversion_mapping():
                 source_patterns=r"(?<!_)model(?!\.(language_model|visual))", target_patterns="model.language_model"
             ),
         ],
+        "isaac": [
+            WeightRenaming(source_patterns=r"^model\.text_model", target_patterns="model.language_model"),
+            WeightRenaming(source_patterns=r"^text_model", target_patterns="language_model"),
+            WeightRenaming(source_patterns=r"^model\.vision_tower", target_patterns="model.visual"),
+            WeightRenaming(source_patterns=r"^vision_tower", target_patterns="visual"),
+        ],
         "colqwen2": [
             WeightRenaming(
                 source_patterns=r"vlm.model(?!\.(language_model|visual))",
