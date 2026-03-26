@@ -204,29 +204,31 @@ def create_isaac_processor(
     **overrides,
 ):
     """Helper to construct IsaacProcessor without requiring an IsaacConfig instance."""
+    vision_config = isaac_config.vision_config
     params = {
         "max_sequence_length": isaac_config.max_sequence_length,
-        "vision_patch_size": isaac_config.vision_patch_size,
-        "vision_max_num_patches": isaac_config.vision_max_num_patches,
-        "vision_min_num_patches": isaac_config.vision_min_num_patches,
-        "pixel_shuffle_scale": isaac_config.pixel_shuffle_scale,
+        "vision_patch_size": vision_config.patch_size,
+        "vision_max_num_patches": vision_config.num_patches,
+        "vision_min_num_patches": getattr(vision_config, "min_num_patches", None),
+        "pixel_shuffle_scale": vision_config.pixel_shuffle_scale_factor,
         "rescale_factor": isaac_config.vision_rescale_factor,
-        "image_mean": tuple(isaac_config.vision_mean),
-        "image_std": tuple(isaac_config.vision_std),
     }
     params.update(overrides)
 
     processor_image = image_processor
     if processor_image is None:
-        processor_image = IsaacImageProcessor(
-            patch_size=params["vision_patch_size"],
-            max_num_patches=params["vision_max_num_patches"],
-            min_num_patches=params["vision_min_num_patches"],
-            pixel_shuffle_scale=params["pixel_shuffle_scale"],
-            rescale_factor=params["rescale_factor"],
-            image_mean=params["image_mean"],
-            image_std=params["image_std"],
-        )
+        image_processor_kwargs = {
+            "patch_size": params["vision_patch_size"],
+            "max_num_patches": params["vision_max_num_patches"],
+            "min_num_patches": params["vision_min_num_patches"],
+            "pixel_shuffle_scale": params["pixel_shuffle_scale"],
+            "rescale_factor": params["rescale_factor"],
+        }
+        if "image_mean" in params:
+            image_processor_kwargs["image_mean"] = params["image_mean"]
+        if "image_std" in params:
+            image_processor_kwargs["image_std"] = params["image_std"]
+        processor_image = IsaacImageProcessor(**image_processor_kwargs)
     processor_params = {
         "max_sequence_length": isaac_config.max_sequence_length,
     }
@@ -241,17 +243,41 @@ def create_isaac_processor(
 def to_model_multimodal_inputs(processor_output, device):
     keys = (
         "mm_token_type_ids",
-        "vision_patches",
-        "image_patch_attention_mask",
-        "vision_token_grids",
-        "vision_token_offsets",
-        "vision_token_lengths",
+        "pixel_values",
+        "image_grid_thw",
+        "image_metadata",
     )
     return {
         key: (value.to(device) if isinstance(value, torch.Tensor) else value)
         for key, value in processor_output.items()
         if key in keys
     }
+
+
+def pack_image_inputs(pixel_values, image_token_grids, image_token_offsets=None, image_token_lengths=None):
+    batch_size, max_images, max_patches, patch_dim = pixel_values.shape
+    num_images = batch_size * max_images
+    device = pixel_values.device
+
+    if image_token_offsets is None:
+        image_token_offsets = torch.zeros((batch_size, max_images), device=device, dtype=torch.long)
+    if image_token_lengths is None:
+        image_token_lengths = image_token_grids[..., 0] * image_token_grids[..., 1]
+
+    image_grid_thw = torch.zeros((num_images, 3), device=device, dtype=torch.long)
+    image_grid_thw[:, 0] = 1
+    image_grid_thw[:, 1:] = image_token_grids.reshape(num_images, 2)
+
+    image_metadata = torch.stack(
+        (
+            torch.arange(batch_size, device=device, dtype=torch.long).repeat_interleave(max_images),
+            image_token_offsets.reshape(-1).to(device=device, dtype=torch.long),
+            image_token_lengths.reshape(-1).to(device=device, dtype=torch.long),
+        ),
+        dim=1,
+    )
+
+    return pixel_values.reshape(num_images, max_patches, patch_dim), image_grid_thw, image_metadata
 
 
 @lru_cache(maxsize=1)
@@ -424,21 +450,26 @@ class IsaacModelTester:
 
     def prepare_config_and_inputs_for_common(self):
         config, input_ids, attention_mask, labels = self.prepare_config_and_inputs()
-        position_ids = torch.arange(self.seq_length, device=torch_device).view(1, -1).expand(self.batch_size, -1)
         patch_size = self.vision_config["patch_size"]
         patch_dim = self.vision_config["num_channels"] * patch_size * patch_size
         num_image_patches = 4
+        vision_patches = torch.randn(
+            (self.batch_size, 1, num_image_patches, patch_dim), device=torch_device, dtype=torch.float32
+        )
+        image_token_grids = torch.tensor([[[2, 2]]] * self.batch_size, device=torch_device, dtype=torch.long)
+        pixel_values, image_grid_thw, image_metadata = pack_image_inputs(
+            pixel_values=vision_patches,
+            image_token_grids=image_token_grids,
+        )
+        mm_token_type_ids = torch.zeros((self.batch_size, self.seq_length), device=torch_device, dtype=torch.long)
+        mm_token_type_ids[:, :num_image_patches] = 1
         inputs_dict = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "position_ids": position_ids,
-            "pixel_values": torch.randn(
-                (self.batch_size, 1, num_image_patches, patch_dim), device=torch_device, dtype=torch.float32
-            ),
-            "image_patch_attention_mask": torch.ones(
-                (self.batch_size, 1, num_image_patches), device=torch_device, dtype=torch.long
-            ),
-            "image_token_grids": torch.tensor([[[2, 2]]] * self.batch_size, device=torch_device, dtype=torch.long),
+            "mm_token_type_ids": mm_token_type_ids,
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "image_metadata": image_metadata,
         }
         if labels is not None:
             inputs_dict["labels"] = labels
@@ -472,6 +503,41 @@ class IsaacModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
         self.maxDiff = None
         self.config_tester.run_common_tests()
 
+    def prepare_config_and_inputs_for_generate(self, batch_size=2):
+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+
+        input_keys_to_ignore = [
+            "decoder_input_ids",
+            "decoder_attention_mask",
+            "use_cache",
+            "labels",
+        ]
+
+        filtered_inputs_dict = {
+            k: v[:batch_size, ...]
+            if isinstance(v, torch.Tensor) and k not in ["pixel_values", "image_grid_thw", "image_metadata"]
+            else v
+            for k, v in inputs_dict.items()
+            if k not in input_keys_to_ignore
+        }
+
+        image_mask = inputs_dict["image_metadata"][:, 0] < batch_size
+        filtered_inputs_dict["pixel_values"] = inputs_dict["pixel_values"][image_mask]
+        filtered_inputs_dict["image_grid_thw"] = inputs_dict["image_grid_thw"][image_mask]
+        filtered_inputs_dict["image_metadata"] = inputs_dict["image_metadata"][image_mask]
+
+        text_gen_config = config.get_text_config(decoder=True)
+        if text_gen_config.eos_token_id is not None and text_gen_config.pad_token_id is None:
+            text_gen_config.pad_token_id = (
+                text_gen_config.eos_token_id
+                if isinstance(text_gen_config.eos_token_id, int)
+                else text_gen_config.eos_token_id[0]
+            )
+        text_gen_config.eos_token_id = None
+        text_gen_config.forced_eos_token_id = None
+
+        return config, filtered_inputs_dict
+
     @unittest.skip(reason="Assisted decoding not supported; Qwen3 backbone does not implement returning attentions")
     def test_assisted_decoding_matches_greedy_search_0_random(self):
         pass
@@ -502,7 +568,8 @@ class IsaacModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
         model.to(torch_device)
         model.eval()
 
-        vision_token_grids = torch.zeros((self.model_tester.batch_size, 0, 2), device=torch_device, dtype=torch.long)
+        image_grid_thw = torch.zeros((0, 3), device=torch_device, dtype=torch.long)
+        image_metadata = torch.zeros((0, 3), device=torch_device, dtype=torch.long)
 
         with torch.no_grad():
             reference = model(input_ids=input_ids, attention_mask=attention_mask)
@@ -512,7 +579,8 @@ class IsaacModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
                 result = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    vision_token_grids=vision_token_grids,
+                    image_grid_thw=image_grid_thw,
+                    image_metadata=image_metadata,
                 )
 
         mock_get_image_features.assert_not_called()
@@ -532,31 +600,40 @@ class IsaacModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
             device=torch_device,
             dtype=torch.long,
         )
-        image_patch_attention_mask = torch.ones((2, 2, 4), device=torch_device, dtype=torch.long)
         image_token_offsets = torch.tensor([[1, 0], [2, 0]], device=torch_device, dtype=torch.long)
         image_token_lengths = torch.tensor([[2, 1], [1, 0]], device=torch_device, dtype=torch.long)
+        packed_pixel_values, image_grid_thw, image_metadata = pack_image_inputs(
+            pixel_values=pixel_values,
+            image_token_grids=image_token_grids,
+            image_token_offsets=image_token_offsets,
+            image_token_lengths=image_token_lengths,
+        )
+
+        active_images = image_grid_thw[:, 1:].prod(dim=1).gt(0)
+        packed_pixel_values = packed_pixel_values[active_images]
+        image_grid_thw = image_grid_thw[active_images]
+        image_metadata = image_metadata[active_images]
 
         with torch.no_grad():
             outputs = model.get_image_features(
-                pixel_values=pixel_values,
-                image_token_grids=image_token_grids,
-                image_patch_attention_mask=image_patch_attention_mask,
-                image_token_offsets=image_token_offsets,
-                image_token_lengths=image_token_lengths,
+                pixel_values=packed_pixel_values,
+                image_grid_thw=image_grid_thw,
+                image_metadata=image_metadata,
                 return_dict=True,
             )
 
         expected = torch.cat(
             (
-                outputs.last_hidden_state[0, 0, 1:3],
-                outputs.last_hidden_state[0, 1, 0:1],
-                outputs.last_hidden_state[1, 0, 2:3],
+                outputs.last_hidden_state[0, 1:3],
+                outputs.last_hidden_state[1, 0:1],
+                outputs.last_hidden_state[2, 2:3],
             ),
             dim=0,
         )
+        pooled_output = torch.cat(outputs.pooler_output, dim=0)
 
-        self.assertEqual(outputs.pooler_output.ndim, 2)
-        torch.testing.assert_close(outputs.pooler_output, expected)
+        self.assertEqual(pooled_output.ndim, 2)
+        torch.testing.assert_close(pooled_output, expected)
 
     def test_for_conditional_generation(self):
         config, input_ids, attention_mask, labels = self.model_tester.prepare_config_and_inputs()
@@ -579,7 +656,7 @@ class IsaacModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
 
         self.assertTrue(hasattr(model, "model"))
         self.assertTrue(hasattr(model, "lm_head"))
-        self.assertTrue(hasattr(model.model, "vision_tower"))
+        self.assertTrue(hasattr(model.model, "visual"))
         self.assertTrue(hasattr(model.model, "multimodal_projector"))
 
         input_vocab_size = model.get_input_embeddings().num_embeddings
@@ -604,6 +681,40 @@ class IsaacModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
         self.assertIsNotNone(outputs.loss)
         self.assertEqual(outputs.loss.ndim, 0)
         self.assertEqual(outputs.logits.shape, (batch_size, seq_len, output_vocab_size))
+
+    @pytest.mark.generate
+    def test_left_padding_compatibility(self):
+        _, inputs_dict = self.prepare_config_and_inputs_for_generate()
+        mm_token_type_ids = inputs_dict["mm_token_type_ids"]
+        pad_size = (mm_token_type_ids.shape[0], 32)
+        padded_mm_token_type_ids = torch.cat(
+            (torch.zeros(pad_size, dtype=mm_token_type_ids.dtype, device=torch_device), mm_token_type_ids), dim=1
+        )
+
+        super().test_left_padding_compatibility(
+            unpadded_custom_inputs={"mm_token_type_ids": mm_token_type_ids},
+            padded_custom_inputs={"mm_token_type_ids": padded_mm_token_type_ids},
+        )
+
+    @unittest.skip(reason="Isaac is image-only.")
+    def test_get_video_features_output_0(self):
+        pass
+
+    @unittest.skip(reason="Isaac is image-only.")
+    def test_get_video_features_output_1(self):
+        pass
+
+    @unittest.skip(reason="Isaac is image-only.")
+    def test_get_video_features_output_2(self):
+        pass
+
+    @unittest.skip(reason="Isaac is image-only.")
+    def test_get_video_features_hidden_states(self):
+        pass
+
+    @unittest.skip(reason="Isaac is image-only.")
+    def test_get_video_features_attentions(self):
+        pass
 
 
 @require_torch
@@ -905,11 +1016,15 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
         input_ids = processor_output["input_ids"]
         device = next(self.model.parameters()).device
         input_ids = input_ids.to(device)
+        attention_mask = processor_output.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
         multimodal_inputs = to_model_multimodal_inputs(processor_output, device)
 
         with torch.no_grad():
             outputs = self.model.generate(
                 input_ids=input_ids,
+                attention_mask=attention_mask,
                 **multimodal_inputs,
                 max_new_tokens=num_tokens or self.max_new_tokens,
                 do_sample=False,
@@ -1026,23 +1141,32 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
             expected_modality[-single_len:] = single_packed["mm_token_type_ids"].squeeze(0)
             torch.testing.assert_close(batch_modality_row, expected_modality)
 
-            if single_packed["vision_patches"] is not None:
-                expected_image_count = int(single_packed["vision_token_lengths"].gt(0).sum().item())
-                batch_image_count = int(batch_packed["vision_token_lengths"][i].gt(0).sum().item())
+            if "image_metadata" in single_packed:
+                single_image_mask = single_packed["image_metadata"][:, 0].eq(0)
+                batch_image_mask = batch_packed["image_metadata"][:, 0].eq(i)
+                expected_image_count = int(single_image_mask.sum().item())
+                batch_image_count = int(batch_image_mask.sum().item())
                 assert batch_image_count == expected_image_count
                 if expected_image_count > 0:
-                    torch.testing.assert_close(
-                        batch_packed["vision_token_grids"][i, :expected_image_count],
-                        single_packed["vision_token_grids"][0, :expected_image_count],
-                    )
-                    torch.testing.assert_close(
-                        batch_packed["vision_token_offsets"][i, :expected_image_count],
-                        single_packed["vision_token_offsets"][0, :expected_image_count],
-                    )
-                    torch.testing.assert_close(
-                        batch_packed["vision_token_lengths"][i, :expected_image_count],
-                        single_packed["vision_token_lengths"][0, :expected_image_count],
-                    )
+                    batch_image_grid_thw = batch_packed["image_grid_thw"][batch_image_mask]
+                    single_image_grid_thw = single_packed["image_grid_thw"][single_image_mask]
+                    batch_image_metadata = batch_packed["image_metadata"][batch_image_mask, 1:]
+                    single_image_metadata = single_packed["image_metadata"][single_image_mask, 1:]
+
+                    torch.testing.assert_close(batch_image_grid_thw, single_image_grid_thw)
+                    torch.testing.assert_close(batch_image_metadata, single_image_metadata)
+
+                    for batch_pixel_values, single_pixel_values, grid_thw in zip(
+                        batch_packed["pixel_values"][batch_image_mask],
+                        single_packed["pixel_values"][single_image_mask],
+                        batch_image_grid_thw,
+                        strict=True,
+                    ):
+                        valid_patch_count = int((grid_thw[1] * grid_thw[2]).item())
+                        torch.testing.assert_close(
+                            batch_pixel_values[:valid_patch_count],
+                            single_pixel_values[:valid_patch_count],
+                        )
 
             if single_len == max_length:
                 continue
@@ -1054,10 +1178,9 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
             assert not torch.any(attention_mask[: max_length - single_len]), f"sample {i} mask ones inside left pad"
             assert torch.all(attention_mask[-single_len:]), f"sample {i} mask zeros inside content"
 
-        assert batch_packed["vision_patches"] is not None
-        assert batch_packed["vision_token_grids"] is not None
-        assert batch_packed["vision_token_offsets"] is not None
-        assert batch_packed["vision_token_lengths"] is not None
+        assert batch_packed["pixel_values"] is not None
+        assert batch_packed["image_grid_thw"] is not None
+        assert batch_packed["image_metadata"] is not None
 
         batch_texts = self._generate_batch(prompts, images_list, num_tokens=100)
         assert len(batch_texts) == len(single_texts) == 3
@@ -1112,12 +1235,16 @@ class IsaacBoxPointingIntegrationTest(unittest.TestCase):
         prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True).strip()
         processor_output = self.processor(text=prompt, images=images, return_tensors="pt")
         input_ids = processor_output["input_ids"].to(self.device)
+        attention_mask = processor_output.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
         prompt_len = input_ids.shape[1]
         multimodal_inputs = to_model_multimodal_inputs(processor_output, self.device)
 
         with torch.no_grad():
             outputs = self.model.generate(
                 input_ids=input_ids,
+                attention_mask=attention_mask,
                 **multimodal_inputs,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=False,
@@ -1162,12 +1289,16 @@ class IsaacBoxPointingIntegrationTest(unittest.TestCase):
         prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True).strip()
         processor_output = self.processor(text=prompt, images=images, return_tensors="pt")
         input_ids = processor_output["input_ids"].to(self.device)
+        attention_mask = processor_output.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
         prompt_len = input_ids.shape[1]
         multimodal_inputs = to_model_multimodal_inputs(processor_output, self.device)
 
         with torch.no_grad():
             outputs = self.model.generate(
                 input_ids=input_ids,
+                attention_mask=attention_mask,
                 **multimodal_inputs,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=False,
