@@ -17,6 +17,7 @@
 import base64
 import io
 import os
+import re
 import unittest
 from functools import lru_cache
 from pathlib import Path
@@ -33,7 +34,6 @@ from transformers import (
     IsaacForConditionalGeneration,
     IsaacModel,
     PythonBackend,
-    Qwen2Tokenizer,
     is_torch_available,
 )
 from transformers.image_utils import load_image
@@ -119,6 +119,15 @@ def document_to_messages(
                 )
 
     return messages, images
+
+
+def strip_trailing_stop_string(text: str, stop_strings: list[str] | tuple[str, ...] | None = None) -> str:
+    if stop_strings is not None:
+        for stop_string in stop_strings:
+            if text.endswith(stop_string):
+                text = text[: -len(stop_string)]
+                break
+    return re.sub(r"^\n{2,}", "\n", text)
 
 
 def compute_logits_statistics(tensor: torch.Tensor) -> dict[str, object]:
@@ -871,10 +880,8 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.checkpoint = _base_reference_checkpoint_or_skip()
         self.hf_config = IsaacConfig.from_pretrained(self.checkpoint, revision=BASE_MODEL_REVISION)
-        self.tokenizer = Qwen2Tokenizer.from_pretrained(
-            self.checkpoint, trust_remote_code=False, use_fast=False, revision=BASE_MODEL_REVISION
-        )
-        self.processor = create_isaac_processor(self.tokenizer, self.hf_config)
+        self.processor = IsaacProcessor.from_pretrained(self.checkpoint, revision=BASE_MODEL_REVISION, do_pad=True)
+        self.tokenizer = self.processor.tokenizer
         self.hf_config.vision_config._attn_implementation = "flash_attention_2"
         self.hf_config.vision_config.attn_implementation = "flash_attention_2"
         self.model = IsaacForConditionalGeneration.from_pretrained(
@@ -922,7 +929,7 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
 
         messages = [
             {"role": "user", "content": "Describe this image:"},
-            {"role": "user", "content": ISAAC_IMAGE_TOKEN},
+            {"role": "user", "content": self.processor.image_token},
         ]
         generated_text = self._generate_from_messages(messages, [image])
         expected_fragment = "The image is a close-up photograph of a red cross symbol."
@@ -942,20 +949,46 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
         assert expected_fragmenet in generated_text
 
     def test_vqa_from_image(self):
-        document = [
+        image = load_image(
+            "https://raw.githubusercontent.com/perceptron-ai-inc/perceptron/refs/heads/main/huggingface/assets/example.webp"
+        )
+        messages = [
             {
-                "type": "image",
-                "content": "https://raw.githubusercontent.com/perceptron-ai-inc/perceptron/refs/heads/main/huggingface/assets/example.webp",
                 "role": "user",
-            },
-            {
-                "type": "text",
-                "content": "Is it safe to cross the street at this moment?",
-                "role": "user",
+                "content": f"{self.processor.image_token}\nIs it safe to cross the street at this moment?",
             },
         ]
-        messages, images = document_to_messages(document)
-        generated_text = self._generate_from_messages(messages, images, num_tokens=256)
+        prompt = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        ).strip()
+        processor_output = self.processor(text=prompt, images=[image], return_tensors="pt")
+        input_ids = processor_output["input_ids"].to(self.device)
+        attention_mask = processor_output.get("attention_mask")
+        if attention_mask is None:
+            pad_id = self.tokenizer.pad_token_id
+            if pad_id is None:
+                pad_id = getattr(self.processor, "pad_token_id", 0)
+            attention_mask = processor_output["input_ids"].ne(pad_id).long()
+        attention_mask = attention_mask.to(self.device)
+        prompt_len = input_ids.shape[1]
+        multimodal_inputs = to_model_multimodal_inputs(processor_output, self.device)
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                **multimodal_inputs,
+                max_new_tokens=256,
+                do_sample=False,
+                pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+                tokenizer=self.tokenizer,
+                return_dict_in_generate=True,
+            )
+
+        generated_ids = outputs.sequences
+        generated_tail = generated_ids[:, prompt_len:]
+        generated_text = self.tokenizer.decode(generated_tail[0], skip_special_tokens=True)
         expected_response = "\nNo, it is not safe to cross the street at this moment. The traffic light for pedestrians is red, indicating that it is not safe to cross."
         assert generated_text == expected_response
 
@@ -1009,7 +1042,7 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
 
         messages = [
             {"role": "user", "content": "Describe this image:"},
-            {"role": "user", "content": ISAAC_IMAGE_TOKEN},
+            {"role": "user", "content": self.processor.image_token},
         ]
         prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True).strip()
         processor_output = self.processor(text=prompt, images=images, return_tensors="pt")
@@ -1077,13 +1110,13 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
         # Image + text
         messages_image_text = [
             {"role": "user", "content": "Describe this image:"},
-            {"role": "user", "content": ISAAC_IMAGE_TOKEN},
+            {"role": "user", "content": self.processor.image_token},
         ]
         single_image_text = self._generate_from_messages(messages_image_text, [red_image])
         assert single_image_text, "Image-text single generation is empty"
 
         # VQA
-        messages_vqa, images_vqa = document_to_messages(vqa_document)
+        messages_vqa, images_vqa = document_to_messages(vqa_document, image_token=self.processor.image_token)
         single_vqa = self._generate_from_messages(messages_vqa, images_vqa, num_tokens=self.max_new_tokens)
         assert single_vqa, "VQA single generation is empty"
 
@@ -1201,10 +1234,9 @@ class IsaacBoxPointingIntegrationTest(unittest.TestCase):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.checkpoint = _reference_checkpoint_or_skip()
         self.hf_config = IsaacConfig.from_pretrained(self.checkpoint, revision=MODEL_REVISION)
-        self.tokenizer = Qwen2Tokenizer.from_pretrained(
-            self.checkpoint, trust_remote_code=False, use_fast=False, revision=MODEL_REVISION
-        )
-        self.processor = create_isaac_processor(self.tokenizer, self.hf_config)
+        # The current local slow fallback only supports padded packing for this checkpoint.
+        self.processor = IsaacProcessor.from_pretrained(self.checkpoint, revision=MODEL_REVISION, do_pad=True)
+        self.tokenizer = self.processor.tokenizer
         self.hf_config.vision_config._attn_implementation = "flash_attention_2"
         self.hf_config.vision_config.attn_implementation = "flash_attention_2"
         self.model = IsaacForConditionalGeneration.from_pretrained(
@@ -1214,26 +1246,23 @@ class IsaacBoxPointingIntegrationTest(unittest.TestCase):
         self.model.eval()
 
     def test_hf_generate_box_points(self):
-        document = [
+        image = load_image(
+            "https://raw.githubusercontent.com/perceptron-ai-inc/perceptron/refs/heads/main/huggingface/assets/example.webp"
+        )
+        messages = [
             {
-                "type": "text",
+                "role": "user",
                 "content": "<hint>BOX</hint>",
-                "role": "user",
             },
             {
-                "type": "image",
-                "content": "https://raw.githubusercontent.com/perceptron-ai-inc/perceptron/refs/heads/main/huggingface/assets/example.webp",
                 "role": "user",
-            },
-            {
-                "type": "text",
-                "content": "Determine whether it is safe to cross the street. Look for signage and moving traffic.",
-                "role": "user",
+                "content": f"{self.processor.image_token}\nDetermine whether it is safe to cross the street. Look for signage and moving traffic.",
             },
         ]
-        messages, images = document_to_messages(document, image_token=self.processor.image_token)
-        prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True).strip()
-        processor_output = self.processor(text=prompt, images=images, return_tensors="pt")
+        prompt = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        ).strip()
+        processor_output = self.processor(text=prompt, images=[image], return_tensors="pt")
         input_ids = processor_output["input_ids"].to(self.device)
         attention_mask = processor_output.get("attention_mask")
         if attention_mask is not None:
@@ -1250,6 +1279,7 @@ class IsaacBoxPointingIntegrationTest(unittest.TestCase):
                 do_sample=False,
                 pad_token_id=self.tokenizer.eos_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
+                tokenizer=self.tokenizer,
                 return_dict_in_generate=True,
             )
 
