@@ -1422,16 +1422,24 @@ class IsaacModel(IsaacPreTrainedModel):
         if isinstance(attention_mask, dict):
             attention_mask = attention_mask["full_attention"]
 
-        if position_ids is None:
-            position_ids = self.compute_3d_position_ids(
-                input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
-                mm_token_type_ids=mm_token_type_ids,
-                image_grid_thw=image_grid_thw,
-                image_metadata=image_metadata,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-            )
+        past_seen_tokens = 0 if past_key_values is None else past_key_values.get_seq_length()
+        computed_position_ids = self.compute_3d_position_ids(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            mm_token_type_ids=mm_token_type_ids,
+            image_grid_thw=image_grid_thw,
+            image_metadata=image_metadata,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+        )
+        if computed_position_ids is not None:
+            position_ids = computed_position_ids
+        elif past_seen_tokens > 0:
+            position_ids = None
+        elif position_ids is not None and past_seen_tokens == 0:
+            position_ids = position_ids.to(device=inputs_embeds.device)
+            if position_ids.ndim == 2:
+                position_ids = position_ids.view(1, position_ids.shape[0], -1).expand(3, -1, -1)
 
         outputs = self.language_model(
             input_ids=None,
