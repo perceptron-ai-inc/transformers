@@ -1429,16 +1429,10 @@ class IsaacModel(Qwen3VLModel):
                 mm_token_type_ids = mm_token_type_ids[:, -seq_len:]
 
         if image_metadata is not None and image_metadata.numel() > 0:
+            # Keep metadata sample indices aligned with the original batch rows. Mixed batches may include
+            # text-only samples, so compressing image-bearing rows to a contiguous index space misassigns
+            # image spans during RoPE construction.
             image_metadata = image_metadata.to(device=inputs_embeds.device, dtype=torch.long)
-            unique_sample_ids = torch.unique(image_metadata[:, 0], sorted=True)
-            expected_sample_ids = torch.arange(
-                unique_sample_ids.shape[0], device=image_metadata.device, dtype=torch.long
-            )
-            if not torch.equal(unique_sample_ids, expected_sample_ids):
-                normalized_image_metadata = image_metadata.clone()
-                for local_idx, sample_idx in enumerate(unique_sample_ids.tolist()):
-                    normalized_image_metadata[image_metadata[:, 0] == sample_idx, 0] = local_idx
-                image_metadata = normalized_image_metadata
 
         image_mask = None
         if pixel_values is not None and image_grid_thw is not None and image_grid_thw.shape[0] > 0:
