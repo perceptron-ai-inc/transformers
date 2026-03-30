@@ -42,12 +42,9 @@ ISAAC_OUTPUT_KEYS = {
     "input_ids",
     "attention_mask",
     "mm_token_type_ids",
-    "vision_patches",
-    "image_patch_attention_mask",
-    "vision_token_grids",
-    "vision_token_offsets",
-    "vision_token_lengths",
-    "vision_image_attention_mask",
+    "pixel_values",
+    "image_grid_thw",
+    "image_metadata",
 }
 
 
@@ -211,7 +208,6 @@ def _make_processor_with_max_len(tokenizer, base_config, max_len):
     return IsaacProcessor(
         image_processor=image_processor,
         tokenizer=tokenizer,
-        vision_token=config.vision_token,
         max_sequence_length=config.max_sequence_length,
     )
 
@@ -230,8 +226,8 @@ def test_processor_prefers_named_image_pad_token():
     )
 
     assert processor.image_token == "<custom_image_pad>"
-    assert processor.image_pad_token_id == processor.tokenizer.image_pad_token_id
-    assert processor.image_pad_token_id != processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+    assert processor.image_token_id == processor.tokenizer.image_pad_token_id
+    assert processor.image_token_id != processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
 
 
 def _assert_common(outputs, batch_size=1):
@@ -240,12 +236,9 @@ def _assert_common(outputs, batch_size=1):
     input_ids = outputs["input_ids"]
     attention_mask = outputs["attention_mask"]
     mm_token_type_ids = outputs["mm_token_type_ids"]
-    vision_patches = outputs["vision_patches"]
-    image_patch_attention_mask = outputs["image_patch_attention_mask"]
-    vision_token_grids = outputs["vision_token_grids"]
-    vision_token_offsets = outputs["vision_token_offsets"]
-    vision_token_lengths = outputs["vision_token_lengths"]
-    vision_image_attention_mask = outputs["vision_image_attention_mask"]
+    pixel_values = outputs["pixel_values"]
+    image_grid_thw = outputs["image_grid_thw"]
+    image_metadata = outputs["image_metadata"]
 
     assert input_ids.shape[0] == batch_size
     assert attention_mask.shape == input_ids.shape
@@ -254,30 +247,37 @@ def _assert_common(outputs, batch_size=1):
     assert attention_mask.dtype == torch.long
     assert mm_token_type_ids.dtype == torch.long
 
-    assert vision_patches.shape[:2] == image_patch_attention_mask.shape[:2]
-    assert vision_patches.shape[0] == batch_size
-    assert vision_token_grids.shape == (batch_size, vision_patches.shape[1], 2)
-    assert vision_token_offsets.shape == (batch_size, vision_patches.shape[1])
-    assert vision_token_lengths.shape == (batch_size, vision_patches.shape[1])
-    assert vision_image_attention_mask.shape == (batch_size, vision_patches.shape[1])
+    assert pixel_values.ndim == 3
+    assert image_grid_thw.shape == (pixel_values.shape[0], 3)
+    assert image_metadata.shape == (pixel_values.shape[0], 3)
+    assert image_grid_thw.dtype == torch.long
+    assert image_metadata.dtype == torch.long
+
+    if image_metadata.numel() > 0:
+        assert torch.all(image_grid_thw[:, 0].eq(1))
+        assert torch.all(image_metadata[:, 0] >= 0)
+        assert torch.all(image_metadata[:, 0] < batch_size)
+        assert torch.all(image_metadata[:, 1] >= 0)
+        assert torch.all(image_metadata[:, 2] >= 0)
 
     return outputs
 
 
+def _get_sample_image_mask(outputs, batch_index=0):
+    return outputs["image_metadata"][:, 0].eq(batch_index)
+
+
 def _assert_no_vision(outputs, batch_index=0):
-    assert outputs["image_patch_attention_mask"][batch_index].sum().item() == 0
-    assert outputs["vision_token_grids"][batch_index].sum().item() == 0
-    assert outputs["vision_token_offsets"][batch_index].sum().item() == 0
-    assert outputs["vision_token_lengths"][batch_index].sum().item() == 0
-    assert outputs["vision_image_attention_mask"][batch_index].sum().item() == 0
+    assert not _get_sample_image_mask(outputs, batch_index=batch_index).any()
     assert not outputs["mm_token_type_ids"][batch_index].eq(1).any()
 
 
 def _assert_vision_segments(outputs, expected_segments, batch_index=0):
-    active_segments = int(outputs["vision_image_attention_mask"][batch_index].sum().item())
+    sample_image_mask = _get_sample_image_mask(outputs, batch_index=batch_index)
+    active_segments = int(sample_image_mask.sum().item())
     assert active_segments == expected_segments
-    assert torch.all(outputs["vision_token_lengths"][batch_index, :expected_segments] > 0)
-    assert torch.all(outputs["image_patch_attention_mask"][batch_index, :expected_segments].sum(dim=-1) > 0)
+    assert torch.all(outputs["image_metadata"][sample_image_mask, 2] > 0)
+    assert torch.all(outputs["image_grid_thw"][sample_image_mask, 1:].prod(dim=-1) > 0)
 
 
 def _count_modality(outputs, modality_value, batch_index=0):
@@ -289,13 +289,22 @@ def _count_modality(outputs, modality_value, batch_index=0):
 
 
 def _get_active_vision_grids(outputs, batch_index=0):
-    mask = outputs["vision_image_attention_mask"][batch_index].bool()
-    return outputs["vision_token_grids"][batch_index][mask]
+    return outputs["image_grid_thw"][_get_sample_image_mask(outputs, batch_index=batch_index), 1:]
+
+
+def _get_active_vision_offsets(outputs, batch_index=0):
+    return outputs["image_metadata"][_get_sample_image_mask(outputs, batch_index=batch_index), 1]
 
 
 def _get_active_vision_lengths(outputs, batch_index=0):
-    mask = outputs["vision_image_attention_mask"][batch_index].bool()
-    return outputs["vision_token_lengths"][batch_index][mask]
+    return outputs["image_metadata"][_get_sample_image_mask(outputs, batch_index=batch_index), 2]
+
+
+def _get_expected_vision_lengths(outputs, pixel_shuffle_scale=1, batch_index=0):
+    grids = _get_active_vision_grids(outputs, batch_index=batch_index)
+    if grids.numel() == 0:
+        return grids.new_zeros((0,))
+    return torch.prod(grids, dim=-1) // (pixel_shuffle_scale**2)
 
 
 @pytest.fixture
@@ -355,7 +364,6 @@ def isaac_processor(isaac_tokenizer, isaac_tiny_config):
     return IsaacProcessor(
         image_processor=image_processor,
         tokenizer=isaac_tokenizer,
-        vision_token=isaac_tiny_config.vision_token,
         max_sequence_length=isaac_tiny_config.max_sequence_length,
     )
 
@@ -381,7 +389,7 @@ def _checkpoint_or_skip(model_id=BASE_MODEL_ID):
 class IsaacProcessorTest(ProcessorTesterMixin, unittest.TestCase):
     processor_class = IsaacProcessor
     model_id = BASE_MODEL_ID
-    images_input_name = "vision_patches"
+    images_input_name = "pixel_values"
 
     @classmethod
     def _setup_from_pretrained(cls, model_id, **kwargs):
@@ -396,9 +404,9 @@ class IsaacProcessorTest(ProcessorTesterMixin, unittest.TestCase):
 
     @classmethod
     def _setup_test_attributes(cls, processor):
-        cls.image_token = processor.vision_token
+        cls.image_token = processor.image_token
         cls.pad_token_id = processor.tokenizer.pad_token_id
-        cls.image_pad_token_id = processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        cls.image_pad_token_id = processor.image_token_id
 
     def prepare_image_inputs(self, batch_size: int | None = None, nested: bool = False):
         if batch_size is None:
@@ -416,13 +424,7 @@ class IsaacProcessorTest(ProcessorTesterMixin, unittest.TestCase):
             return_tensors="pt",
         )
 
-        expected_input_names = set(processor.model_input_names) | {
-            "mm_token_type_ids",
-            "vision_token_offsets",
-            "vision_token_lengths",
-            "vision_image_attention_mask",
-        }
-        self.assertSetEqual(set(inputs.keys()), expected_input_names)
+        self.assertSetEqual(set(inputs.keys()), set(processor.model_input_names))
 
     @unittest.skip("IsaacProcessor expands image placeholders into image pad tokens before tokenization")
     def test_tokenizer_defaults(self):
@@ -434,7 +436,7 @@ class IsaacProcessorTest(ProcessorTesterMixin, unittest.TestCase):
 
     def test_single_vs_batched_consistency(self):
         processor = self.get_processor()
-        prompt = f"hello {processor.vision_token} world"
+        prompt = f"hello {processor.image_token} world"
         image = self.prepare_image_inputs()
 
         single = _assert_common(processor(text=prompt, images=[image], return_tensors="pt"))
@@ -450,6 +452,16 @@ class IsaacProcessorTest(ProcessorTesterMixin, unittest.TestCase):
         if image_positions.any():
             self.assertTrue(torch.all(batch_ids[image_positions] == self.image_pad_token_id))
             self.assertTrue(torch.all(batch["attention_mask"][0][image_positions] == 1))
+
+        single_image_mask = _get_sample_image_mask(single)
+        batch_image_mask = _get_sample_image_mask(batch)
+        torch.testing.assert_close(batch["pixel_values"][batch_image_mask], single["pixel_values"][single_image_mask])
+        torch.testing.assert_close(
+            batch["image_grid_thw"][batch_image_mask], single["image_grid_thw"][single_image_mask]
+        )
+        torch.testing.assert_close(
+            batch["image_metadata"][batch_image_mask, 1:], single["image_metadata"][single_image_mask, 1:]
+        )
 
         _assert_vision_segments(batch, expected_segments=1, batch_index=0)
         _assert_no_vision(batch, batch_index=1)
@@ -525,71 +537,71 @@ def test_post_process_generation_rejects_polygons_with_fewer_than_three_points()
 @require_torch
 @require_vision
 def test_single_image_returns_offsets_and_lengths(isaac_processor):
-    vision_token = isaac_processor.vision_token
+    image_token = isaac_processor.image_token
     outputs = _assert_common(
         _run_processor(
-            isaac_processor, text=f"Look at this {vision_token} and describe it.", images=[_make_dummy_image()]
+            isaac_processor, text=f"Look at this {image_token} and describe it.", images=[_make_dummy_image()]
         )
     )
     _assert_vision_segments(outputs, expected_segments=1)
 
-    grid_tokens = torch.prod(_get_active_vision_grids(outputs), dim=-1)
+    grid_tokens = _get_expected_vision_lengths(outputs, isaac_processor.image_processor.pixel_shuffle_scale)
     torch.testing.assert_close(_get_active_vision_lengths(outputs), grid_tokens)
     torch.testing.assert_close(
-        outputs["vision_token_offsets"][0, :1], torch.zeros_like(outputs["vision_token_offsets"][0, :1])
+        _get_active_vision_offsets(outputs), torch.zeros_like(_get_active_vision_offsets(outputs))
     )
 
 
 @require_torch
 @require_vision
 def test_multiple_images_have_matching_offsets_lengths_and_grids(isaac_processor):
-    vision_token = isaac_processor.vision_token
+    image_token = isaac_processor.image_token
     images = [_make_dummy_image(color=(255, 0, 0)), _make_dummy_image(color=(0, 255, 0))]
 
     outputs = _assert_common(
-        _run_processor(isaac_processor, text=f"First {vision_token} then {vision_token}", images=images)
+        _run_processor(isaac_processor, text=f"First {image_token} then {image_token}", images=images)
     )
     _assert_vision_segments(outputs, expected_segments=2)
 
-    grid_tokens = torch.prod(_get_active_vision_grids(outputs), dim=-1)
+    grid_tokens = _get_expected_vision_lengths(outputs, isaac_processor.image_processor.pixel_shuffle_scale)
     torch.testing.assert_close(_get_active_vision_lengths(outputs), grid_tokens)
     torch.testing.assert_close(
-        outputs["vision_token_offsets"][0, :2], torch.zeros_like(outputs["vision_token_offsets"][0, :2])
+        _get_active_vision_offsets(outputs), torch.zeros_like(_get_active_vision_offsets(outputs))
     )
 
 
 @require_torch
 @require_vision
 def test_error_on_image_mismatch(isaac_processor):
-    vision_token = isaac_processor.vision_token
+    image_token = isaac_processor.image_token
     with pytest.raises(ValueError, match="one image per"):
-        _run_processor(isaac_processor, text=f"{vision_token} {vision_token}", images=[_make_dummy_image()])
+        _run_processor(isaac_processor, text=f"{image_token} {image_token}", images=[_make_dummy_image()])
 
 
 @require_torch
 @require_vision
 def test_consecutive_vision_tokens_allow_empty_text_segments(isaac_processor):
-    vision_token = isaac_processor.vision_token
+    image_token = isaac_processor.image_token
     images = [_make_dummy_image(), _make_dummy_image(color=(0, 0, 255))]
 
     outputs = _assert_common(
-        _run_processor(isaac_processor, text=f"prefix {vision_token}{vision_token} suffix", images=images)
+        _run_processor(isaac_processor, text=f"prefix {image_token}{image_token} suffix", images=images)
     )
     _assert_vision_segments(outputs, expected_segments=2)
 
     torch.testing.assert_close(
-        outputs["vision_token_offsets"][0, :2], torch.zeros_like(outputs["vision_token_offsets"][0, :2])
+        _get_active_vision_offsets(outputs), torch.zeros_like(_get_active_vision_offsets(outputs))
     )
-    grid_tokens = torch.prod(_get_active_vision_grids(outputs), dim=-1)
+    grid_tokens = _get_expected_vision_lengths(outputs, isaac_processor.image_processor.pixel_shuffle_scale)
     torch.testing.assert_close(_get_active_vision_lengths(outputs), grid_tokens)
 
 
 @require_torch
 @require_vision
 def test_device_and_dtype_consistency(isaac_processor):
-    vision_token = isaac_processor.vision_token
+    image_token = isaac_processor.image_token
     outputs = _assert_common(
-        _run_processor(isaac_processor, text=f"Describe this {vision_token}", images=[_make_dummy_image()])
+        _run_processor(isaac_processor, text=f"Describe this {image_token}", images=[_make_dummy_image()])
     )
     _assert_vision_segments(outputs, expected_segments=1)
 
@@ -597,9 +609,8 @@ def test_device_and_dtype_consistency(isaac_processor):
         outputs["input_ids"],
         outputs["attention_mask"],
         outputs["mm_token_type_ids"],
-        outputs["vision_token_offsets"],
-        outputs["vision_token_lengths"],
-        outputs["vision_token_grids"],
+        outputs["image_grid_thw"],
+        outputs["image_metadata"],
     ]
     devices = {tensor.device for tensor in tensors}
     assert len(devices) == 1
@@ -610,13 +621,13 @@ def test_device_and_dtype_consistency(isaac_processor):
 @require_torch
 @require_vision
 def test_no_crop_when_total_below_max(isaac_processor):
-    vision_token = isaac_processor.vision_token
+    image_token = isaac_processor.image_token
     outputs = _assert_common(
-        _run_processor(isaac_processor, text=f"hello {vision_token} world", images=[_make_dummy_image()])
+        _run_processor(isaac_processor, text=f"hello {image_token} world", images=[_make_dummy_image()])
     )
     _assert_vision_segments(outputs, expected_segments=1)
 
-    grid_tokens = torch.prod(_get_active_vision_grids(outputs), dim=-1)
+    grid_tokens = _get_expected_vision_lengths(outputs, isaac_processor.image_processor.pixel_shuffle_scale)
     text_tokens = _count_modality(outputs, 0)
     assert outputs["input_ids"].shape[1] == grid_tokens.item() + text_tokens
 
@@ -624,8 +635,8 @@ def test_no_crop_when_total_below_max(isaac_processor):
 @require_torch
 @require_vision
 def test_exact_fit_keeps_all_tokens(isaac_processor, isaac_tokenizer, isaac_tiny_config):
-    vision_token = isaac_processor.vision_token
-    text = f"hey {vision_token} there"
+    image_token = isaac_processor.image_token
+    text = f"hey {image_token} there"
     image = _make_dummy_image()
 
     base_outputs = _assert_common(_run_processor(isaac_processor, text=text, images=[image]))
@@ -643,9 +654,9 @@ def test_exact_fit_keeps_all_tokens(isaac_processor, isaac_tokenizer, isaac_tiny
 @require_torch
 @require_vision
 def test_crop_truncates_text_segment_only(isaac_processor, isaac_tokenizer, isaac_tiny_config):
-    vision_token = isaac_processor.vision_token
+    image_token = isaac_processor.image_token
     text_prefix_tokens = " ".join([f"t{i}" for i in range(8)])
-    text = f"{text_prefix_tokens} {vision_token} tail end"
+    text = f"{text_prefix_tokens} {image_token} tail end"
     image = _make_dummy_image()
 
     base_outputs = _assert_common(_run_processor(isaac_processor, text=text, images=[image]))
@@ -660,7 +671,7 @@ def test_crop_truncates_text_segment_only(isaac_processor, isaac_tokenizer, isaa
     assert outputs["input_ids"].shape[1] == max_len
     assert _count_modality(outputs, 0) == full_text_tokens - 4
     torch.testing.assert_close(
-        outputs["vision_token_offsets"][0, :1], torch.zeros_like(outputs["vision_token_offsets"][0, :1])
+        _get_active_vision_offsets(outputs), torch.zeros_like(_get_active_vision_offsets(outputs))
     )
     assert _get_active_vision_lengths(outputs).item() == vision_length
 
@@ -668,10 +679,10 @@ def test_crop_truncates_text_segment_only(isaac_processor, isaac_tokenizer, isaa
 @require_torch
 @require_vision
 def test_crop_cuts_through_image_segment(isaac_processor, isaac_tokenizer, isaac_tiny_config):
-    vision_token = isaac_processor.vision_token
+    image_token = isaac_processor.image_token
     text_before = "hi"
     text_after = "bye"
-    text = f"{text_before} {vision_token} {text_after}"
+    text = f"{text_before} {image_token} {text_after}"
     image = _make_dummy_image()
 
     base_outputs = _assert_common(_run_processor(isaac_processor, text=text, images=[image]))
@@ -690,7 +701,7 @@ def test_crop_cuts_through_image_segment(isaac_processor, isaac_tokenizer, isaac
 
     _assert_vision_segments(outputs, expected_segments=1)
     assert outputs["input_ids"].shape[1] == max_len
-    assert outputs["vision_token_offsets"][0, 0].item() == expected_offset
+    assert _get_active_vision_offsets(outputs).item() == expected_offset
     assert _get_active_vision_lengths(outputs).item() == expected_length
     assert _count_modality(outputs, 0) == text_after_len
 
