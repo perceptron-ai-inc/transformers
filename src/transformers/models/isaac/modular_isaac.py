@@ -1037,6 +1037,8 @@ class IsaacProcessor(ProcessorMixin):
                     length = 0
                     remaining_dropped -= expected_length
 
+                # Record which suffix of this image's placeholder span survives left truncation.
+                # The model still encodes the full image and uses this window for both feature gathering and vision RoPE.
                 image_metadata[image_cursor + image_idx, 1] = offset
                 image_metadata[image_cursor + image_idx, 2] = length
             image_cursor += len(expected_image_lengths)
