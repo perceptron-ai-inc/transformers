@@ -262,17 +262,17 @@ class IsaacProcessor(ProcessorMixin):
                     f"IsaacProcessor expects one image per image token, got {num_images} tokens and {num_provided_images} images in sample with text {text_value} "
                 )
 
-            expected_image_lengths = [
-                int(vision_segment_lengths[image_cursor + image_idx].item()) for image_idx in range(num_images)
-            ]
-            expected_image_lengths_per_sample.append(expected_image_lengths)
-
-            expanded_text = segments[0]
-            for image_idx, segment_length in enumerate(expected_image_lengths):
-                expanded_text += (self.image_token * segment_length) + segments[image_idx + 1]
-            expanded_texts.append(expanded_text)
+            expected_image_lengths = []
+            expanded_text_parts = [segments[0]]
             for image_idx in range(num_images):
+                segment_length = int(vision_segment_lengths[image_cursor + image_idx].item())
+                expected_image_lengths.append(segment_length)
+                expanded_text_parts.append(self.image_token * segment_length)
+                expanded_text_parts.append(segments[image_idx + 1])
                 image_metadata[image_cursor + image_idx, 0] = batch_idx
+
+            expected_image_lengths_per_sample.append(expected_image_lengths)
+            expanded_texts.append("".join(expanded_text_parts))
             image_cursor += num_images
 
         effective_max_length = self.max_sequence_length
@@ -327,6 +327,8 @@ class IsaacProcessor(ProcessorMixin):
                     length = 0
                     remaining_dropped -= expected_length
 
+                # Record which suffix of this image's placeholder span survives left truncation.
+                # The model still encodes the full image and uses this window for both feature gathering and vision RoPE.
                 image_metadata[image_cursor + image_idx, 1] = offset
                 image_metadata[image_cursor + image_idx, 2] = length
             image_cursor += len(expected_image_lengths)
