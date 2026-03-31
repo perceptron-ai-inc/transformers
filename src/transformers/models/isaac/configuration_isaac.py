@@ -108,7 +108,6 @@ class IsaacTextConfig(PreTrainedConfig):
     rope_parameters: RopeParameters | dict | None = None
     attention_bias: bool = False
     use_sliding_window: bool = False
-    sliding_window: int | None = 4096
     max_window_layers: int = 28
     layer_types: list[str] | None = None
     attention_dropout: float | int = 0.0
@@ -118,18 +117,13 @@ class IsaacTextConfig(PreTrainedConfig):
     ignore_keys_at_rope_validation = {"mrope_section", "mrope_interleaved"}
 
     def __post_init__(self, **kwargs):
-        self.sliding_window = self.sliding_window if self.use_sliding_window else None
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
 
         if self.layer_types is None:
-            self.layer_types = [
-                "sliding_attention"
-                if self.sliding_window is not None and i >= self.max_window_layers
-                else "full_attention"
-                for i in range(self.num_hidden_layers)
-            ]
-        super().__post_init__(**kwargs)
+            self.layer_types = ["full_attention" for _ in range(self.num_hidden_layers)]
+
+        PretrainedConfig.__post_init__(self, **kwargs)
         self.validate_layer_type()
 
 

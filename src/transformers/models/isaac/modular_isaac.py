@@ -222,9 +222,16 @@ class IsaacTextConfig(Qwen3Config):
     model_type = "isaac_text"
     ignore_keys_at_rope_validation = {"mrope_section", "mrope_interleaved"}
     max_position_embeddings: int = 32768
+    sliding_window = AttributeError()
 
     def __post_init__(self, **kwargs):
-        super().__post_init__(**kwargs)
+        if self.num_key_value_heads is None:
+            self.num_key_value_heads = self.num_attention_heads
+
+        if self.layer_types is None:
+            self.layer_types = ["full_attention" for _ in range(self.num_hidden_layers)]
+
+        PretrainedConfig.__post_init__(self, **kwargs)
         self.validate_layer_type()
 
 
