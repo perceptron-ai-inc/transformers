@@ -137,7 +137,8 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
         self,
         encoding,
         *,
-        expected_num_images=None,
+        expected_batch_size=None,
+        expected_max_images=None,
         expected_patch_dim=None,
     ):
         self.assertEqual(set(encoding.keys()), {"pixel_values", "image_grid_thw"})
@@ -145,20 +146,34 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
         pixel_values = encoding["pixel_values"]
         image_grid_thw = encoding["image_grid_thw"]
 
+        if expected_batch_size is None:
+            self.assertIsNone(pixel_values)
+            self.assertIsNone(image_grid_thw)
+            return
+
+        self.assertIsNotNone(pixel_values)
+        self.assertIsNotNone(image_grid_thw)
         self.assertEqual(pixel_values.dtype, torch.float32)
         self.assertEqual(image_grid_thw.dtype, torch.long)
 
-        if expected_num_images is not None:
-            self.assertEqual(pixel_values.shape[0], expected_num_images)
+        if expected_batch_size is not None:
+            self.assertEqual(pixel_values.shape[0], expected_batch_size)
+            self.assertEqual(image_grid_thw.shape[0], expected_batch_size)
+        if expected_max_images is not None:
+            self.assertEqual(pixel_values.shape[1], expected_max_images)
+            self.assertEqual(image_grid_thw.shape[1], expected_max_images)
         if expected_patch_dim is not None:
             self.assertEqual(pixel_values.shape[-1], expected_patch_dim)
 
-        self.assertEqual(tuple(image_grid_thw.shape), (pixel_values.shape[0], 3))
-        self.assertTrue(torch.all(image_grid_thw[:, 0] == 1))
+        self.assertEqual(tuple(image_grid_thw.shape), (pixel_values.shape[0], pixel_values.shape[1], 3))
 
-        expected_patch_counts = image_grid_thw[:, 1] * image_grid_thw[:, 2]
-        token_positions = torch.arange(pixel_values.shape[1], device=pixel_values.device).unsqueeze(0)
-        image_patch_attention_mask = token_positions < expected_patch_counts.unsqueeze(1)
+        active_slots = image_grid_thw[..., 0].eq(1)
+        self.assertTrue(torch.all(image_grid_thw[~active_slots].eq(0)))
+        self.assertTrue(torch.all(image_grid_thw[active_slots, 1:] > 0))
+
+        expected_patch_counts = image_grid_thw[..., 1] * image_grid_thw[..., 2]
+        token_positions = torch.arange(pixel_values.shape[2], device=pixel_values.device).view(1, 1, -1)
+        image_patch_attention_mask = active_slots.unsqueeze(-1) & token_positions.lt(expected_patch_counts.unsqueeze(-1))
 
         padded_patch_rows = pixel_values[~image_patch_attention_mask]
         if padded_patch_rows.numel() > 0:
@@ -199,14 +214,16 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
             single_output = image_processor(image_inputs[0], return_tensors="pt")
             self._assert_output_contract(
                 single_output,
-                expected_num_images=1,
+                expected_batch_size=1,
+                expected_max_images=1,
                 expected_patch_dim=self.image_processor_tester.patch_dim,
             )
 
             batched_output = image_processor(image_inputs, return_tensors="pt")
             self._assert_output_contract(
                 batched_output,
-                expected_num_images=self.image_processor_tester.batch_size,
+                expected_batch_size=self.image_processor_tester.batch_size,
+                expected_max_images=1,
                 expected_patch_dim=self.image_processor_tester.patch_dim,
             )
 
@@ -221,14 +238,16 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
             single_output = image_processor(image_inputs[0], return_tensors="pt")
             self._assert_output_contract(
                 single_output,
-                expected_num_images=1,
+                expected_batch_size=1,
+                expected_max_images=1,
                 expected_patch_dim=self.image_processor_tester.patch_dim,
             )
 
             batched_output = image_processor(image_inputs, return_tensors="pt")
             self._assert_output_contract(
                 batched_output,
-                expected_num_images=self.image_processor_tester.batch_size,
+                expected_batch_size=self.image_processor_tester.batch_size,
+                expected_max_images=1,
                 expected_patch_dim=self.image_processor_tester.patch_dim,
             )
 
@@ -243,14 +262,16 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
             single_output = image_processor(image_inputs[0], return_tensors="pt")
             self._assert_output_contract(
                 single_output,
-                expected_num_images=1,
+                expected_batch_size=1,
+                expected_max_images=1,
                 expected_patch_dim=self.image_processor_tester.patch_dim,
             )
 
             batched_output = image_processor(image_inputs, return_tensors="pt")
             self._assert_output_contract(
                 batched_output,
-                expected_num_images=self.image_processor_tester.batch_size,
+                expected_batch_size=self.image_processor_tester.batch_size,
+                expected_max_images=1,
                 expected_patch_dim=self.image_processor_tester.patch_dim,
             )
 
@@ -281,32 +302,28 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
             encoding = image_processor(image_inputs, return_tensors="pt")
             self._assert_output_contract(
                 encoding,
-                expected_num_images=3,
+                expected_batch_size=2,
+                expected_max_images=2,
                 expected_patch_dim=768,
             )
-            self.assertEqual(tuple(encoding["pixel_values"].shape), (3, 6, 768))
+            self.assertEqual(tuple(encoding["pixel_values"].shape), (2, 2, 6, 768))
 
             expected_grids = torch.tensor(
                 [
-                    [1, 2, 2],
-                    [1, 2, 3],
-                    [1, 3, 2],
+                    [[1, 2, 2], [0, 0, 0]],
+                    [[1, 2, 3], [1, 3, 2]],
                 ],
                 dtype=torch.long,
             )
 
             torch.testing.assert_close(encoding["image_grid_thw"], expected_grids)
 
-    def test_all_empty_images_returns_zero_sized_tensors(self):
+    def test_all_empty_images_returns_none_visual_fields(self):
         for image_processing_class in self.image_processing_classes.values():
             image_processor = image_processing_class(**self.image_processor_dict)
             encoding = image_processor([[], []], return_tensors="pt")
 
-            self.assertEqual(set(encoding.keys()), {"pixel_values", "image_grid_thw"})
-            self.assertEqual(tuple(encoding["pixel_values"].shape), (0, 0, 0))
-            self.assertEqual(tuple(encoding["image_grid_thw"].shape), (0, 3))
-            self.assertEqual(encoding["pixel_values"].dtype, torch.float32)
-            self.assertEqual(encoding["image_grid_thw"].dtype, torch.long)
+            self._assert_output_contract(encoding, expected_batch_size=None)
 
     def test_do_resize_false_requires_patch_divisibility(self):
         for image_processing_class in self.image_processing_classes.values():

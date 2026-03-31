@@ -1064,8 +1064,8 @@ class IsaacModel(IsaacPreTrainedModel):
             ),
             dim=0,
         )
-        token_offset = int(image_metadata[1].item())
-        token_length = int(image_metadata[2].item())
+        token_offset = int(image_metadata[0].item())
+        token_length = int(image_metadata[1].item())
         return vision_position_ids[:, token_offset : token_offset + token_length]
 
     def get_rope_index(
@@ -1122,6 +1122,7 @@ class IsaacModel(IsaacPreTrainedModel):
         image_grid_thw = image_grid_thw.to(dtype=torch.long)
         image_metadata = image_metadata.to(dtype=torch.long)
         attention_mask = attention_mask.to(dtype=torch.long)
+        active_slot_mask = image_grid_thw[..., 0].eq(1)
 
         position_ids = torch.zeros((3, batch_size, seq_len), device=device, dtype=position_dtype)
         rope_deltas = torch.zeros((batch_size, 1), device=device, dtype=torch.long)
@@ -1129,9 +1130,9 @@ class IsaacModel(IsaacPreTrainedModel):
         for batch_idx in range(batch_size):
             sample_attention_mask = attention_mask[batch_idx].bool()
             sample_token_types = mm_token_type_ids[batch_idx][sample_attention_mask]
-            sample_image_mask = image_metadata[:, 0] == batch_idx
-            sample_grids = image_grid_thw[sample_image_mask]
-            sample_metadata = image_metadata[sample_image_mask]
+            sample_grids = image_grid_thw[batch_idx]
+            sample_metadata = image_metadata[batch_idx]
+            sample_active_slots = active_slot_mask[batch_idx]
 
             current_pos = 0
             image_idx = 0
@@ -1152,13 +1153,15 @@ class IsaacModel(IsaacPreTrainedModel):
                     current_pos += group_length
                     seq_pos = group_end
                 else:
-                    while image_idx < sample_metadata.shape[0] and sample_metadata[image_idx, 2].item() == 0:
+                    while image_idx < sample_metadata.shape[0] and (
+                        not bool(sample_active_slots[image_idx].item()) or sample_metadata[image_idx, 1].item() == 0
+                    ):
                         image_idx += 1
                     torch_compilable_check(
                         image_idx < sample_metadata.shape[0],
-                        "Isaac multimodal sequence has more visible image tokens than packed image metadata rows.",
+                        "Isaac multimodal sequence has more visible image tokens than batch-major image metadata slots.",
                     )
-                    token_length = int(sample_metadata[image_idx, 2].item())
+                    token_length = int(sample_metadata[image_idx, 1].item())
                     torch_compilable_check(
                         token_length <= sample_token_types.shape[0] - seq_pos,
                         "Isaac image metadata length exceeds the remaining multimodal placeholder span.",
@@ -1210,11 +1213,11 @@ class IsaacModel(IsaacPreTrainedModel):
         """
         Args:
             pixel_values (`torch.Tensor`):
-                Packed per-image patch vectors with shape `(num_images, max_patches, patch_dim)`.
+                Batch-major patch vectors with shape `(batch_size, max_images, max_patches, patch_dim)`.
             image_grid_thw (`torch.Tensor`):
-                Per-image grids shaped `(num_images, 3)` with `(T=1, H, W)` entries.
+                Batch-major grids shaped `(batch_size, max_images, 3)` with `(T=1, H, W)` entries.
             image_metadata (`torch.Tensor`, *optional*):
-                Packed per-image metadata `(sample_idx, offset, length)` shaped `(num_images, 3)`.
+                Batch-major per-slot metadata `(offset, length)` shaped `(batch_size, max_images, 2)`.
         """
         if pixel_values.shape[0] == 0:
             hidden_size = self.config.get_text_config().hidden_size
@@ -1226,28 +1229,41 @@ class IsaacModel(IsaacPreTrainedModel):
             )
 
         image_grid_thw = image_grid_thw.to(dtype=torch.long)
+        active_slot_mask = image_grid_thw[..., 0].eq(1)
+        if not active_slot_mask.any():
+            hidden_size = self.config.get_text_config().hidden_size
+            return BaseModelOutputWithPooling(
+                last_hidden_state=pixel_values.new_zeros((0, 0, hidden_size)),
+                pooler_output=(),
+                hidden_states=None,
+                attentions=None,
+            )
+
+        flat_pixel_values = pixel_values[active_slot_mask]
+        flat_image_grid_thw = image_grid_thw[active_slot_mask]
         vision_outputs: BaseModelOutputWithPooling = self.visual(
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
+            pixel_values=flat_pixel_values,
+            image_grid_thw=flat_image_grid_thw,
             return_dict=True,
             **kwargs,
         )
         projected_features = self.multimodal_projector(vision_outputs.last_hidden_state)
 
         pixel_shuffle_scale = self.config.vision_config.pixel_shuffle_scale_factor
-        full_lengths = image_grid_thw[:, 1].div(pixel_shuffle_scale, rounding_mode="floor") * image_grid_thw[:, 2].div(
-            pixel_shuffle_scale, rounding_mode="floor"
-        )
+        full_lengths = flat_image_grid_thw[:, 1].div(pixel_shuffle_scale, rounding_mode="floor") * flat_image_grid_thw[
+            :, 2
+        ].div(pixel_shuffle_scale, rounding_mode="floor")
         if image_metadata is None:
             offsets = torch.zeros_like(full_lengths)
             lengths = full_lengths
         else:
             torch_compilable_check(
-                image_metadata.shape[0] == projected_features.shape[0],
-                "IsaacModel.get_image_features expects one metadata row per packed image.",
+                image_metadata.shape[:2] == image_grid_thw.shape[:2],
+                "IsaacModel.get_image_features expects batch-major metadata aligned with `image_grid_thw`.",
             )
-            offsets = image_metadata[:, 1].to(device=projected_features.device, dtype=torch.long)
-            lengths = image_metadata[:, 2].to(device=projected_features.device, dtype=torch.long)
+            active_metadata = image_metadata[active_slot_mask]
+            offsets = active_metadata[:, 0].to(device=projected_features.device, dtype=torch.long)
+            lengths = active_metadata[:, 1].to(device=projected_features.device, dtype=torch.long)
 
         image_features = tuple(
             projected_features[image_idx, offset : offset + length]
@@ -1292,7 +1308,11 @@ class IsaacModel(IsaacPreTrainedModel):
     ) -> torch.Tensor:
         past_seen_tokens = 0 if past_key_values is None else past_key_values.get_seq_length()
 
-        has_multimodal = image_grid_thw is not None and image_metadata is not None and image_grid_thw.shape[0] > 0
+        has_multimodal = (
+            image_grid_thw is not None
+            and image_metadata is not None
+            and bool(image_grid_thw[..., 0].eq(1).any().item())
+        )
         if has_multimodal and mm_token_type_ids is None and input_ids is not None:
             raise ValueError(
                 "Multimodal data was passed (via `image_grid_thw`) but `mm_token_type_ids` is missing. "
@@ -1364,11 +1384,11 @@ class IsaacModel(IsaacPreTrainedModel):
             mm_token_type_ids (`torch.LongTensor`, *optional*):
                 Multimodal token type ids aligned with the token sequence, using `0 -> text` and `1 -> image`.
             pixel_values (`torch.FloatTensor`, *optional*):
-                Packed per-image patch vectors shaped `(num_images, max_patches, patch_dim)`.
+                Batch-major patch vectors shaped `(batch_size, max_images, max_patches, patch_dim)`.
             image_grid_thw (`torch.LongTensor`, *optional*):
-                Packed per-image grids shaped `(num_images, 3)` with `(T=1, H, W)` entries.
+                Batch-major per-slot grids shaped `(batch_size, max_images, 3)` with `(T=1, H, W)` entries.
             image_metadata (`torch.LongTensor`, *optional*):
-                Internal packed metadata per image shaped `(num_images, 3)` with `(sample_idx, offset, length)`.
+                Batch-major per-slot metadata shaped `(batch_size, max_images, 2)` with `(offset, length)`.
         """
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("You must specify exactly one of `input_ids` or `inputs_embeds`.")
@@ -1387,14 +1407,14 @@ class IsaacModel(IsaacPreTrainedModel):
             elif mm_token_type_ids.shape[1] > seq_len:
                 mm_token_type_ids = mm_token_type_ids[:, -seq_len:]
 
-        if image_metadata is not None and image_metadata.numel() > 0:
-            # Keep metadata sample indices aligned with the original batch rows. Mixed batches may include
-            # text-only samples, so compressing image-bearing rows to a contiguous index space misassigns
-            # image spans during RoPE construction.
+        if image_metadata is not None:
             image_metadata = image_metadata.to(device=inputs_embeds.device, dtype=torch.long)
 
         image_mask = None
-        if pixel_values is not None and image_grid_thw is not None and image_grid_thw.shape[0] > 0:
+        has_active_images = (
+            pixel_values is not None and image_grid_thw is not None and bool(image_grid_thw[..., 0].eq(1).any().item())
+        )
+        if has_active_images:
             image_outputs = self.get_image_features(
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
@@ -1799,40 +1819,10 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
             return input_ids, model_kwargs
 
         visual_keys = ["pixel_values", "image_grid_thw", "image_metadata"]
-
-        def _empty_like(tensor):
-            return tensor.new_empty((0, *tensor.shape[1:]))
-
-        def _repeat_sample_slices(tensor, lengths):
-            samples = torch.split(tensor, lengths)
-            repeated = []
-            for sample in samples:
-                repeated.extend(sample.clone() for _ in range(expand_size))
-            return torch.cat(repeated, dim=0) if repeated else _empty_like(tensor)
-
-        if model_kwargs.get("image_metadata") is not None:
-            image_metadata = model_kwargs["image_metadata"]
-            batch_size = input_ids.shape[0] if input_ids is not None else model_kwargs["inputs_embeds"].shape[0]
-            sample_ids = image_metadata[:, 0] if image_metadata.numel() > 0 else image_metadata.new_zeros((0,))
-            image_nums = torch.bincount(sample_ids, minlength=batch_size)
-            lengths = image_nums.tolist()
-
-            if model_kwargs.get("pixel_values") is not None:
-                model_kwargs["pixel_values"] = _repeat_sample_slices(model_kwargs["pixel_values"], lengths)
-            if model_kwargs.get("image_grid_thw") is not None:
-                model_kwargs["image_grid_thw"] = _repeat_sample_slices(model_kwargs["image_grid_thw"], lengths)
-
-            expanded_metadata = []
-            for sample_idx, sample in enumerate(torch.split(image_metadata, lengths)):
-                for repeat_idx in range(expand_size):
-                    if sample.shape[0] == 0:
-                        continue
-                    repeated_sample = sample.clone()
-                    repeated_sample[:, 0] = sample_idx * expand_size + repeat_idx
-                    expanded_metadata.append(repeated_sample)
-            model_kwargs["image_metadata"] = (
-                torch.cat(expanded_metadata, dim=0) if expanded_metadata else image_metadata.new_empty((0, 3))
-            )
+        for key in visual_keys:
+            value = model_kwargs.get(key)
+            if value is not None:
+                model_kwargs[key] = value.repeat_interleave(expand_size, dim=0)
 
         if input_ids is not None:
             input_ids = input_ids.repeat_interleave(expand_size, dim=0)

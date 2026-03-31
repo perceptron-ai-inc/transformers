@@ -339,24 +339,30 @@ def _assert_common(outputs, batch_size=1):
     assert attention_mask.dtype == torch.long
     assert mm_token_type_ids.dtype == torch.long
 
-    assert pixel_values.ndim == 3
-    assert image_grid_thw.shape == (pixel_values.shape[0], 3)
-    assert image_metadata.shape == (pixel_values.shape[0], 3)
-    assert image_grid_thw.dtype == torch.long
-    assert image_metadata.dtype == torch.long
+    if pixel_values is None:
+        assert image_grid_thw is None
+        assert image_metadata is None
+    else:
+        assert pixel_values.ndim == 4
+        assert image_grid_thw.shape == (batch_size, pixel_values.shape[1], 3)
+        assert image_metadata.shape == (batch_size, pixel_values.shape[1], 2)
+        assert image_grid_thw.dtype == torch.long
+        assert image_metadata.dtype == torch.long
 
-    if image_metadata.numel() > 0:
-        assert torch.all(image_grid_thw[:, 0].eq(1))
-        assert torch.all(image_metadata[:, 0] >= 0)
-        assert torch.all(image_metadata[:, 0] < batch_size)
-        assert torch.all(image_metadata[:, 1] >= 0)
-        assert torch.all(image_metadata[:, 2] >= 0)
+        active_slots = image_grid_thw[..., 0].eq(1)
+        assert torch.all(image_grid_thw[~active_slots].eq(0))
+        if active_slots.any():
+            assert torch.all(image_grid_thw[active_slots, 1:] > 0)
+            assert torch.all(image_metadata[active_slots] >= 0)
 
     return outputs
 
 
 def _get_sample_image_mask(outputs, batch_index=0):
-    return outputs["image_metadata"][:, 0].eq(batch_index)
+    image_grid_thw = outputs["image_grid_thw"]
+    if image_grid_thw is None:
+        return torch.zeros((0,), dtype=torch.bool)
+    return image_grid_thw[batch_index, :, 0].eq(1)
 
 
 def _assert_no_vision(outputs, batch_index=0):
@@ -368,8 +374,8 @@ def _assert_vision_segments(outputs, expected_segments, batch_index=0):
     sample_image_mask = _get_sample_image_mask(outputs, batch_index=batch_index)
     active_segments = int(sample_image_mask.sum().item())
     assert active_segments == expected_segments
-    assert torch.all(outputs["image_metadata"][sample_image_mask, 2] > 0)
-    assert torch.all(outputs["image_grid_thw"][sample_image_mask, 1:].prod(dim=-1) > 0)
+    assert torch.all(outputs["image_metadata"][batch_index, sample_image_mask, 1] > 0)
+    assert torch.all(outputs["image_grid_thw"][batch_index, sample_image_mask, 1:].prod(dim=-1) > 0)
 
 
 def _count_modality(outputs, modality_value, batch_index=0):
@@ -381,15 +387,24 @@ def _count_modality(outputs, modality_value, batch_index=0):
 
 
 def _get_active_vision_grids(outputs, batch_index=0):
-    return outputs["image_grid_thw"][_get_sample_image_mask(outputs, batch_index=batch_index), 1:]
+    image_grid_thw = outputs["image_grid_thw"]
+    if image_grid_thw is None:
+        return torch.zeros((0, 2), dtype=torch.long)
+    return image_grid_thw[batch_index, _get_sample_image_mask(outputs, batch_index=batch_index), 1:]
 
 
 def _get_active_vision_offsets(outputs, batch_index=0):
-    return outputs["image_metadata"][_get_sample_image_mask(outputs, batch_index=batch_index), 1]
+    image_metadata = outputs["image_metadata"]
+    if image_metadata is None:
+        return torch.zeros((0,), dtype=torch.long)
+    return image_metadata[batch_index, _get_sample_image_mask(outputs, batch_index=batch_index), 0]
 
 
 def _get_active_vision_lengths(outputs, batch_index=0):
-    return outputs["image_metadata"][_get_sample_image_mask(outputs, batch_index=batch_index), 2]
+    image_metadata = outputs["image_metadata"]
+    if image_metadata is None:
+        return torch.zeros((0,), dtype=torch.long)
+    return image_metadata[batch_index, _get_sample_image_mask(outputs, batch_index=batch_index), 1]
 
 
 def _get_expected_vision_lengths(outputs, pixel_shuffle_scale=1, batch_index=0):
@@ -572,14 +587,19 @@ class IsaacProcessorTest(ProcessorTesterMixin, unittest.TestCase):
             self.assertTrue(torch.all(batch_ids[image_positions] == self.image_pad_token_id))
             self.assertTrue(torch.all(batch["attention_mask"][0][image_positions] == 1))
 
-        single_image_mask = _get_sample_image_mask(single)
-        batch_image_mask = _get_sample_image_mask(batch)
-        torch.testing.assert_close(batch["pixel_values"][batch_image_mask], single["pixel_values"][single_image_mask])
+        single_image_mask = _get_sample_image_mask(single, batch_index=0)
+        batch_image_mask = _get_sample_image_mask(batch, batch_index=0)
         torch.testing.assert_close(
-            batch["image_grid_thw"][batch_image_mask], single["image_grid_thw"][single_image_mask]
+            batch["pixel_values"][0, batch_image_mask],
+            single["pixel_values"][0, single_image_mask],
         )
         torch.testing.assert_close(
-            batch["image_metadata"][batch_image_mask, 1:], single["image_metadata"][single_image_mask, 1:]
+            batch["image_grid_thw"][0, batch_image_mask],
+            single["image_grid_thw"][0, single_image_mask],
+        )
+        torch.testing.assert_close(
+            batch["image_metadata"][0, batch_image_mask],
+            single["image_metadata"][0, single_image_mask],
         )
 
         _assert_vision_segments(batch, expected_segments=1, batch_index=0)
@@ -590,6 +610,9 @@ class IsaacProcessorTest(ProcessorTesterMixin, unittest.TestCase):
 @require_vision
 def test_text_only_has_no_vision_fields(isaac_processor):
     outputs = _assert_common(_run_processor(isaac_processor, text="Hello, how are you?", images=None))
+    assert outputs["pixel_values"] is None
+    assert outputs["image_grid_thw"] is None
+    assert outputs["image_metadata"] is None
     _assert_no_vision(outputs)
 
 

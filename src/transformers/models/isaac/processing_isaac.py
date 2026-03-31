@@ -241,17 +241,19 @@ class IsaacProcessor(ProcessorMixin):
         pairs = list(zip(texts, batched_images, strict=True))
         image_inputs = self.image_processor(images=batched_images, return_tensors=TensorType.PYTORCH)
         image_grid_thw = image_inputs["image_grid_thw"]
-        num_images = image_grid_thw.shape[0]
-        image_metadata = torch.zeros((num_images, 3), dtype=torch.long)
-        grid_heights = image_grid_thw[:, 1]
-        grid_widths = image_grid_thw[:, 2]
-        vision_segment_lengths = (grid_heights // self.image_processor.pixel_shuffle_scale) * (
-            grid_widths // self.image_processor.pixel_shuffle_scale
-        )
+        image_metadata = None
+        vision_segment_lengths = None
+        if image_grid_thw is not None:
+            batch_size, max_images = image_grid_thw.shape[:2]
+            image_metadata = torch.zeros((batch_size, max_images, 2), dtype=torch.long)
+            grid_heights = image_grid_thw[..., 1]
+            grid_widths = image_grid_thw[..., 2]
+            vision_segment_lengths = (grid_heights // self.image_processor.pixel_shuffle_scale) * (
+                grid_widths // self.image_processor.pixel_shuffle_scale
+            )
 
         expanded_texts = []
         expected_image_lengths_per_sample = []
-        image_cursor = 0
 
         for batch_idx, (text_value, sample_images) in enumerate(pairs):
             segments = text_value.split(self.image_token)
@@ -265,15 +267,13 @@ class IsaacProcessor(ProcessorMixin):
             expected_image_lengths = []
             expanded_text_parts = [segments[0]]
             for image_idx in range(num_images):
-                segment_length = int(vision_segment_lengths[image_cursor + image_idx].item())
+                segment_length = int(vision_segment_lengths[batch_idx, image_idx].item())
                 expected_image_lengths.append(segment_length)
                 expanded_text_parts.append(self.image_token * segment_length)
                 expanded_text_parts.append(segments[image_idx + 1])
-                image_metadata[image_cursor + image_idx, 0] = batch_idx
 
             expected_image_lengths_per_sample.append(expected_image_lengths)
             expanded_texts.append("".join(expanded_text_parts))
-            image_cursor += num_images
 
         effective_max_length = self.max_sequence_length
         if max_length is not None and (truncation or padding == "max_length"):
@@ -296,9 +296,12 @@ class IsaacProcessor(ProcessorMixin):
 
         kept_input_ids_per_sample: list[list[int] | None] = [None] * len(texts)
         overflow_input_ids_per_sample: list[list[list[int]]] = [[] for _ in texts]
+        overflow_to_sample_mapping = tokenized_text_inputs.get("overflow_to_sample_mapping")
+        if overflow_to_sample_mapping is None:
+            overflow_to_sample_mapping = list(range(len(tokenized_text_inputs["input_ids"])))
 
         for row_input_ids, sample_idx in zip(
-            tokenized_text_inputs["input_ids"], tokenized_text_inputs["overflow_to_sample_mapping"], strict=True
+            tokenized_text_inputs["input_ids"], overflow_to_sample_mapping, strict=True
         ):
             sample_idx = int(sample_idx)
             if kept_input_ids_per_sample[sample_idx] is None:
@@ -306,7 +309,6 @@ class IsaacProcessor(ProcessorMixin):
             else:
                 overflow_input_ids_per_sample[sample_idx].append(row_input_ids)
 
-        image_cursor = 0
         for batch_idx, expected_image_lengths in enumerate(expected_image_lengths_per_sample):
             dropped_image_tokens = sum(
                 overflow_input_ids.count(self.image_token_id)
@@ -329,9 +331,8 @@ class IsaacProcessor(ProcessorMixin):
 
                 # Record which suffix of this image's placeholder span survives left truncation.
                 # The model still encodes the full image and uses this window for both feature gathering and vision RoPE.
-                image_metadata[image_cursor + image_idx, 1] = offset
-                image_metadata[image_cursor + image_idx, 2] = length
-            image_cursor += len(expected_image_lengths)
+                image_metadata[batch_idx, image_idx, 0] = offset
+                image_metadata[batch_idx, image_idx, 1] = length
 
         input_ids = torch.tensor(kept_input_ids_per_sample, dtype=torch.long)
         attention_mask = input_ids.ne(self.pad_token_id).to(dtype=torch.long)
