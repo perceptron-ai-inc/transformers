@@ -173,7 +173,9 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
 
         expected_patch_counts = image_grid_thw[..., 1] * image_grid_thw[..., 2]
         token_positions = torch.arange(pixel_values.shape[2], device=pixel_values.device).view(1, 1, -1)
-        image_patch_attention_mask = active_slots.unsqueeze(-1) & token_positions.lt(expected_patch_counts.unsqueeze(-1))
+        image_patch_attention_mask = active_slots.unsqueeze(-1) & token_positions.lt(
+            expected_patch_counts.unsqueeze(-1)
+        )
 
         padded_patch_rows = pixel_values[~image_patch_attention_mask]
         if padded_patch_rows.numel() > 0:

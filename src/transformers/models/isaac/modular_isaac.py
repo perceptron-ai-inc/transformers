@@ -346,7 +346,9 @@ class IsaacImageProcessor(TorchvisionBackend):
             "image_grid_thw": torch.zeros((batch_size, max_images, 3), device=patch_device, dtype=torch.long),
         }
 
-        for batch_idx, (sample_patches, sample_token_grids) in enumerate(zip(vision_patches, vision_token_grids, strict=True)):
+        for batch_idx, (sample_patches, sample_token_grids) in enumerate(
+            zip(vision_patches, vision_token_grids, strict=True)
+        ):
             for image_slot, (patches, token_grid) in enumerate(zip(sample_patches, sample_token_grids, strict=True)):
                 patch_count = int(patches.shape[0])
                 tensors["pixel_values"][batch_idx, image_slot, :patch_count] = patches
@@ -1460,9 +1462,7 @@ class IsaacModel(Qwen3VLModel):
 
         image_mask = None
         has_active_images = (
-            pixel_values is not None
-            and image_grid_thw is not None
-            and bool(image_grid_thw[..., 0].eq(1).any().item())
+            pixel_values is not None and image_grid_thw is not None and bool(image_grid_thw[..., 0].eq(1).any().item())
         )
         if has_active_images:
             image_outputs = self.get_image_features(

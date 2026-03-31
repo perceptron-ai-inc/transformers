@@ -1467,9 +1467,7 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
             {"role": "user", "content": "Describe this image:"},
             {"role": "user", "content": self.processor.image_token},
         ]
-        single_image_text = self._generate_from_messages(
-            messages_image_text, [red_image], generate_kwargs=beam_kwargs
-        )
+        single_image_text = self._generate_from_messages(messages_image_text, [red_image], generate_kwargs=beam_kwargs)
         assert single_image_text, "Image-text beam generation is empty"
 
         messages_vqa, images_vqa = document_to_messages(vqa_document, image_token=self.processor.image_token)
