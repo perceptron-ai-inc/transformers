@@ -850,6 +850,40 @@ def test_crop_cuts_through_image_segment(isaac_processor, isaac_tokenizer, isaac
 
 @require_torch
 @require_vision
+def test_crop_cuts_through_later_image_segment_after_dropping_earlier_image(
+    isaac_processor, isaac_tokenizer, isaac_tiny_config
+):
+    image_token = isaac_processor.image_token
+    text_before = "hi"
+    text_after = "bye"
+    text = f"{text_before} {image_token}{image_token} {text_after}"
+    images = [[_make_dummy_image(), _make_dummy_image(color=(0, 255, 0))]]
+
+    base_outputs = _run_processor(isaac_processor, text=[text], images=images)
+    vision_lengths = _get_active_vision_lengths(base_outputs)
+    text_before_len = len(isaac_tokenizer.encode(text_before, add_special_tokens=False))
+    text_after_len = len(isaac_tokenizer.encode(text_after, add_special_tokens=False))
+
+    partial_second_drop = 7
+    start = text_before_len + vision_lengths[0].item() + partial_second_drop
+    max_len = base_outputs["input_ids"].shape[1] - start
+
+    processor = _make_processor_with_max_len(isaac_tokenizer, isaac_tiny_config, max_len)
+    outputs = _run_processor(processor, text=[text], images=images)
+
+    assert outputs["input_ids"].shape[1] == max_len
+    torch.testing.assert_close(
+        outputs["image_metadata"][0, _get_sample_image_mask(outputs, batch_index=0)],
+        torch.tensor(
+            [[0, 0], [partial_second_drop, vision_lengths[1].item() - partial_second_drop]], dtype=torch.long
+        ),
+    )
+    assert _count_modality(outputs, 1) == vision_lengths[1].item() - partial_second_drop
+    assert _count_modality(outputs, 0) == text_after_len
+
+
+@require_torch
+@require_vision
 def test_batch_outputs_match_individual_calls(isaac_processor):
     texts = ["hi", "this one is longer"]
 
