@@ -123,15 +123,6 @@ def document_to_messages(
     return messages, images
 
 
-def strip_trailing_stop_string(text: str, stop_strings: list[str] | tuple[str, ...] | None = None) -> str:
-    if stop_strings is not None:
-        for stop_string in stop_strings:
-            if text.endswith(stop_string):
-                text = text[: -len(stop_string)]
-                break
-    return re.sub(r"^\n{2,}", "\n", text)
-
-
 def compute_logits_statistics(tensor: torch.Tensor) -> dict[str, object]:
     """
     Summarize logits with simple statistics that are stable across minor
@@ -154,28 +145,6 @@ def compute_logits_statistics(tensor: torch.Tensor) -> dict[str, object]:
         "sum": _rounded(flat.sum()),
         "l2_norm": _rounded(torch.linalg.vector_norm(flat, ord=2)),
     }
-
-
-def infer_pad_from_tail(sequence: torch.Tensor) -> tuple[int | None, int]:
-    """
-    Infer the pad value used in a 1D sequence by scanning the repeated tail.
-
-    Returns (pad_value or None if no padding detected, last_nonpad_index).
-    """
-
-    if sequence.ndim != 1:
-        raise ValueError("sequence must be 1D")
-
-    pad_candidate = sequence[-1].item()
-    idx = sequence.shape[0] - 1
-    while idx >= 0 and sequence[idx].item() == pad_candidate:
-        idx -= 1
-
-    if idx == sequence.shape[0] - 1:
-        return None, idx
-    if idx < 0:
-        return pad_candidate, -1
-    return pad_candidate, idx
 
 
 def _pixel_shuffle_reference(x: torch.Tensor, token_grids: torch.Tensor, scale_factor: int):
