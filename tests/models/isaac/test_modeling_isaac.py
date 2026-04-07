@@ -94,10 +94,12 @@ def compute_logits_statistics(tensor: torch.Tensor) -> dict[str, object]:
     }
 
 
-def strip_think_block(text: str) -> str:
-    if "</think>" not in text:
-        return text
-    return text.split("</think>", 1)[1].lstrip()
+def trim_trailing_generation_newline(batch_inputs):
+    trimmed_inputs = batch_inputs.copy()
+    for key in ("input_ids", "attention_mask", "mm_token_type_ids"):
+        if key in trimmed_inputs and trimmed_inputs[key] is not None:
+            trimmed_inputs[key] = trimmed_inputs[key][:, :-1]
+    return trimmed_inputs
 
 
 def _pixel_shuffle_reference(x: torch.Tensor, token_grids: torch.Tensor, scale_factor: int):
@@ -616,12 +618,14 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
                 ],
             }
         ]
-        inputs = self.processor.apply_chat_template(
-            conversation,
-            tokenize=True,
-            return_dict=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
+        inputs = trim_trailing_generation_newline(
+            self.processor.apply_chat_template(
+                conversation,
+                tokenize=True,
+                return_dict=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
         ).to(self.device, dtype=self.dtype)
 
         with torch.no_grad():
@@ -646,12 +650,14 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
                 "content": [{"type": "text", "text": "What is the pythogorean theorem?"}],
             }
         ]
-        inputs = self.processor.apply_chat_template(
-            conversation,
-            tokenize=True,
-            return_dict=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
+        inputs = trim_trailing_generation_newline(
+            self.processor.apply_chat_template(
+                conversation,
+                tokenize=True,
+                return_dict=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
         ).to(self.device, dtype=self.dtype)
 
         with torch.no_grad():
@@ -665,8 +671,8 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
             )
 
         generated_ids = outputs.sequences[:, inputs["input_ids"].shape[1] :]
-        generated_text = strip_think_block(self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0])
-        expected_fragmenet = "The Pythagorean theorem is a fundamental principle in geometry that relates the lengths of the sides of a right-angled triangle."
+        generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        expected_fragmenet = "The Pythagorean theorem is a fundamental principle in geometry that relates the lengths of the sides of a right-angled triangle. Let's break it down step by step:"
         assert expected_fragmenet in generated_text
 
     def test_vqa_from_image(self):
@@ -682,12 +688,14 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
                 ],
             }
         ]
-        inputs = self.processor.apply_chat_template(
-            conversation,
-            tokenize=True,
-            return_dict=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
+        inputs = trim_trailing_generation_newline(
+            self.processor.apply_chat_template(
+                conversation,
+                tokenize=True,
+                return_dict=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
         ).to(self.device, dtype=self.dtype)
 
         with torch.no_grad():
@@ -701,9 +709,9 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
             )
 
         generated_ids = outputs.sequences[:, inputs["input_ids"].shape[1] :]
-        generated_text = strip_think_block(self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0])
-        assert generated_text.startswith("No, it is not safe to cross the street at this moment.")
-        assert "red" in generated_text.lower()
+        generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        expected_response = "\nNo, it is not safe to cross the street at this moment. The traffic light for pedestrians is red, indicating that it is not safe to cross."
+        assert generated_text == expected_response
 
     def test_logit_equivalence(self):
         image = _load_red_dot_image()
@@ -719,12 +727,14 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
                 ],
             }
         ]
-        inputs = self.processor.apply_chat_template(
-            conversation,
-            tokenize=True,
-            return_dict=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
+        inputs = trim_trailing_generation_newline(
+            self.processor.apply_chat_template(
+                conversation,
+                tokenize=True,
+                return_dict=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
         ).to(self.device, dtype=self.dtype)
 
         with torch.no_grad():
@@ -743,12 +753,12 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
         expected_logit_stats = {
             "shape": [10, 151936],
             "numel": 1519360,
-            "mean": 0.3370261318,
-            "std": 2.7222043444,
-            "min": -12.875,
-            "max": 28.875,
-            "sum": 512064.0235532373,
-            "l2_norm": 3381.0706842935,
+            "mean": 0.0608877803,
+            "std": 2.8308793244,
+            "min": -12.0625,
+            "max": 31.0,
+            "sum": 92510.4578057677,
+            "l2_norm": 3490.2146142251,
         }
         assert logit_stats == expected_logit_stats
 
@@ -788,22 +798,26 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
         ]
 
         single_inputs = [
+            trim_trailing_generation_newline(
+                self.processor.apply_chat_template(
+                    conversation,
+                    tokenize=True,
+                    return_dict=True,
+                    add_generation_prompt=True,
+                    return_tensors="pt",
+                )
+            )
+            for conversation in conversations
+        ]
+        batch_inputs = trim_trailing_generation_newline(
             self.processor.apply_chat_template(
-                conversation,
+                conversations,
                 tokenize=True,
                 return_dict=True,
                 add_generation_prompt=True,
                 return_tensors="pt",
+                processor_kwargs={"padding_side": "left"},
             )
-            for conversation in conversations
-        ]
-        batch_inputs = self.processor.apply_chat_template(
-            conversations,
-            tokenize=True,
-            return_dict=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
-            processor_kwargs={"padding_side": "left"},
         )
         batch_input_ids = batch_inputs["input_ids"]
         max_length = batch_input_ids.shape[1]
@@ -879,7 +893,7 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
                     return_dict_in_generate=True,
                 )
             generated_ids = outputs.sequences[:, single_input["input_ids"].shape[1] :]
-            single_texts.append(strip_think_block(self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]))
+            single_texts.append(self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0])
 
         batch_inputs = batch_inputs.to(self.device, dtype=self.dtype)
         with torch.no_grad():
@@ -892,7 +906,7 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
                 return_dict_in_generate=True,
             )
         batch_generated_ids = batch_outputs.sequences[:, batch_inputs["input_ids"].shape[1] :]
-        batch_texts = [strip_think_block(text) for text in self.processor.batch_decode(batch_generated_ids, skip_special_tokens=True)]
+        batch_texts = self.processor.batch_decode(batch_generated_ids, skip_special_tokens=True)
         assert len(batch_texts) == len(single_texts) == 3
 
         for i, (batch_text, single_text) in enumerate(zip(batch_texts, single_texts)):
@@ -936,12 +950,14 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
 
         single_texts = []
         for conversation in conversations:
-            single_input = self.processor.apply_chat_template(
-                conversation,
-                tokenize=True,
-                return_dict=True,
-                add_generation_prompt=True,
-                return_tensors="pt",
+            single_input = trim_trailing_generation_newline(
+                self.processor.apply_chat_template(
+                    conversation,
+                    tokenize=True,
+                    return_dict=True,
+                    add_generation_prompt=True,
+                    return_tensors="pt",
+                )
             ).to(self.device, dtype=self.dtype)
             with torch.no_grad():
                 outputs = self.model.generate(
@@ -954,15 +970,17 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
                     **beam_kwargs,
                 )
             generated_ids = outputs.sequences[:, single_input["input_ids"].shape[1] :]
-            single_texts.append(strip_think_block(self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]))
+            single_texts.append(self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0])
 
-        batch_inputs = self.processor.apply_chat_template(
-            conversations,
-            tokenize=True,
-            return_dict=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
-            processor_kwargs={"padding_side": "left"},
+        batch_inputs = trim_trailing_generation_newline(
+            self.processor.apply_chat_template(
+                conversations,
+                tokenize=True,
+                return_dict=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+                processor_kwargs={"padding_side": "left"},
+            )
         ).to(self.device, dtype=self.dtype)
         with torch.no_grad():
             batch_outputs = self.model.generate(
@@ -975,12 +993,11 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
                 **beam_kwargs,
             )
         batch_generated_ids = batch_outputs.sequences[:, batch_inputs["input_ids"].shape[1] :]
-        batch_texts = [strip_think_block(text) for text in self.processor.batch_decode(batch_generated_ids, skip_special_tokens=True)]
+        batch_texts = self.processor.batch_decode(batch_generated_ids, skip_special_tokens=True)
         assert len(batch_texts) == len(single_texts) == 3
 
         for i, (batch_text, single_text) in enumerate(zip(batch_texts, single_texts)):
-            stable_prefix = single_text[:80].strip()
-            assert stable_prefix in batch_text, f"beam batch[{i}] mismatch: {batch_text!r} vs single[{i}] {single_text!r}"
+            assert single_text in batch_text, f"beam batch[{i}] mismatch: {batch_text!r} vs single[{i}] {single_text!r}"
 
 
 @require_torch
@@ -1023,12 +1040,14 @@ class IsaacBoxPointingIntegrationTest(unittest.TestCase):
                 ],
             }
         ]
-        inputs = self.processor.apply_chat_template(
-            conversation,
-            tokenize=True,
-            return_dict=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
+        inputs = trim_trailing_generation_newline(
+            self.processor.apply_chat_template(
+                conversation,
+                tokenize=True,
+                return_dict=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
         ).to(self.device, dtype=self.dtype)
 
         with torch.no_grad():
@@ -1050,7 +1069,7 @@ class IsaacBoxPointingIntegrationTest(unittest.TestCase):
         assert first_point.top_left.y < first_point.bottom_right.y
         assert first_point.mention == "traffic light"
         assert first_point.top_left.x == 808
-        assert abs(first_point.top_left.y - 247) <= 1
+        assert first_point.top_left.y == 247
         assert first_point.bottom_right.x == 863
         assert first_point.bottom_right.y == 386
 
@@ -1071,12 +1090,14 @@ class IsaacBoxPointingIntegrationTest(unittest.TestCase):
                 ],
             }
         ]
-        inputs = self.processor.apply_chat_template(
-            conversation,
-            tokenize=True,
-            return_dict=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
+        inputs = trim_trailing_generation_newline(
+            self.processor.apply_chat_template(
+                conversation,
+                tokenize=True,
+                return_dict=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
         ).to(self.device, dtype=self.dtype)
 
         with torch.no_grad():
@@ -1104,8 +1125,9 @@ class IsaacBoxPointingIntegrationTest(unittest.TestCase):
         assert max(xs) <= expected_right + 4
         assert min(ys) >= expected_top - 4
         assert max(ys) <= expected_bottom + 4
-        assert max(xs) - min(xs) >= 10
-        assert max(ys) - min(ys) >= 60
+        assert max(xs) - min(xs) >= 35
+        assert max(ys) - min(ys) >= 100
         assert any(abs(x - expected_left) <= 12 for x in xs)
-        assert any(abs(y - expected_top) <= 80 for y in ys)
+        assert any(abs(x - expected_right) <= 12 for x in xs)
+        assert any(abs(y - expected_top) <= 12 for y in ys)
         assert any(abs(y - expected_bottom) <= 12 for y in ys)
