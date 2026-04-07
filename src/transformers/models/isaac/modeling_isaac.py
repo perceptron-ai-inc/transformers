@@ -1183,32 +1183,22 @@ class IsaacModel(IsaacPreTrainedModel):
 
     def get_placeholder_mask(
         self,
-        input_ids: torch.LongTensor,
+        mm_token_type_ids: torch.LongTensor,
         inputs_embeds: torch.FloatTensor,
-        image_features: torch.FloatTensor | None = None,
-    ):
+        image_features: torch.FloatTensor,
+    ) -> torch.BoolTensor:
         """
         Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
         equal to the length of multimodal features. If the lengths are different, an error is raised.
         """
-        if input_ids is None:
-            special_image_mask = inputs_embeds == self.get_input_embeddings()(
-                torch.tensor(self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
-            )
-            special_image_mask = special_image_mask.all(-1)
-
-        else:
-            special_image_mask = input_ids == self.config.image_token_id
-
-        n_image_tokens = special_image_mask.sum()
-        special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-        if image_features is not None:
-            torch_compilable_check(
-                inputs_embeds[special_image_mask].numel() == image_features.numel(),
-                f"Image features and image tokens do not match, tokens: {n_image_tokens}, features: {image_features.shape[0]}",
-            )
-
-        return special_image_mask
+        image_token_mask = mm_token_type_ids.to(dtype=torch.long) == 1
+        n_image_tokens = image_token_mask.sum()
+        image_token_mask = image_token_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        torch_compilable_check(
+            inputs_embeds[image_token_mask].numel() == image_features.numel(),
+            f"Image features and image tokens do not match, tokens: {n_image_tokens}, features: {image_features.shape[0]}",
+        )
+        return image_token_mask
 
     def compute_3d_position_ids(
         self,
@@ -1220,45 +1210,54 @@ class IsaacModel(IsaacPreTrainedModel):
         image_metadata: torch.Tensor | None = None,
         past_key_values: Cache | None = None,
     ) -> torch.Tensor:
-        past_key_values_length = 0 if past_key_values is None else past_key_values.get_seq_length()
+        past_seen_tokens = 0 if past_key_values is None else past_key_values.get_seq_length()
         has_multimodal = image_grid_thw is not None and image_metadata is not None
-
         if has_multimodal and mm_token_type_ids is None and input_ids is not None:
             raise ValueError(
                 "Multimodal data was passed (via `image_grid_thw` or `image_metadata`) but `mm_token_type_ids` is "
                 "missing. Please pass `mm_token_type_ids` to the model so that multimodal RoPE (M-RoPE) can be "
                 "computed correctly. `mm_token_type_ids` is returned by the processor alongside `input_ids`."
             )
-        can_compute_mrope = input_ids is not None and mm_token_type_ids is not None and has_multimodal
 
-        if can_compute_mrope and (self.rope_deltas is None or past_key_values_length == 0):
+        if has_multimodal and (self.rope_deltas is None or past_seen_tokens == 0):
+            rope_input_ids = input_ids
+            if rope_input_ids is None:
+                rope_input_ids = torch.zeros(inputs_embeds.shape[:2], device=inputs_embeds.device, dtype=torch.long)
             position_ids, rope_deltas = self.get_rope_index(
-                input_ids,
+                rope_input_ids,
                 image_grid_thw=image_grid_thw,
                 image_metadata=image_metadata,
                 attention_mask=attention_mask,
                 mm_token_type_ids=mm_token_type_ids,
             )
             self.rope_deltas = rope_deltas
-        # Use pre-calculated rope-deltas to infer correct 3D position ids during incremental
-        # generation (past_key_values_length > 0) or when only inputs_embeds is provided (no input_ids
-        # to recompute from). Skip when input_ids is provided without past_key_values to avoid shape
-        # mismatches from stale rope_deltas (e.g., training forward pass after generation).
-        elif self.rope_deltas is not None and (past_key_values_length > 0 or input_ids is None):
-            batch_size, seq_length, _ = inputs_embeds.shape
-            if attention_mask is not None:
-                position_ids = attention_mask.long().cumsum(-1) - 1
-                position_ids = position_ids.masked_fill(attention_mask == 0, 0)
-                position_ids = position_ids.view(1, batch_size, -1).repeat(3, 1, 1).to(inputs_embeds.device)
+            return position_ids
+
+        if self.rope_deltas is None:
+            return None
+
+        rope_deltas = torch.as_tensor(self.rope_deltas, device=inputs_embeds.device, dtype=torch.long).reshape(-1, 1)
+        if rope_deltas.shape[0] != inputs_embeds.shape[0]:
+            if inputs_embeds.shape[0] % rope_deltas.shape[0] == 0:
+                rope_deltas = rope_deltas.repeat_interleave(inputs_embeds.shape[0] // rope_deltas.shape[0], dim=0)
             else:
-                position_ids = torch.arange(past_key_values_length, past_key_values_length + seq_length)
-                position_ids = position_ids.view(1, 1, -1).expand(3, batch_size, -1).to(inputs_embeds.device)
-            delta = self.rope_deltas.repeat_interleave(batch_size // self.rope_deltas.shape[0], dim=0)
-            position_ids = position_ids + delta.to(device=inputs_embeds.device)
+                rope_deltas = rope_deltas[:1].expand(inputs_embeds.shape[0], -1)
+
+        if attention_mask is not None and attention_mask.shape[-1] > inputs_embeds.shape[1]:
+            rope_position = attention_mask.long().cumsum(dim=-1) - 1
+            rope_position = rope_position.masked_fill(attention_mask == 0, 0)
+            rope_position = rope_position[:, -inputs_embeds.shape[1] :]
         else:
-            # Can't build correct 3D positions. Let the model infer it
-            position_ids = None
-        return position_ids
+            rope_position = torch.arange(
+                past_seen_tokens,
+                past_seen_tokens + inputs_embeds.shape[1],
+                device=inputs_embeds.device,
+                dtype=torch.long,
+            ).view(1, -1)
+            rope_position = rope_position.expand(inputs_embeds.shape[0], -1)
+
+        position_ids = rope_position.view(1, inputs_embeds.shape[0], -1).expand(3, -1, -1)
+        return position_ids + rope_deltas.to(device=inputs_embeds.device).unsqueeze(0)
 
     @auto_docstring(
         custom_intro="""
@@ -1308,11 +1307,22 @@ class IsaacModel(IsaacPreTrainedModel):
                 return_dict=True,
             )
             image_embeds = image_outputs.pooler_output
-            image_embeds = torch.cat(image_embeds, dim=0).to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
-            image_mask = self.get_placeholder_mask(input_ids, inputs_embeds, image_embeds)
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            if len(image_embeds) > 0:
+                image_embeds = torch.cat(image_embeds, dim=0).to(
+                    device=inputs_embeds.device, dtype=inputs_embeds.dtype
+                )
+                image_mask = self.get_placeholder_mask(
+                    mm_token_type_ids=mm_token_type_ids,
+                    inputs_embeds=inputs_embeds,
+                    image_features=image_embeds,
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
-        position_ids = self.compute_3d_position_ids(
+        if isinstance(attention_mask, dict):
+            attention_mask = attention_mask["full_attention"]
+
+        past_seen_tokens = 0 if past_key_values is None else past_key_values.get_seq_length()
+        computed_position_ids = self.compute_3d_position_ids(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             mm_token_type_ids=mm_token_type_ids,
@@ -1321,6 +1331,14 @@ class IsaacModel(IsaacPreTrainedModel):
             attention_mask=attention_mask,
             past_key_values=past_key_values,
         )
+        if computed_position_ids is not None:
+            position_ids = computed_position_ids
+        elif past_seen_tokens > 0:
+            position_ids = None
+        elif position_ids is not None and past_seen_tokens == 0:
+            position_ids = position_ids.to(device=inputs_embeds.device)
+            if position_ids.ndim == 2:
+                position_ids = position_ids.view(1, position_ids.shape[0], -1).expand(3, -1, -1)
 
         outputs = self.language_model(
             input_ids=None,
@@ -1501,7 +1519,6 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         >>> print(output_text)
         ```
         """
-
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -1517,8 +1534,6 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs[0]
-
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
@@ -1532,7 +1547,7 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            rope_deltas=outputs.rope_deltas,
+            rope_deltas=self.model.rope_deltas,
         )
 
     def prepare_inputs_for_generation(
@@ -1572,6 +1587,22 @@ class IsaacForConditionalGeneration(IsaacPreTrainedModel, GenerationMixin):
         is_prefill = is_first_iteration or not use_cache
         for key, value in multimodal_inputs.items():
             model_inputs[key] = value if is_prefill else None
+        if model_inputs["mm_token_type_ids"] is not None:
+            sequence_length = None
+            if model_inputs.get("input_ids") is not None:
+                sequence_length = model_inputs["input_ids"].shape[1]
+            elif model_inputs.get("inputs_embeds") is not None:
+                sequence_length = model_inputs["inputs_embeds"].shape[1]
+
+            if sequence_length is not None:
+                current_length = model_inputs["mm_token_type_ids"].shape[1]
+                if current_length < sequence_length:
+                    padding = model_inputs["mm_token_type_ids"].new_zeros(
+                        (model_inputs["mm_token_type_ids"].shape[0], sequence_length - current_length)
+                    )
+                    model_inputs["mm_token_type_ids"] = torch.cat([model_inputs["mm_token_type_ids"], padding], dim=1)
+                elif current_length > sequence_length:
+                    model_inputs["mm_token_type_ids"] = model_inputs["mm_token_type_ids"][:, -sequence_length:]
 
         return model_inputs
 
@@ -1710,10 +1741,4 @@ class Polygon(NamedTuple):
     t: float | None = None
 
 
-__all__ = [
-    "IsaacTextModel",
-    "IsaacVisionModel",
-    "IsaacModel",
-    "IsaacPreTrainedModel",
-    "IsaacForConditionalGeneration",
-]
+__all__ = ["IsaacTextModel", "IsaacVisionModel", "IsaacModel", "IsaacPreTrainedModel", "IsaacForConditionalGeneration"]

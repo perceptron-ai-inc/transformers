@@ -223,9 +223,11 @@ class IsaacImageProcessor(TorchvisionBackend):
         self,
         vision_patches: list[list[torch.Tensor]],
         vision_token_grids: list[list[torch.Tensor]],
-    ) -> dict[str, torch.Tensor]:
+    ) -> dict[str, torch.Tensor | None]:
         batch_size = len(vision_patches)
         flat_patches = [patches for sample_patches in vision_patches for patches in sample_patches]
+        if len(flat_patches) == 0:
+            return {"pixel_values": None, "image_grid_thw": None}
 
         first_patch = flat_patches[0]
         max_patches = max(patches.shape[0] for patches in flat_patches)
@@ -271,6 +273,9 @@ class IsaacImageProcessor(TorchvisionBackend):
         return_tensors: str | TensorType | None,
         **kwargs,
     ) -> BatchFeature:
+        if all(len(sample_images) == 0 for sample_images in images):
+            return BatchFeature(data={"pixel_values": None, "image_grid_thw": None}, tensor_type=return_tensors)
+
         grouped_images, grouped_images_index = group_images_by_shape(
             images, disable_grouping=disable_grouping, is_nested=True
         )

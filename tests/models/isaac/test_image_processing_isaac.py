@@ -25,7 +25,7 @@ from transformers.testing_utils import (
     slow,
     torch_device,
 )
-from transformers.utils import is_torch_available, is_torchvision_available, is_vision_available
+from transformers.utils import is_torch_available, is_vision_available
 
 from ...test_image_processing_common import ImageProcessingTestMixin, prepare_image_inputs
 
@@ -35,9 +35,6 @@ if is_torch_available():
 
 if is_vision_available():
     from PIL import Image
-
-if is_torchvision_available():
-    from transformers.models.isaac.image_processing_isaac import IsaacImageProcessor
 
 
 def _make_dummy_image(size=(32, 32), color=(255, 0, 0)):
@@ -121,10 +118,6 @@ class IsaacImageProcessingTester:
 @require_torch
 @require_vision
 class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
-    image_processing_class = None
-    fast_image_processing_class = IsaacImageProcessor if is_torchvision_available() else None
-    test_slow_image_processor = False
-
     def setUp(self):
         super().setUp()
         self.image_processor_tester = IsaacImageProcessingTester(self)
@@ -306,7 +299,7 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
                 encoding,
                 expected_batch_size=2,
                 expected_max_images=2,
-                expected_patch_dim=768,
+                expected_patch_dim=self.image_processor_tester.patch_dim,
             )
             self.assertEqual(tuple(encoding["pixel_values"].shape), (2, 2, 6, 768))
 
