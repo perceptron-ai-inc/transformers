@@ -160,8 +160,9 @@ class IsaacProcessor(ProcessorMixin):
                     length -= offset
                     remaining_dropped = 0
                 elif remaining_dropped >= length:
+                    dropped_length = length
                     length = 0
-                    remaining_dropped -= length
+                    remaining_dropped -= dropped_length
 
                 # Record which suffix of this image's placeholder span survives left truncation.
                 # The model still encodes the full image and uses this window for both feature gathering and vision RoPE.
