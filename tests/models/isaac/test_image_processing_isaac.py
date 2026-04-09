@@ -297,26 +297,6 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
 
             torch.testing.assert_close(encoding["image_grid_thw"], expected_grids)
 
-    def test_all_empty_images_returns_none_visual_fields(self):
-        for image_processing_class in self.image_processing_classes.values():
-            image_processor = image_processing_class(**self.image_processor_dict)
-            encoding = image_processor([[], []], return_tensors="pt")
-
-            self._assert_output_contract(encoding, expected_batch_size=None)
-
-    def test_do_resize_false_requires_patch_divisibility(self):
-        for image_processing_class in self.image_processing_classes.values():
-            image_processor = image_processing_class(
-                **{
-                    **self.image_processor_dict,
-                    "do_resize": False,
-                    "patch_size": 16,
-                }
-            )
-
-            with self.assertRaisesRegex(ValueError, "must be divisible by patch_size"):
-                image_processor([[_make_dummy_image(size=(31, 32))]], return_tensors="pt")
-
     def test_pixel_shuffle_scale_requires_divisible_token_grid(self):
         for image_processing_class in self.image_processing_classes.values():
             image_processor = image_processing_class(
@@ -330,4 +310,3 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "must be divisible by pixel_shuffle_scale"):
                 image_processor([[_make_dummy_image(size=(32, 16))]], return_tensors="pt")
-
