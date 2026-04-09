@@ -1314,25 +1314,8 @@ class IsaacModel(IsaacPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        batch_size, seq_len = inputs_embeds.shape[:2]
-        if mm_token_type_ids is None:
-            mm_token_type_ids = torch.full((batch_size, seq_len), 0, device=inputs_embeds.device, dtype=torch.long)
-        else:
-            mm_token_type_ids = mm_token_type_ids.to(device=inputs_embeds.device, dtype=torch.long)
-            if mm_token_type_ids.shape[1] < seq_len:
-                padding = mm_token_type_ids.new_zeros((batch_size, seq_len - mm_token_type_ids.shape[1]))
-                mm_token_type_ids = torch.cat([mm_token_type_ids, padding], dim=1)
-            elif mm_token_type_ids.shape[1] > seq_len:
-                mm_token_type_ids = mm_token_type_ids[:, -seq_len:]
-
-        if image_metadata is not None:
-            image_metadata = image_metadata.to(device=inputs_embeds.device, dtype=torch.long)
-
         image_mask = None
-        has_active_images = (
-            pixel_values is not None and image_grid_thw is not None and bool(image_grid_thw[..., 0].eq(1).any().item())
-        )
-        if has_active_images:
+        if pixel_values is not None and image_grid_thw is not None:
             image_outputs = self.get_image_features(
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
@@ -1385,14 +1368,12 @@ class IsaacModel(IsaacPreTrainedModel):
             **kwargs,
         )
 
-        outputs_with_rope = BaseModelOutputWithPast(
+        return BaseModelOutputWithPast(
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-        outputs_with_rope["rope_deltas"] = self.rope_deltas
-        return outputs_with_rope
 
 
 @dataclass
