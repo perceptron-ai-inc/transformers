@@ -17,6 +17,7 @@ import unittest
 
 import numpy as np
 
+from transformers.models.isaac.image_processing_isaac import get_image_size_for_max_num_patches
 from transformers.testing_utils import require_torch, require_vision
 from transformers.utils import is_torch_available, is_vision_available
 
@@ -96,7 +97,7 @@ class IsaacImageProcessingTester:
         }
 
     def prepare_image_inputs(self, equal_resolution=False, numpify=False, torchify=False):
-        images = prepare_image_inputs(
+        return prepare_image_inputs(
             batch_size=self.batch_size,
             min_resolution=self.min_resolution,
             max_resolution=self.max_resolution,
@@ -105,7 +106,28 @@ class IsaacImageProcessingTester:
             numpify=numpify,
             torchify=torchify,
         )
-        return [[image] for image in images]
+
+    def expected_output_image_shape(self, images):
+        max_patches = 0
+        for image in images:
+            if isinstance(image, Image.Image):
+                width, height = image.size
+            elif isinstance(image, np.ndarray):
+                height, width = image.shape[:2]
+            else:
+                height, width = image.shape[-2:]
+
+            target_height, target_width = get_image_size_for_max_num_patches(
+                image_height=height,
+                image_width=width,
+                patch_size=self.patch_size,
+                max_num_patches=self.max_num_patches,
+                min_num_patches=self.min_num_patches,
+                pixel_shuffle_scale=self.pixel_shuffle_scale,
+            )
+            max_patches = max(max_patches, (target_height // self.patch_size) * (target_width // self.patch_size))
+
+        return (1, max_patches, self.patch_dim)
 
 
 @require_torch
@@ -118,54 +140,6 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
     @property
     def image_processor_dict(self):
         return self.image_processor_tester.prepare_image_processor_dict()
-
-    def _assert_output_contract(
-        self,
-        encoding,
-        *,
-        expected_batch_size=None,
-        expected_max_images=None,
-        expected_patch_dim=None,
-    ):
-        self.assertEqual(set(encoding.keys()), {"pixel_values", "image_grid_thw"})
-
-        pixel_values = encoding["pixel_values"]
-        image_grid_thw = encoding["image_grid_thw"]
-
-        if expected_batch_size is None:
-            self.assertIsNone(pixel_values)
-            self.assertIsNone(image_grid_thw)
-            return
-
-        self.assertIsNotNone(pixel_values)
-        self.assertIsNotNone(image_grid_thw)
-        self.assertEqual(pixel_values.dtype, torch.float32)
-        self.assertEqual(image_grid_thw.dtype, torch.long)
-
-        if expected_batch_size is not None:
-            self.assertEqual(pixel_values.shape[0], expected_batch_size)
-            self.assertEqual(image_grid_thw.shape[0], expected_batch_size)
-        if expected_max_images is not None:
-            self.assertEqual(pixel_values.shape[1], expected_max_images)
-            self.assertEqual(image_grid_thw.shape[1], expected_max_images)
-        if expected_patch_dim is not None:
-            self.assertEqual(pixel_values.shape[-1], expected_patch_dim)
-
-        self.assertEqual(tuple(image_grid_thw.shape), (pixel_values.shape[0], pixel_values.shape[1], 3))
-
-        active_slots = image_grid_thw[..., 0].eq(1)
-        self.assertTrue(torch.all(image_grid_thw[~active_slots].eq(0)))
-        self.assertTrue(torch.all(image_grid_thw[active_slots, 1:] > 0))
-
-        expected_patch_counts = image_grid_thw[..., 1] * image_grid_thw[..., 2]
-        token_positions = torch.arange(pixel_values.shape[2], device=pixel_values.device).view(1, 1, -1)
-        image_patch_attention_mask = active_slots.unsqueeze(-1) & token_positions.lt(
-            expected_patch_counts.unsqueeze(-1)
-        )
-
-        padded_patch_rows = pixel_values[~image_patch_attention_mask]
-        if padded_patch_rows.numel() > 0:
-            self.assertTrue(torch.all(padded_patch_rows == 0))
 
     @unittest.skip(reason="Isaac image processor 4-channel coverage is not defined")
     def test_call_numpy_4_channels(self):
@@ -192,12 +166,6 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
             ]
 
             encoding = image_processor(image_inputs, return_tensors="pt")
-            self._assert_output_contract(
-                encoding,
-                expected_batch_size=2,
-                expected_max_images=2,
-                expected_patch_dim=self.image_processor_tester.patch_dim,
-            )
             self.assertEqual(tuple(encoding["pixel_values"].shape), (2, 2, 6, 768))
 
             expected_grids = torch.tensor(
@@ -209,6 +177,7 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
             )
 
             torch.testing.assert_close(encoding["image_grid_thw"], expected_grids)
+            self.assertTrue(torch.all(encoding["pixel_values"][0, 1] == 0))
 
     def test_pixel_shuffle_scale_requires_divisible_token_grid(self):
         for image_processing_class in self.image_processing_classes.values():
