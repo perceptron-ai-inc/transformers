@@ -16,15 +16,8 @@
 import unittest
 
 import numpy as np
-import pytest
 
-from transformers.testing_utils import (
-    require_torch,
-    require_torch_accelerator,
-    require_vision,
-    slow,
-    torch_device,
-)
+from transformers.testing_utils import require_torch, require_vision
 from transformers.utils import is_torch_available, is_vision_available
 
 from ...test_image_processing_common import ImageProcessingTestMixin, prepare_image_inputs
@@ -173,15 +166,6 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
         padded_patch_rows = pixel_values[~image_patch_attention_mask]
         if padded_patch_rows.numel() > 0:
             self.assertTrue(torch.all(padded_patch_rows == 0))
-
-    def _assert_encoding_close(self, eager_encoding, compiled_encoding):
-        torch.testing.assert_close(
-            eager_encoding["pixel_values"],
-            compiled_encoding["pixel_values"],
-            atol=1e-4,
-            rtol=1e-4,
-        )
-        torch.testing.assert_close(eager_encoding["image_grid_thw"], compiled_encoding["image_grid_thw"])
 
     def test_image_processor_properties(self):
         for image_processing_class in self.image_processing_classes.values():
@@ -347,51 +331,3 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "must be divisible by pixel_shuffle_scale"):
                 image_processor([[_make_dummy_image(size=(32, 16))]], return_tensors="pt")
 
-    def test_cast_dtype_device(self):
-        for image_processing_class in self.image_processing_classes.values():
-            image_processor = image_processing_class(**self.image_processor_dict)
-            image_inputs = self.image_processor_tester.prepare_image_inputs(equal_resolution=False, torchify=True)
-
-            encoding = image_processor(image_inputs, return_tensors="pt")
-            self.assertEqual(encoding["pixel_values"].device, torch.device("cpu"))
-            self.assertEqual(encoding["pixel_values"].dtype, torch.float32)
-            self.assertEqual(encoding["image_grid_thw"].dtype, torch.long)
-
-            encoding = image_processor(image_inputs, return_tensors="pt").to(torch.float16)
-            self.assertEqual(encoding["pixel_values"].device, torch.device("cpu"))
-            self.assertEqual(encoding["pixel_values"].dtype, torch.float16)
-            self.assertEqual(encoding["image_grid_thw"].dtype, torch.long)
-
-            encoding = image_processor(image_inputs, return_tensors="pt").to("cpu", torch.bfloat16)
-            self.assertEqual(encoding["pixel_values"].device, torch.device("cpu"))
-            self.assertEqual(encoding["pixel_values"].dtype, torch.bfloat16)
-            self.assertEqual(encoding["image_grid_thw"].dtype, torch.long)
-
-            with self.assertRaises(TypeError):
-                _ = image_processor(image_inputs, return_tensors="pt").to(torch.bfloat16, "cpu")
-
-            encoding = image_processor(image_inputs, return_tensors="pt")
-            encoding.update({"input_ids": torch.LongTensor([[1, 2, 3], [4, 5, 6]])})
-            encoding = encoding.to(torch.float16)
-
-            self.assertEqual(encoding["pixel_values"].device, torch.device("cpu"))
-            self.assertEqual(encoding["pixel_values"].dtype, torch.float16)
-            self.assertEqual(encoding["image_grid_thw"].dtype, torch.long)
-            self.assertEqual(encoding["input_ids"].dtype, torch.long)
-
-    @slow
-    @require_torch_accelerator
-    @require_vision
-    @pytest.mark.torch_compile_test
-    def test_can_compile_torchvision_backend(self):
-        if "torchvision" not in self.image_processing_classes:
-            self.skipTest("Skipping compilation test as torchvision backend is not available")
-
-        torch.compiler.reset()
-        input_image = torch.randint(0, 255, (3, 32, 32), dtype=torch.uint8)
-        image_processor = self.image_processing_classes["torchvision"](**self.image_processor_dict)
-        output_eager = image_processor(input_image, device=torch_device, return_tensors="pt")
-
-        image_processor = torch.compile(image_processor, mode="reduce-overhead")
-        output_compiled = image_processor(input_image, device=torch_device, return_tensors="pt")
-        self._assert_encoding_close(output_eager, output_compiled)
