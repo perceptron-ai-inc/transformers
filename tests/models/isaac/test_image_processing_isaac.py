@@ -254,7 +254,7 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
                 expected_patch_dim=self.image_processor_tester.patch_dim,
             )
 
-    @unittest.skip(reason="Isaac image processor 4-channel coverage is not defined yet")
+    @unittest.skip(reason="Isaac image processor 4-channel coverage is not defined")
     def test_call_numpy_4_channels(self):
         pass
 
