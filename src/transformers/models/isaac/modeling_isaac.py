@@ -1025,11 +1025,11 @@ class IsaacModel(IsaacPreTrainedModel):
 
     def get_rope_index(
         self,
-        input_ids: torch.LongTensor | None,
+        input_ids: torch.LongTensor,
         mm_token_type_ids: torch.Tensor,
-        image_grid_thw: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor,
+        image_metadata: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        image_metadata: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -1056,9 +1056,6 @@ class IsaacModel(IsaacPreTrainedModel):
             position_ids (`torch.LongTensor` of shape `(3, batch_size, sequence_length)`)
             mrope_position_deltas (`torch.Tensor` of shape `(batch_size)`)
         """
-        if image_grid_thw is None or image_metadata is None:
-            raise ValueError("Isaac multimodal RoPE requires both `image_grid_thw` and `image_metadata`.")
-
         if attention_mask is None:
             if input_ids is None:
                 attention_mask = mm_token_type_ids.new_ones(mm_token_type_ids.shape, dtype=torch.long)
@@ -1226,7 +1223,6 @@ class IsaacModel(IsaacPreTrainedModel):
         past_key_values: Cache | None = None,
     ) -> torch.Tensor:
         past_seen_tokens = 0 if past_key_values is None else past_key_values.get_seq_length()
-
         has_multimodal = (
             image_grid_thw is not None
             and image_metadata is not None
@@ -1234,8 +1230,9 @@ class IsaacModel(IsaacPreTrainedModel):
         )
         if has_multimodal and mm_token_type_ids is None and input_ids is not None:
             raise ValueError(
-                "Multimodal data was passed (via `image_grid_thw`) but `mm_token_type_ids` is missing. "
-                "Please pass `mm_token_type_ids` so Isaac can build multimodal RoPE positions."
+                "Multimodal data was passed (via `image_grid_thw` or `image_metadata`) but `mm_token_type_ids` is "
+                "missing. Please pass `mm_token_type_ids` to the model so that multimodal RoPE (M-RoPE) can be "
+                "computed correctly. `mm_token_type_ids` is returned by the processor alongside `input_ids`."
             )
 
         if has_multimodal and past_seen_tokens == 0:
