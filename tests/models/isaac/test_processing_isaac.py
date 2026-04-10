@@ -24,10 +24,13 @@ from huggingface_hub import is_offline_mode
 
 from transformers.models.isaac.processing_isaac import IsaacProcessor
 from transformers.testing_utils import require_torch, require_vision
-from transformers.utils import is_vision_available
+from transformers.utils import is_torch_available, is_vision_available
 
 from ...test_processing_common import ProcessorTesterMixin
 
+
+if is_torch_available():
+    import torch
 
 if is_vision_available():
     from PIL import Image
@@ -101,6 +104,44 @@ class IsaacProcessorTest(ProcessorTesterMixin, unittest.TestCase):
     @unittest.skip("Isaac chat templates emit <image> placeholders but the processor consumes image pad tokens")
     def test_apply_chat_template_image_1(self):
         pass
+
+    def test_apply_chat_template_image_placeholder_expands_to_image_pad_tokens(self):
+        processor = self.get_processor()
+        image = _make_dummy_image(size=(16, 16))
+        messages = [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this."},
+                        {"type": "image", "image": image},
+                    ],
+                }
+            ]
+        ]
+
+        formatted_prompt = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        self.assertEqual(len(formatted_prompt), 1)
+        self.assertIn("<image>", formatted_prompt[0])
+
+        out_dict = processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        self.assertTrue(all(key in out_dict for key in ["input_ids", "attention_mask", "pixel_values", "image_grid_thw", "image_metadata", "mm_token_type_ids"]))
+
+        expected_num_image_tokens = processor._get_num_multimodal_tokens(image_sizes=[(image.height, image.width)])[
+            "num_image_tokens"
+        ][0]
+        actual_num_image_tokens = int(out_dict["input_ids"][0].eq(processor.image_token_id).sum().item())
+
+        self.assertEqual(actual_num_image_tokens, expected_num_image_tokens)
+        self.assertEqual(int(out_dict["mm_token_type_ids"][0].sum().item()), expected_num_image_tokens)
+        self.assertEqual(int(out_dict["image_metadata"][0, 0, 1].item()), expected_num_image_tokens)
+        self.assertTrue(torch.all(out_dict["mm_token_type_ids"][0][out_dict["input_ids"][0].eq(processor.image_token_id)] == 1))
 
     def test_get_num_multimodal_tokens_matches_processor_call(self):
         processor = self.get_processor()
