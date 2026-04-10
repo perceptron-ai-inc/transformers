@@ -1404,15 +1404,37 @@ class IsaacProcessor(ProcessorMixin):
 
         truncated_input_ids: list[list[int] | None] = [None] * len(texts)
         truncated_attention_mask: list[list[int] | None] = [None] * len(texts)
+        offset_mappings = text_inputs.get("offset_mapping")
+        truncated_offset_mapping: list[list[list[int]] | None] | None = None
+        if offset_mappings is not None:
+            truncated_offset_mapping = [None] * len(texts)
         overflow_input_ids_per_sample = defaultdict(int)
 
         # 5. Drop overflowing token ids
-        for batch_idx, input_ids, attention_mask in zip(
-            text_inputs["overflow_to_sample_mapping"], text_inputs["input_ids"], text_inputs["attention_mask"]
-        ):
+        if offset_mappings is None:
+            iterator = zip(
+                text_inputs["overflow_to_sample_mapping"], text_inputs["input_ids"], text_inputs["attention_mask"]
+            )
+        else:
+            iterator = zip(
+                text_inputs["overflow_to_sample_mapping"],
+                text_inputs["input_ids"],
+                text_inputs["attention_mask"],
+                offset_mappings,
+            )
+
+        for sample in iterator:
+            if offset_mappings is None:
+                batch_idx, input_ids, attention_mask = sample
+                offset_mapping = None
+            else:
+                batch_idx, input_ids, attention_mask, offset_mapping = sample
+
             if truncated_input_ids[batch_idx] is None:
                 truncated_input_ids[batch_idx] = input_ids
                 truncated_attention_mask[batch_idx] = attention_mask
+                if truncated_offset_mapping is not None:
+                    truncated_offset_mapping[batch_idx] = offset_mapping
             else:
                 overflow_input_ids_per_sample[batch_idx] += input_ids.count(self.image_token_id)
 
@@ -1447,6 +1469,8 @@ class IsaacProcessor(ProcessorMixin):
             "image_metadata": image_metadata,
             **image_inputs,
         }
+        if truncated_offset_mapping is not None:
+            data["offset_mapping"] = torch.tensor(truncated_offset_mapping, dtype=torch.long)
 
         if return_mm_token_type_ids:
             data["mm_token_type_ids"] = self.create_mm_token_type_ids(data["input_ids"])

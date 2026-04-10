@@ -94,10 +94,6 @@ class IsaacProcessorTest(ProcessorTesterMixin, unittest.TestCase):
             return [[image] for image in images]
         return images
 
-    @unittest.skip("IsaacProcessor does not return offset mappings needed for assistant masks")
-    def test_apply_chat_template_assistant_mask(self):
-        pass
-
     @unittest.skip("Isaac chat templates emit <image> placeholders but the processor consumes image pad tokens")
     def test_apply_chat_template_image_0(self):
         pass
