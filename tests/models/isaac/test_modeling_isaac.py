@@ -94,14 +94,6 @@ def compute_logits_statistics(tensor: torch.Tensor) -> dict[str, object]:
     }
 
 
-def trim_trailing_generation_newline(batch_inputs):
-    trimmed_inputs = batch_inputs.copy()
-    for key in ("input_ids", "attention_mask", "mm_token_type_ids"):
-        if key in trimmed_inputs and trimmed_inputs[key] is not None:
-            trimmed_inputs[key] = trimmed_inputs[key][:, :-1]
-    return trimmed_inputs
-
-
 def _pixel_shuffle_reference(x: torch.Tensor, token_grids: torch.Tensor, scale_factor: int):
     num_images, _, embed_dim = x.shape
     output_lengths = []
@@ -618,14 +610,12 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
                 ],
             }
         ]
-        inputs = trim_trailing_generation_newline(
-            self.processor.apply_chat_template(
-                conversation,
-                tokenize=True,
-                return_dict=True,
-                add_generation_prompt=True,
-                return_tensors="pt",
-            )
+        inputs = self.processor.apply_chat_template(
+            conversation,
+            tokenize=True,
+            return_dict=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
         ).to(self.device, dtype=self.dtype)
 
         with torch.no_grad():
@@ -650,14 +640,12 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
                 "content": [{"type": "text", "text": "What is the pythogorean theorem?"}],
             }
         ]
-        inputs = trim_trailing_generation_newline(
-            self.processor.apply_chat_template(
-                conversation,
-                tokenize=True,
-                return_dict=True,
-                add_generation_prompt=True,
-                return_tensors="pt",
-            )
+        inputs = self.processor.apply_chat_template(
+            conversation,
+            tokenize=True,
+            return_dict=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
         ).to(self.device, dtype=self.dtype)
 
         with torch.no_grad():
@@ -688,14 +676,12 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
                 ],
             }
         ]
-        inputs = trim_trailing_generation_newline(
-            self.processor.apply_chat_template(
-                conversation,
-                tokenize=True,
-                return_dict=True,
-                add_generation_prompt=True,
-                return_tensors="pt",
-            )
+        inputs = self.processor.apply_chat_template(
+            conversation,
+            tokenize=True,
+            return_dict=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
         ).to(self.device, dtype=self.dtype)
 
         with torch.no_grad():
@@ -727,14 +713,12 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
                 ],
             }
         ]
-        inputs = trim_trailing_generation_newline(
-            self.processor.apply_chat_template(
-                conversation,
-                tokenize=True,
-                return_dict=True,
-                add_generation_prompt=True,
-                return_tensors="pt",
-            )
+        inputs = self.processor.apply_chat_template(
+            conversation,
+            tokenize=True,
+            return_dict=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
         ).to(self.device, dtype=self.dtype)
 
         with torch.no_grad():
@@ -798,26 +782,22 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
         ]
 
         single_inputs = [
-            trim_trailing_generation_newline(
-                self.processor.apply_chat_template(
-                    conversation,
-                    tokenize=True,
-                    return_dict=True,
-                    add_generation_prompt=True,
-                    return_tensors="pt",
-                )
-            )
-            for conversation in conversations
-        ]
-        batch_inputs = trim_trailing_generation_newline(
             self.processor.apply_chat_template(
-                conversations,
+                conversation,
                 tokenize=True,
                 return_dict=True,
                 add_generation_prompt=True,
                 return_tensors="pt",
-                processor_kwargs={"padding_side": "left"},
             )
+            for conversation in conversations
+        ]
+        batch_inputs = self.processor.apply_chat_template(
+            conversations,
+            tokenize=True,
+            return_dict=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            processor_kwargs={"padding_side": "left"},
         )
         batch_input_ids = batch_inputs["input_ids"]
         max_length = batch_input_ids.shape[1]
@@ -950,14 +930,12 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
 
         single_texts = []
         for conversation in conversations:
-            single_input = trim_trailing_generation_newline(
-                self.processor.apply_chat_template(
-                    conversation,
-                    tokenize=True,
-                    return_dict=True,
-                    add_generation_prompt=True,
-                    return_tensors="pt",
-                )
+            single_input = self.processor.apply_chat_template(
+                conversation,
+                tokenize=True,
+                return_dict=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
             ).to(self.device, dtype=self.dtype)
             with torch.no_grad():
                 outputs = self.model.generate(
@@ -972,15 +950,13 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
             generated_ids = outputs.sequences[:, single_input["input_ids"].shape[1] :]
             single_texts.append(self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0])
 
-        batch_inputs = trim_trailing_generation_newline(
-            self.processor.apply_chat_template(
-                conversations,
-                tokenize=True,
-                return_dict=True,
-                add_generation_prompt=True,
-                return_tensors="pt",
-                processor_kwargs={"padding_side": "left"},
-            )
+        batch_inputs = self.processor.apply_chat_template(
+            conversations,
+            tokenize=True,
+            return_dict=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            processor_kwargs={"padding_side": "left"},
         ).to(self.device, dtype=self.dtype)
         with torch.no_grad():
             batch_outputs = self.model.generate(
@@ -1040,14 +1016,12 @@ class IsaacBoxPointingIntegrationTest(unittest.TestCase):
                 ],
             }
         ]
-        inputs = trim_trailing_generation_newline(
-            self.processor.apply_chat_template(
-                conversation,
-                tokenize=True,
-                return_dict=True,
-                add_generation_prompt=True,
-                return_tensors="pt",
-            )
+        inputs = self.processor.apply_chat_template(
+            conversation,
+            tokenize=True,
+            return_dict=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
         ).to(self.device, dtype=self.dtype)
 
         with torch.no_grad():
@@ -1090,14 +1064,12 @@ class IsaacBoxPointingIntegrationTest(unittest.TestCase):
                 ],
             }
         ]
-        inputs = trim_trailing_generation_newline(
-            self.processor.apply_chat_template(
-                conversation,
-                tokenize=True,
-                return_dict=True,
-                add_generation_prompt=True,
-                return_tensors="pt",
-            )
+        inputs = self.processor.apply_chat_template(
+            conversation,
+            tokenize=True,
+            return_dict=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
         ).to(self.device, dtype=self.dtype)
 
         with torch.no_grad():
