@@ -97,7 +97,7 @@ class IsaacImageProcessingTester:
         }
 
     def prepare_image_inputs(self, equal_resolution=False, numpify=False, torchify=False):
-        return prepare_image_inputs(
+        images = prepare_image_inputs(
             batch_size=self.batch_size,
             min_resolution=self.min_resolution,
             max_resolution=self.max_resolution,
@@ -106,28 +106,35 @@ class IsaacImageProcessingTester:
             numpify=numpify,
             torchify=torchify,
         )
+        return [[image] for image in images]
 
     def expected_output_image_shape(self, images):
+        max_images = 0
         max_patches = 0
-        for image in images:
-            if isinstance(image, Image.Image):
-                width, height = image.size
-            elif isinstance(image, np.ndarray):
-                height, width = image.shape[:2]
-            else:
-                height, width = image.shape[-2:]
+        for sample_images in images:
+            if not isinstance(sample_images, (list, tuple)):
+                sample_images = [sample_images]
 
-            target_height, target_width = get_image_size_for_max_num_patches(
-                image_height=height,
-                image_width=width,
-                patch_size=self.patch_size,
-                max_num_patches=self.max_num_patches,
-                min_num_patches=self.min_num_patches,
-                pixel_shuffle_scale=self.pixel_shuffle_scale,
-            )
-            max_patches = max(max_patches, (target_height // self.patch_size) * (target_width // self.patch_size))
+            max_images = max(max_images, len(sample_images))
+            for image in sample_images:
+                if isinstance(image, Image.Image):
+                    width, height = image.size
+                elif isinstance(image, np.ndarray):
+                    height, width = image.shape[:2]
+                else:
+                    height, width = image.shape[-2:]
 
-        return (1, max_patches, self.patch_dim)
+                target_height, target_width = get_image_size_for_max_num_patches(
+                    image_height=height,
+                    image_width=width,
+                    patch_size=self.patch_size,
+                    max_num_patches=self.max_num_patches,
+                    min_num_patches=self.min_num_patches,
+                    pixel_shuffle_scale=self.pixel_shuffle_scale,
+                )
+                max_patches = max(max_patches, (target_height // self.patch_size) * (target_width // self.patch_size))
+
+        return (max_images, max_patches, self.patch_dim)
 
 
 @require_torch
@@ -141,9 +148,87 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
     def image_processor_dict(self):
         return self.image_processor_tester.prepare_image_processor_dict()
 
+    def test_call_pil(self):
+        for image_processing_class in self.image_processing_classes.values():
+            image_processing = image_processing_class(**self.image_processor_dict)
+            image_inputs = self.image_processor_tester.prepare_image_inputs(equal_resolution=False)
+            for sample_images in image_inputs:
+                self.assertEqual(len(sample_images), 1)
+                self.assertIsInstance(sample_images[0], Image.Image)
+
+            encoded_images = image_processing(image_inputs[0], return_tensors="pt").pixel_values
+            expected_output_image_shape = self.image_processor_tester.expected_output_image_shape([image_inputs[0]])
+            self.assertEqual(tuple(encoded_images.shape), (1, *expected_output_image_shape))
+
+            encoded_images = image_processing(image_inputs, return_tensors="pt").pixel_values
+            expected_output_image_shape = self.image_processor_tester.expected_output_image_shape(image_inputs)
+            self.assertEqual(
+                tuple(encoded_images.shape), (self.image_processor_tester.batch_size, *expected_output_image_shape)
+            )
+
+    def test_call_numpy(self):
+        for image_processing_class in self.image_processing_classes.values():
+            image_processing = image_processing_class(**self.image_processor_dict)
+            image_inputs = self.image_processor_tester.prepare_image_inputs(equal_resolution=False, numpify=True)
+            for sample_images in image_inputs:
+                self.assertEqual(len(sample_images), 1)
+                self.assertIsInstance(sample_images[0], np.ndarray)
+
+            encoded_images = image_processing(image_inputs[0], return_tensors="pt").pixel_values
+            expected_output_image_shape = self.image_processor_tester.expected_output_image_shape([image_inputs[0]])
+            self.assertEqual(tuple(encoded_images.shape), (1, *expected_output_image_shape))
+
+            encoded_images = image_processing(image_inputs, return_tensors="pt").pixel_values
+            expected_output_image_shape = self.image_processor_tester.expected_output_image_shape(image_inputs)
+            self.assertEqual(
+                tuple(encoded_images.shape), (self.image_processor_tester.batch_size, *expected_output_image_shape)
+            )
+
+    def test_call_pytorch(self):
+        for image_processing_class in self.image_processing_classes.values():
+            image_processing = image_processing_class(**self.image_processor_dict)
+            image_inputs = self.image_processor_tester.prepare_image_inputs(equal_resolution=False, torchify=True)
+            for sample_images in image_inputs:
+                self.assertEqual(len(sample_images), 1)
+                self.assertIsInstance(sample_images[0], torch.Tensor)
+
+            encoded_images = image_processing(image_inputs[0], return_tensors="pt").pixel_values
+            expected_output_image_shape = self.image_processor_tester.expected_output_image_shape([image_inputs[0]])
+            self.assertEqual(tuple(encoded_images.shape), (1, *expected_output_image_shape))
+
+            encoded_images = image_processing(image_inputs, return_tensors="pt").pixel_values
+            expected_output_image_shape = self.image_processor_tester.expected_output_image_shape(image_inputs)
+            self.assertEqual(
+                tuple(encoded_images.shape), (self.image_processor_tester.batch_size, *expected_output_image_shape)
+            )
+
     @unittest.skip(reason="Isaac image processor 4-channel coverage is not defined")
     def test_call_numpy_4_channels(self):
         pass
+
+    def test_flat_list_is_single_multi_image_sample(self):
+        for image_processing_class in self.image_processing_classes.values():
+            image_processor = image_processing_class(
+                **{
+                    **self.image_processor_dict,
+                    "do_resize": False,
+                    "patch_size": 16,
+                    "max_num_patches": 64,
+                    "min_num_patches": 1,
+                    "pixel_shuffle_scale": 1,
+                }
+            )
+            image_inputs = [
+                _make_dummy_image(size=(32, 32), color=(255, 0, 0)),
+                _make_dummy_image(size=(32, 32), color=(0, 255, 0)),
+            ]
+
+            encoding = image_processor(image_inputs, return_tensors="pt")
+            self.assertEqual(tuple(encoding["pixel_values"].shape), (1, 2, 4, 768))
+
+            expected_grids = torch.tensor([[[1, 2, 2], [1, 2, 2]]], dtype=torch.long)
+            torch.testing.assert_close(encoding["image_grid_thw"], expected_grids)
+
 
     def test_nested_multi_image_batch_preserves_grids_and_padding(self):
         for image_processing_class in self.image_processing_classes.values():
