@@ -31,7 +31,7 @@ from ...generation.utils import GenerationMixin
 from ...image_transforms import group_images_by_shape, reorder_images
 from ...image_utils import ImageInput, PILImageResampling, SizeDict, make_nested_list_of_images
 from ...masking_utils import create_bidirectional_mask
-from ...modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, ModelOutput
+from ...modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
 from ...modeling_utils import PreTrainedModel
 from ...models.qwen3.configuration_qwen3 import Qwen3Config
 from ...processing_utils import ImagesKwargs, MultiModalData, ProcessingKwargs, ProcessorMixin, Unpack
@@ -782,17 +782,15 @@ class IsaacModel(Qwen3VLModel):
 
 
 @dataclass
-@auto_docstring(
-    custom_intro="""
-    Base class for Isaac causal language model (or autoregressive) outputs.
+class IsaacCausalLMOutputWithPast(CausalLMOutputWithPast):
     """
-)
-class IsaacCausalLMOutputWithPast(ModelOutput):
-    loss: torch.FloatTensor | None = None
-    logits: torch.FloatTensor | None = None
-    past_key_values: Cache | None = None
-    hidden_states: tuple[torch.FloatTensor] | None = None
-    attentions: tuple[torch.FloatTensor] | None = None
+    Base class for Isaac causal language model (or autoregressive) outputs.
+
+    Args:
+        rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+            The rope index difference between sequence length and multimodal rope.
+    """
+
     rope_deltas: torch.LongTensor | None = None
 
 
