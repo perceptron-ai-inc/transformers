@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 import re
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 from huggingface_hub.dataclasses import strict
@@ -30,7 +31,7 @@ from ...generation.utils import GenerationMixin
 from ...image_transforms import group_images_by_shape, reorder_images
 from ...image_utils import ImageInput, PILImageResampling, SizeDict, make_nested_list_of_images
 from ...masking_utils import create_bidirectional_mask
-from ...modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling
+from ...modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, ModelOutput
 from ...modeling_utils import PreTrainedModel
 from ...models.qwen3.configuration_qwen3 import Qwen3Config
 from ...processing_utils import ImagesKwargs, MultiModalData, ProcessingKwargs, ProcessorMixin, Unpack
@@ -728,7 +729,9 @@ class IsaacModel(Qwen3VLModel):
             )
             image_embeds = image_outputs.pooler_output
             if len(image_embeds) > 0:
-                image_embeds = torch.cat(image_embeds, dim=0).to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+                image_embeds = torch.cat(image_embeds, dim=0).to(
+                    device=inputs_embeds.device, dtype=inputs_embeds.dtype
+                )
                 image_mask = self.get_placeholder_mask(
                     mm_token_type_ids=mm_token_type_ids,
                     inputs_embeds=inputs_embeds,
@@ -776,6 +779,21 @@ class IsaacModel(Qwen3VLModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+
+@dataclass
+@auto_docstring(
+    custom_intro="""
+    Base class for Isaac causal language model (or autoregressive) outputs.
+    """
+)
+class IsaacCausalLMOutputWithPast(ModelOutput):
+    loss: torch.FloatTensor | None = None
+    logits: torch.FloatTensor | None = None
+    past_key_values: Cache | None = None
+    hidden_states: tuple[torch.FloatTensor] | None = None
+    attentions: tuple[torch.FloatTensor] | None = None
+    rope_deltas: torch.LongTensor | None = None
 
 
 @auto_docstring
