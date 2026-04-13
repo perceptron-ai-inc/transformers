@@ -16,12 +16,11 @@
 
 import os
 import unittest
-from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 import pytest
-from huggingface_hub import hf_hub_download, is_offline_mode
+from huggingface_hub import is_offline_mode
 
 from transformers.models.isaac.processing_isaac import IsaacProcessor
 from transformers.testing_utils import require_torch, require_vision
@@ -50,47 +49,6 @@ def _make_dummy_image(size=(32, 32), color=(255, 0, 0)):
     return Image.new("RGB", size, color=color)
 
 
-def _add_generation_tags_to_isaac_chat_template(chat_template: str) -> str:
-    if "{% generation %}" in chat_template or "{%- generation" in chat_template:
-        return chat_template
-
-    reasoning_block = (
-        "{{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content.strip('\\n') + '\\n</think>\\n\\n' + content.lstrip('\\n') }}"
-    )
-    patched_reasoning_block = (
-        "{{- '<|im_start|>' + message.role + '\\n' }}"
-        "{% generation %}"
-        "{{- '<think>\\n' + reasoning_content.strip('\\n') + '\\n</think>\\n\\n' + content.lstrip('\\n') }}"
-        "{% endgeneration %}"
-    )
-    plain_assistant_block = "{{- '<|im_start|>' + message.role + '\\n' + content }}"
-    patched_plain_assistant_block = (
-        "{{- '<|im_start|>' + message.role + '\\n' }}{% generation %}{{- content }}{% endgeneration %}"
-    )
-
-    assistant_non_string_block = (
-        "        {%- else %}\n"
-        "            {{- render_block_turns(message.role, message.content) }}\n"
-        "            {%- if message.tool_calls %}"
-    )
-    patched_assistant_non_string_block = (
-        "        {%- else %}\n"
-        "            {%- for content in message.content -%}\n"
-        "                {%- if content['type'] == 'image' or 'image' in content or 'image_url' in content -%}\n"
-        "                    {{- '<|im_start|>' + message.role + '\\n<image><|im_end|>\\n' }}\n"
-        "                {%- elif 'text' in content -%}\n"
-        "                    {{- '<|im_start|>' + message.role + '\\n' }}{% generation %}{{- content['text'] }}{% endgeneration %}{{- '<|im_end|>\\n' }}\n"
-        "                {%- endif -%}\n"
-        "            {%- endfor %}\n"
-        "            {%- if message.tool_calls %}"
-    )
-
-    patched_template = chat_template.replace(reasoning_block, patched_reasoning_block)
-    patched_template = patched_template.replace(plain_assistant_block, patched_plain_assistant_block)
-    patched_template = patched_template.replace(assistant_non_string_block, patched_assistant_non_string_block)
-    return patched_template
-
-
 BASE_MODEL_ID = os.environ.get("ISAAC_TEST_MODEL_ID", "PerceptronAI/Isaac-0.1-Base")
 BASE_MODEL_REVISION = os.environ.get("ISAAC_TEST_MODEL_REVISION", "refs/pr/3") or None
 LOCAL_CHECKPOINT = os.environ.get("ISAAC_TEST_MODEL_PATH")
@@ -105,17 +63,6 @@ def _checkpoint_or_skip(model_id=BASE_MODEL_ID):
     if is_offline_mode():
         pytest.skip("Offline mode: set ISAAC_TEST_MODEL_PATH to a local checkpoint to run these tests.")
     return model_id
-
-
-@lru_cache(maxsize=1)
-def _load_chat_template_from_test_revision(model_id=BASE_MODEL_ID, revision=BASE_MODEL_REVISION):
-    checkpoint = _checkpoint_or_skip(model_id)
-    checkpoint_path = Path(checkpoint)
-    if checkpoint_path.exists():
-        return checkpoint_path.joinpath("chat_template.jinja").read_text(encoding="utf-8")
-
-    chat_template_path = hf_hub_download(model_id, "chat_template.jinja", revision=revision)
-    return Path(chat_template_path).read_text(encoding="utf-8")
 
 
 @require_torch
@@ -194,70 +141,8 @@ class IsaacProcessorTest(ProcessorTesterMixin, unittest.TestCase):
         self.assertEqual(int(out_dict["image_metadata"][0, 0, 1].item()), expected_num_image_tokens)
         self.assertTrue(torch.all(out_dict["mm_token_type_ids"][0][out_dict["input_ids"][0].eq(processor.image_token_id)] == 1))
 
-    def test_current_chat_template_generation_tags_preserve_text_only_generation_prompt(self):
+    def test_default_chat_template_enables_assistant_masks(self):
         processor = self.get_processor()
-        patched_template = _add_generation_tags_to_isaac_chat_template(_load_chat_template_from_test_revision())
-        messages = [[{"role": "user", "content": [{"type": "text", "text": "What is the capital of France?"}]}]]
-
-        original_prompt = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-        patched_prompt = processor.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=False, chat_template=patched_template
-        )
-        self.assertEqual(original_prompt, patched_prompt)
-
-        original_inputs = processor.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
-        )
-        patched_inputs = processor.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-            chat_template=patched_template,
-        )
-        torch.testing.assert_close(original_inputs["input_ids"], patched_inputs["input_ids"])
-        torch.testing.assert_close(original_inputs["attention_mask"], patched_inputs["attention_mask"])
-
-    def test_current_chat_template_generation_tags_preserve_multimodal_generation_prompt(self):
-        processor = self.get_processor()
-        patched_template = _add_generation_tags_to_isaac_chat_template(_load_chat_template_from_test_revision())
-        image = _make_dummy_image(size=(16, 16))
-        messages = [
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Describe this."},
-                        {"type": "image", "image": image},
-                    ],
-                }
-            ]
-        ]
-
-        original_prompt = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-        patched_prompt = processor.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=False, chat_template=patched_template
-        )
-        self.assertEqual(original_prompt, patched_prompt)
-
-        original_inputs = processor.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
-        )
-        patched_inputs = processor.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-            chat_template=patched_template,
-        )
-        for key in ["input_ids", "attention_mask", "image_metadata", "pixel_values", "image_grid_thw", "mm_token_type_ids"]:
-            torch.testing.assert_close(original_inputs[key], patched_inputs[key])
-
-    def test_current_chat_template_generation_tags_enable_assistant_masks(self):
-        processor = self.get_processor()
-        patched_template = _add_generation_tags_to_isaac_chat_template(_load_chat_template_from_test_revision())
         messages = [
             [
                 {"role": "user", "content": [{"type": "text", "text": "What is the capital of France?"}]},
@@ -267,12 +152,6 @@ class IsaacProcessorTest(ProcessorTesterMixin, unittest.TestCase):
             ]
         ]
 
-        original_prompt = processor.apply_chat_template(messages, add_generation_prompt=False, tokenize=False)
-        patched_prompt = processor.apply_chat_template(
-            messages, add_generation_prompt=False, tokenize=False, chat_template=patched_template
-        )
-        self.assertEqual(original_prompt, patched_prompt)
-
         inputs = processor.apply_chat_template(
             messages,
             add_generation_prompt=False,
@@ -280,7 +159,6 @@ class IsaacProcessorTest(ProcessorTesterMixin, unittest.TestCase):
             return_dict=True,
             return_tensors="pt",
             return_assistant_tokens_mask=True,
-            chat_template=patched_template,
         )
         self.assertGreater(int(inputs["assistant_masks"].sum().item()), 0)
 
