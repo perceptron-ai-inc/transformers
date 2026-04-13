@@ -31,11 +31,8 @@ from transformers import (
     IsaacConfig,
     IsaacForConditionalGeneration,
     IsaacModel,
-    PythonBackend,
     is_torch_available,
 )
-from transformers.models.isaac.image_processing_isaac import IsaacImageProcessor
-from transformers.models.isaac.modeling_isaac import IsaacVisionConfig, IsaacVisionModel
 from transformers.models.isaac.processing_isaac import IsaacProcessor
 from transformers.testing_utils import (
     require_flash_attn,

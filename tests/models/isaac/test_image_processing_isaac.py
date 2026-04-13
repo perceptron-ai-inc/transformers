@@ -229,7 +229,6 @@ class IsaacImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
             expected_grids = torch.tensor([[[1, 2, 2], [1, 2, 2]]], dtype=torch.long)
             torch.testing.assert_close(encoding["image_grid_thw"], expected_grids)
 
-
     def test_nested_multi_image_batch_preserves_grids_and_padding(self):
         for image_processing_class in self.image_processing_classes.values():
             image_processor = image_processing_class(
