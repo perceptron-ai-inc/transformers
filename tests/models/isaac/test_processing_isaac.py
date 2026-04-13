@@ -38,11 +38,6 @@ else:
     Image = None
 
 
-class IsaacProcessorTestDouble(IsaacProcessor):
-    def check_argument_for_proper_class(self, argument_name, argument):
-        return type(argument)
-
-
 def _make_dummy_image(size=(32, 32), color=(255, 0, 0)):
     if Image is None:
         raise RuntimeError("PIL.Image is not available in this environment.")
@@ -68,7 +63,7 @@ def _checkpoint_or_skip(model_id=BASE_MODEL_ID):
 @require_torch
 @require_vision
 class IsaacProcessorTest(ProcessorTesterMixin, unittest.TestCase):
-    processor_class = IsaacProcessorTestDouble
+    processor_class = IsaacProcessor
     model_id = BASE_MODEL_ID
     images_input_name = "pixel_values"
 
