@@ -24,7 +24,9 @@ from pathlib import Path
 import pytest
 from huggingface_hub import is_offline_mode
 
-from tests.generation.test_utils import GenerationTesterMixin
+from tests.generation.test_utils import (
+    GenerationTesterMixin,
+)
 from tests.test_configuration_common import ConfigTester
 from tests.test_pipeline_mixin import PipelineTesterMixin
 from transformers import (
