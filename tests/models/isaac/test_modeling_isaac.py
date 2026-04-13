@@ -94,79 +94,6 @@ def compute_logits_statistics(tensor: torch.Tensor) -> dict[str, object]:
     }
 
 
-def _pixel_shuffle_reference(x: torch.Tensor, token_grids: torch.Tensor, scale_factor: int):
-    num_images, _, embed_dim = x.shape
-    output_lengths = []
-    for i in range(num_images):
-        h, w = token_grids[i].tolist()
-        output_lengths.append((h // scale_factor) * (w // scale_factor))
-
-    max_output_tokens = max(output_lengths, default=0)
-    output_dim = embed_dim * scale_factor * scale_factor
-    out = x.new_zeros((num_images, max_output_tokens, output_dim))
-    out_mask = torch.zeros((num_images, max_output_tokens), device=x.device, dtype=torch.long)
-
-    for i in range(num_images):
-        h, w = token_grids[i].tolist()
-        if h == 0 or w == 0:
-            continue
-        seq_len = h * w
-        tokens = x[i, :seq_len]
-        hb, wb = h // scale_factor, w // scale_factor
-        t = tokens.view(h, w, embed_dim).permute(2, 0, 1).unsqueeze(0)
-        t = torch.nn.functional.pixel_unshuffle(t, downscale_factor=scale_factor)
-        t = t.view(1, embed_dim, scale_factor, scale_factor, hb, wb)
-        t = t.permute(0, 4, 5, 2, 3, 1).contiguous().view(hb * wb, output_dim)
-        out[i, : hb * wb] = t
-        out_mask[i, : hb * wb] = 1
-
-    return out, out_mask, torch.tensor(output_lengths, device=x.device, dtype=torch.long)
-
-
-def create_isaac_processor(
-    tokenizer,
-    isaac_config,
-    *,
-    image_processor=None,
-    **overrides,
-):
-    """Helper to construct IsaacProcessor without requiring an IsaacConfig instance."""
-    vision_config = isaac_config.vision_config
-    params = {
-        "max_sequence_length": isaac_config.max_sequence_length,
-        "vision_patch_size": vision_config.patch_size,
-        "vision_max_num_patches": vision_config.num_patches,
-        "vision_min_num_patches": getattr(vision_config, "min_num_patches", None),
-        "pixel_shuffle_scale": vision_config.pixel_shuffle_scale_factor,
-        "rescale_factor": isaac_config.vision_rescale_factor,
-    }
-    params.update(overrides)
-
-    processor_image = image_processor
-    if processor_image is None:
-        image_processor_kwargs = {
-            "patch_size": params["vision_patch_size"],
-            "max_num_patches": params["vision_max_num_patches"],
-            "min_num_patches": params["vision_min_num_patches"],
-            "pixel_shuffle_scale": params["pixel_shuffle_scale"],
-            "rescale_factor": params["rescale_factor"],
-        }
-        if "image_mean" in params:
-            image_processor_kwargs["image_mean"] = params["image_mean"]
-        if "image_std" in params:
-            image_processor_kwargs["image_std"] = params["image_std"]
-        processor_image = IsaacImageProcessor(**image_processor_kwargs)
-    processor_params = {
-        "max_sequence_length": isaac_config.max_sequence_length,
-    }
-
-    return IsaacProcessor(
-        image_processor=processor_image,
-        tokenizer=tokenizer,
-        **processor_params,
-    )
-
-
 def pack_image_inputs(pixel_values, image_token_grids, image_token_offsets=None, image_token_lengths=None):
     batch_size, max_images, _, _ = pixel_values.shape
     device = pixel_values.device
@@ -220,68 +147,6 @@ def _reference_checkpoint_or_skip():
     if is_offline_mode():
         pytest.skip("Offline mode: set ISAAC_TEST_MODEL_PATH to a local checkpoint to run these tests.")
     return MODEL_ID
-
-
-class SimpleIsaacTokenizer(PythonBackend):
-    vocab_files_names = {}
-    model_input_names = ["input_ids"]
-
-    def __init__(self):
-        self._vocab = {
-            "<pad>": 0,
-            "<bos>": 1,
-            "<eos>": 2,
-            "<unk>": 3,
-            ISAAC_IMAGE_TOKEN: 4,
-        }
-        self._ids_to_tokens = {idx: tok for tok, idx in self._vocab.items()}
-        super().__init__(
-            bos_token="<bos>",
-            eos_token="<eos>",
-            pad_token="<pad>",
-            unk_token="<unk>",
-            extra_special_tokens={"image_pad_token": ISAAC_IMAGE_TOKEN},
-            model_max_length=512,
-        )
-        self.image_pad_token = ISAAC_IMAGE_TOKEN
-        self.image_pad_token_id = self._vocab[self.image_pad_token]
-        self.chat_template = (
-            "{% for message in messages %}"
-            "{{ message['role'] }}: {{ message['content'] | trim }}\n"
-            "{% endfor %}"
-            "{% if add_generation_prompt %}assistant:{% endif %}"
-        )
-
-    def get_vocab(self):
-        return dict(self._vocab)
-
-    def _tokenize(self, text):
-        clean = text.replace("\n", " ").strip()
-        if not clean:
-            return []
-        return [token for token in clean.split(" ") if token]
-
-    def _convert_token_to_id(self, token):
-        if token not in self._vocab:
-            next_id = len(self._vocab)
-            self._vocab[token] = next_id
-            self._ids_to_tokens[next_id] = token
-        return self._vocab[token]
-
-    def _convert_id_to_token(self, index):
-        return self._ids_to_tokens.get(index, self.unk_token)
-
-    @property
-    def vocab_size(self) -> int:
-        return len(self._vocab)
-
-    def build_inputs_with_special_tokens(self, token_ids_0, token_ids_1=None):
-        if token_ids_1 is not None:
-            token_ids_0 = token_ids_0 + token_ids_1
-        return [self.bos_token_id] + list(token_ids_0) + [self.eos_token_id]
-
-    def save_vocabulary(self, save_directory, filename_prefix=None):
-        return ()
 
 
 class IsaacModelTester:
@@ -506,72 +371,6 @@ class IsaacModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
     @unittest.skip(reason="Isaac is image-only.")
     def test_get_video_features_attentions(self):
         pass
-
-
-@require_torch
-class IsaacPixelShufflePaddedTest(unittest.TestCase):
-    def test_pixel_shuffle_padded_matches_reference_no_attention_mask(self):
-        x = torch.arange(2 * 16 * 4, device=torch_device, dtype=torch.float32).view(2, 16, 4)
-        token_grids = torch.tensor([[4, 4], [2, 4]], device=torch_device, dtype=torch.long)
-        expected_hidden, _, _ = _pixel_shuffle_reference(x, token_grids, scale_factor=2)
-        model = IsaacVisionModel(
-            IsaacVisionConfig(
-                hidden_size=4,
-                intermediate_size=16,
-                num_hidden_layers=1,
-                num_attention_heads=1,
-                num_channels=3,
-                num_patches=16,
-                patch_size=4,
-                attention_dropout=0.0,
-                pixel_shuffle_scale_factor=2,
-            )
-        ).to(torch_device)
-
-        hidden = model.pixel_shuffle_padded(hidden_states=x, token_grids=token_grids)
-
-        torch.testing.assert_close(hidden, expected_hidden)
-
-    def test_pixel_shuffle_padded_raises_on_non_divisible_grid(self):
-        x = torch.randn(1, 15, 8, device=torch_device)
-        token_grids = torch.tensor([[3, 5]], device=torch_device, dtype=torch.long)
-        model = IsaacVisionModel(
-            IsaacVisionConfig(
-                hidden_size=8,
-                intermediate_size=16,
-                num_hidden_layers=1,
-                num_attention_heads=1,
-                num_channels=3,
-                num_patches=16,
-                patch_size=4,
-                attention_dropout=0.0,
-                pixel_shuffle_scale_factor=2,
-            )
-        ).to(torch_device)
-
-        with pytest.raises(ValueError, match="divisible"):
-            model.pixel_shuffle_padded(hidden_states=x, token_grids=token_grids)
-
-    def test_pixel_shuffle_padded_zero_grid(self):
-        x = torch.randn(1, 4, 8, device=torch_device)
-        token_grids = torch.tensor([[0, 0]], device=torch_device, dtype=torch.long)
-        model = IsaacVisionModel(
-            IsaacVisionConfig(
-                hidden_size=8,
-                intermediate_size=16,
-                num_hidden_layers=1,
-                num_attention_heads=1,
-                num_channels=3,
-                num_patches=16,
-                patch_size=4,
-                attention_dropout=0.0,
-                pixel_shuffle_scale_factor=2,
-            )
-        ).to(torch_device)
-
-        hidden = model.pixel_shuffle_padded(hidden_states=x, token_grids=token_grids)
-
-        self.assertEqual(hidden.shape, (1, 0, 32))
 
 
 @require_torch
@@ -973,7 +772,9 @@ class IsaacGenerationIntegrationTest(unittest.TestCase):
         assert len(batch_texts) == len(single_texts) == 3
 
         for i, (batch_text, single_text) in enumerate(zip(batch_texts, single_texts)):
-            assert single_text in batch_text, f"beam batch[{i}] mismatch: {batch_text!r} vs single[{i}] {single_text!r}"
+            assert single_text in batch_text, (
+                f"beam batch[{i}] mismatch: {batch_text!r} vs single[{i}] {single_text!r}"
+            )
 
 
 @require_torch

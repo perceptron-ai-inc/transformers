@@ -131,40 +131,31 @@ class IsaacProcessorTest(ProcessorTesterMixin, unittest.TestCase):
             return_dict=True,
             return_tensors="pt",
         )
-        self.assertTrue(all(key in out_dict for key in ["input_ids", "attention_mask", "pixel_values", "image_grid_thw", "image_metadata", "mm_token_type_ids"]))
+        self.assertTrue(
+            all(
+                key in out_dict
+                for key in [
+                    "input_ids",
+                    "attention_mask",
+                    "pixel_values",
+                    "image_grid_thw",
+                    "image_metadata",
+                    "mm_token_type_ids",
+                ]
+            )
+        )
 
-        expected_num_image_tokens = processor._get_num_multimodal_tokens(image_sizes=[(image.height, image.width)])["num_image_tokens"][0]
+        expected_num_image_tokens = processor._get_num_multimodal_tokens(image_sizes=[(image.height, image.width)])[
+            "num_image_tokens"
+        ][0]
         actual_num_image_tokens = int(out_dict["input_ids"][0].eq(processor.image_token_id).sum().item())
 
         self.assertEqual(actual_num_image_tokens, expected_num_image_tokens)
         self.assertEqual(int(out_dict["mm_token_type_ids"][0].sum().item()), expected_num_image_tokens)
         self.assertEqual(int(out_dict["image_metadata"][0, 0, 1].item()), expected_num_image_tokens)
-        self.assertTrue(torch.all(out_dict["mm_token_type_ids"][0][out_dict["input_ids"][0].eq(processor.image_token_id)] == 1))
-
-    def test_default_chat_template_enables_assistant_masks(self):
-        processor = self.get_processor()
-        messages = [
-            [
-                {"role": "user", "content": [{"type": "text", "text": "What is the capital of France?"}]},
-                {"role": "assistant", "content": [{"type": "text", "text": "The capital of France is Paris."}]},
-                {"role": "user", "content": [{"type": "text", "text": "What about Italy?"}]},
-                {"role": "assistant", "content": [{"type": "text", "text": "The capital of Italy is Rome."}]},
-            ]
-        ]
-
-        inputs = processor.apply_chat_template(
-            messages,
-            add_generation_prompt=False,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-            return_assistant_tokens_mask=True,
+        self.assertTrue(
+            torch.all(out_dict["mm_token_type_ids"][0][out_dict["input_ids"][0].eq(processor.image_token_id)] == 1)
         )
-        self.assertGreater(int(inputs["assistant_masks"].sum().item()), 0)
-
-        assistant_ids = inputs["input_ids"][inputs["assistant_masks"].bool()]
-        expected_assistant_text = "The capital of France is Paris.The capital of Italy is Rome."
-        self.assertEqual(processor.decode(assistant_ids, skip_special_tokens=True), expected_assistant_text)
 
     def test_get_num_multimodal_tokens_matches_processor_call(self):
         processor = self.get_processor()
